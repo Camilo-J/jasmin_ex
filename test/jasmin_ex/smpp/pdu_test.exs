@@ -94,4 +94,36 @@ defmodule JasminEx.Smpp.PDUTest do
       end
     end
   end
+
+  describe "error paths" do
+    test "binary shorter than the 16-byte header returns :truncated" do
+      assert {:error, {:decode, :truncated}} = PDU.decode(<<>>)
+      assert {:error, {:decode, :truncated}} = PDU.decode(<<1, 2, 3, 4>>)
+      assert {:error, {:decode, :truncated}} = PDU.decode(<<0::32, 0::32, 0::32>>)
+    end
+
+    test "command_length shorter than the header is :invalid_length" do
+      # header[0..3] = command_length = 12 (smaller than 16)
+      bin = <<12::32, 0x0000_0004::32, 0::32, 0::32>>
+      assert {:error, {:decode, :invalid_length}} = PDU.decode(bin)
+    end
+
+    test "declared body length larger than actual buffer returns :truncated" do
+      # command_length = 24 (header + 8 bytes of body), but only 4 bytes follow
+      bin = <<24::32, 0x0000_0004::32, 0::32, 0x0000_0001::32, "abc">>
+      assert {:error, {:decode, :truncated}} = PDU.decode(bin)
+    end
+
+    test "unknown command_id (not in our constants map) returns :unknown_command_id" do
+      # 0xDEAD_0001 is not in our in-scope command_id set
+      bin = <<16::32, 0xDEAD_0001::32, 0::32, 0::32>>
+      assert {:error, {:decode, :unknown_command_id}} = PDU.decode(bin)
+    end
+
+    test "valid command_id but unknown status returns :unknown_command_id" do
+      # :submit_sm (0x04) is valid, but status=0xDEAD is not in our status map.
+      bin = <<16::32, 0x0000_0004::32, 0x0000_00FB::32, 0x0000_0001::32>>
+      assert {:error, {:decode, :unknown_command_id}} = PDU.decode(bin)
+    end
+  end
 end

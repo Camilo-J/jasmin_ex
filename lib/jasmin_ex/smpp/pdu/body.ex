@@ -332,7 +332,7 @@ defmodule JasminEx.Smpp.PDU.Body do
       if byte_size(rest) < sm_length do
         {:error, {:decode, :truncated}}
       else
-        <<short_message::binary-size(sm_length), _::binary>> = rest
+        <<short_message::binary-size(^sm_length), _::binary>> = rest
 
         {:ok,
          %SubmitSM{
@@ -366,7 +366,7 @@ defmodule JasminEx.Smpp.PDU.Body do
 
   defp encode_c_octet(nil), do: [0]
 
-  defp split_c_octet(bin, name) do
+  defp split_c_octet(bin, _name) do
     case :binary.split(bin, <<0>>) do
       [str, rest] -> {:ok, str, rest}
       [_str] -> {:error, {:decode, :bad_cstring}}
