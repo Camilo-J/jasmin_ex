@@ -187,7 +187,7 @@ defmodule JasminEx.Smpp.PDU.Body do
           | EnquireLink.t()
           | GenericNack.t()
 
-  @spec encode(atom(), t()) :: {:ok, binary()} | {:error, {:encode, atom()}}
+  @spec encode(atom(), t()) :: {:ok, iodata()} | {:error, {:encode, atom()}}
   def encode(:bind_transmitter, %Bind{} = b), do: {:ok, encode_bind(b)}
   def encode(:bind_receiver, %Bind{} = b), do: {:ok, encode_bind(b)}
   def encode(:bind_transceiver, %Bind{} = b), do: {:ok, encode_bind(b)}
@@ -311,7 +311,7 @@ defmodule JasminEx.Smpp.PDU.Body do
     {:ok, IO.iodata_to_binary(bytes)}
   end
 
-  defp decode_submit_sm(bin, _shape) do
+  defp decode_submit_sm(bin, shape) do
     with {:ok, service_type, rest} <- split_c_octet(bin, "service_type"),
          {:ok, sat, rest} <- take_u8(rest, "source_addr_ton"),
          {:ok, san, rest} <- take_u8(rest, "source_addr_npi"),
@@ -329,34 +329,44 @@ defmodule JasminEx.Smpp.PDU.Body do
          {:ok, data_coding, rest} <- take_u8(rest, "data_coding"),
          {:ok, sm_default_msg_id, rest} <- take_u8(rest, "sm_default_msg_id"),
          {:ok, sm_length, rest} <- take_u8(rest, "sm_length") do
-      if byte_size(rest) < sm_length do
-        {:error, {:decode, :truncated}}
-      else
-        <<short_message::binary-size(^sm_length), _::binary>> = rest
-
-        {:ok,
-         %SubmitSM{
-           service_type: service_type,
-           source_addr_ton: ton_atom(sat),
-           source_addr_npi: npi_atom(san),
-           source_addr: source_addr,
-           dest_addr_ton: ton_atom(dat),
-           dest_addr_npi: npi_atom(dan),
-           destination_addr: destination_addr,
-           esm_class: esm_class,
-           protocol_id: protocol_id,
-           priority_flag: priority_flag,
-           schedule_delivery_time: schedule_delivery_time,
-           validity_period: validity_period,
-           registered_delivery: registered_delivery,
-           replace_if_present_flag: replace_if_present_flag,
-           data_coding: data_coding_atom(data_coding),
-           sm_default_msg_id: sm_default_msg_id,
-           short_message: short_message
-         }}
-      end
+      build_submit_sm(rest, sm_length, shape, %{
+        service_type: service_type,
+        source_addr_ton: ton_atom(sat),
+        source_addr_npi: npi_atom(san),
+        source_addr: source_addr,
+        dest_addr_ton: ton_atom(dat),
+        dest_addr_npi: npi_atom(dan),
+        destination_addr: destination_addr,
+        esm_class: esm_class,
+        protocol_id: protocol_id,
+        priority_flag: priority_flag,
+        schedule_delivery_time: schedule_delivery_time,
+        validity_period: validity_period,
+        registered_delivery: registered_delivery,
+        replace_if_present_flag: replace_if_present_flag,
+        data_coding: data_coding_atom(data_coding),
+        sm_default_msg_id: sm_default_msg_id
+      })
     end
   end
+
+  # Guard clause: not enough bytes for short_message — early return with error
+  defp build_submit_sm(rest, sm_length, _shape, _fields)
+       when byte_size(rest) < sm_length do
+    {:error, {:decode, :truncated}}
+  end
+
+  # Happy path: extract short_message and build the right struct based on shape
+  defp build_submit_sm(rest, sm_length, shape, fields) do
+    <<short_message::binary-size(^sm_length), _::binary>> = rest
+    {:ok, build_submit_struct(shape, Map.put(fields, :short_message, short_message))}
+  end
+
+  # Struct dispatch — SubmitSM and DeliverSM share every SMPP 3.4 body field,
+  # so only the wrapping struct varies. Using `struct/2` with a map tail
+  # gives full field coverage without a giant %Struct{...} literal.
+  defp build_submit_struct(:submit_sm, fields), do: struct(%SubmitSM{}, fields)
+  defp build_submit_struct(:deliver_sm, fields), do: struct(%DeliverSM{}, fields)
 
   # ── private: low-level binary helpers ────────────────────────────────────
 

@@ -22,13 +22,7 @@ defmodule JasminEx.Smpp.PDU.BodyTest do
 
       {:ok, bin} = Body.encode(:bind_transmitter, body)
       assert {:ok, decoded} = Body.decode(:bind_transmitter, bin)
-      assert decoded.system_id == body.system_id
-      assert decoded.password == body.password
-      assert decoded.system_type == body.system_type
-      assert decoded.interface_version == body.interface_version
-      assert decoded.addr_ton == body.addr_ton
-      assert decoded.addr_npi == body.addr_npi
-      assert decoded.address_range == body.address_range
+      assert decoded == body
     end
 
     test "bind_transmitter wire layout matches SMPP spec (all fields null-terminated + 3 u8s)" do
@@ -63,9 +57,7 @@ defmodule JasminEx.Smpp.PDU.BodyTest do
 
       {:ok, bin} = Body.encode(:bind_receiver, body)
       assert {:ok, decoded} = Body.decode(:bind_receiver, bin)
-      assert decoded.system_id == "rcv"
-      assert decoded.addr_ton == :INTERNATIONAL
-      assert decoded.address_range == "+1"
+      assert decoded == body
     end
   end
 
@@ -83,7 +75,7 @@ defmodule JasminEx.Smpp.PDU.BodyTest do
 
       {:ok, bin} = Body.encode(:bind_transceiver, body)
       assert {:ok, decoded} = Body.decode(:bind_transceiver, bin)
-      assert decoded.system_id == "trx"
+      assert decoded == body
     end
   end
 
@@ -167,12 +159,8 @@ defmodule JasminEx.Smpp.PDU.BodyTest do
       bin = IO.iodata_to_binary(iodata)
       {:ok, decoded} = Body.decode(:submit_sm, bin)
 
-      assert decoded.source_addr == "src"
-      assert decoded.destination_addr == "+1234567890"
-      assert decoded.dest_addr_ton == :INTERNATIONAL
-      assert decoded.dest_addr_npi == :ISDN
-      assert decoded.data_coding == :SMSC_DEFAULT_ALPHABET
-      assert decoded.short_message == "Hello"
+      assert decoded.__struct__ == Body.SubmitSM
+      assert decoded == body
     end
 
     test "submit_sm wire layout matches SMPP spec (16 fields + sm_length + sm bytes)" do
@@ -255,10 +243,11 @@ defmodule JasminEx.Smpp.PDU.BodyTest do
       bin = IO.iodata_to_binary(iodata)
       {:ok, decoded} = Body.decode(:deliver_sm, bin)
 
-      assert decoded.source_addr == "+447700900123"
-      assert decoded.destination_addr == "user"
-      assert decoded.data_coding == :SMSC_DEFAULT_ALPHABET
-      assert decoded.short_message == "Inbound"
+      # Critical: deliver_sm round-trip must produce %Body.DeliverSM{}, not %Body.SubmitSM{}
+      # Spec scenario "decoded struct equals the original struct" is only satisfied when
+      # BOTH the field values AND the struct type match the original.
+      assert decoded.__struct__ == Body.DeliverSM
+      assert decoded == body
     end
 
     test "deliver_sm_resp body is message_id only" do

@@ -126,4 +126,86 @@ defmodule JasminEx.Smpp.PDUTest do
       assert {:error, {:decode, :unknown_command_id}} = PDU.decode(bin)
     end
   end
+
+  describe "full pipeline (PDU.encode -> PDU.decode -> Body.decode)" do
+    alias JasminEx.Smpp.PDU.Body
+
+    test "submit_sm round-trip via PDU + Body delivers the original %SubmitSM{} struct" do
+      body = %Body.SubmitSM{
+        service_type: "",
+        source_addr_ton: :INTERNATIONAL,
+        source_addr_npi: :ISDN,
+        source_addr: "src42",
+        dest_addr_ton: :NATIONAL,
+        dest_addr_npi: :ISDN,
+        destination_addr: "+1234567890",
+        esm_class: 0,
+        protocol_id: 0,
+        priority_flag: 0,
+        schedule_delivery_time: "",
+        validity_period: "",
+        registered_delivery: 0,
+        replace_if_present_flag: 0,
+        data_coding: :SMSC_DEFAULT_ALPHABET,
+        sm_default_msg_id: 0,
+        short_message: "Pipeline OK"
+      }
+
+      {:ok, body_bin} = Body.encode(:submit_sm, body)
+
+      wire =
+        body_bin
+        |> then(&PDU.build(command: :submit_sm, status: :ESME_ROK, sequence_number: 1, body: &1))
+        |> PDU.encode()
+        |> IO.iodata_to_binary()
+
+      assert {:ok, decoded_pdu} = PDU.decode(wire)
+      assert decoded_pdu.command == :submit_sm
+      assert decoded_pdu.sequence_number == 1
+      assert decoded_pdu.body == body_bin
+
+      assert {:ok, decoded_body} = Body.decode(decoded_pdu.command, decoded_pdu.body)
+      assert decoded_body == body
+    end
+
+    test "deliver_sm round-trip via PDU + Body yields %DeliverSM{} (not %SubmitSM{})" do
+      body = %Body.DeliverSM{
+        service_type: "",
+        source_addr_ton: :INTERNATIONAL,
+        source_addr_npi: :ISDN,
+        source_addr: "+447700900999",
+        dest_addr_ton: :UNKNOWN,
+        dest_addr_npi: :UNKNOWN,
+        destination_addr: "user42",
+        esm_class: 0,
+        protocol_id: 0,
+        priority_flag: 0,
+        schedule_delivery_time: "",
+        validity_period: "",
+        registered_delivery: 0,
+        replace_if_present_flag: 0,
+        data_coding: :SMSC_DEFAULT_ALPHABET,
+        sm_default_msg_id: 0,
+        short_message: "Inbound MO"
+      }
+
+      {:ok, body_bin} = Body.encode(:deliver_sm, body)
+
+      wire =
+        body_bin
+        |> then(
+          &PDU.build(command: :deliver_sm, status: :ESME_ROK, sequence_number: 99, body: &1)
+        )
+        |> PDU.encode()
+        |> IO.iodata_to_binary()
+
+      assert {:ok, decoded_pdu} = PDU.decode(wire)
+      assert decoded_pdu.command == :deliver_sm
+
+      assert {:ok, decoded_body} = Body.decode(decoded_pdu.command, decoded_pdu.body)
+      # Critical: full PDU pipeline must preserve struct type, not collapse to %SubmitSM{}
+      assert decoded_body.__struct__ == Body.DeliverSM
+      assert decoded_body == body
+    end
+  end
 end
