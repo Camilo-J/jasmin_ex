@@ -59,15 +59,13 @@ defmodule JasminEx.Smpp.Framing do
 
   defp extract(<<command_length::32, _rest::binary>> = state)
        when command_length < @header_size do
-    # Wire-level bad lenth — drop the head bytes so the next header can be
+    # Wire-level bad length — drop the head bytes so the next header can be
     # examined. This is a coarse recovery; treat the discards as
     # "frames rejected" the caller can log.
-    drop = command_length
-
-    if byte_size(state) <= drop do
+    if byte_size(state) <= command_length do
       {[], <<>>}
     else
-      <<_::binary-size(drop), rest::binary>> = state
+      <<_::binary-size(^command_length), rest::binary>> = state
       extract(rest, [])
     end
   end

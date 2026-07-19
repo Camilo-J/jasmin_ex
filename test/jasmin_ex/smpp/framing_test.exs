@@ -17,7 +17,7 @@ defmodule JasminEx.Smpp.FramingTest do
       assert byte_size(full) == 16
 
       cut = 8
-      <<prefix::binary-size(cut), suffix::binary>> = full
+      <<prefix::binary-size(^cut), suffix::binary>> = full
 
       assert {[], ^prefix} = Framing.feed(<<>>, prefix)
       # After joining prefix + suffix the whole PDU is complete
@@ -79,7 +79,7 @@ defmodule JasminEx.Smpp.FramingTest do
     test "accumulated buffer eventually drains when the missing bytes arrive" do
       full = pdu_bytes(:submit_sm_resp, 5, "msg-id")
       cut = 12
-      <<prefix::binary-size(cut), suffix::binary>> = full
+      <<prefix::binary-size(^cut), suffix::binary>> = full
 
       {[], ^prefix} = Framing.feed(<<>>, prefix)
       # no-op empty chunk
