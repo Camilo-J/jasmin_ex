@@ -77,7 +77,7 @@ defmodule JasminEx.Smpp.Framing do
       # partial PDU at the head — wait for more bytes
       {[], state}
     else
-      <<pdu::binary-size(command_length), rest::binary>> = state
+      <<pdu::binary-size(^command_length), rest::binary>> = state
       extract(rest, [pdu])
     end
   end
