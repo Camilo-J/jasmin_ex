@@ -63,7 +63,7 @@ defmodule JasminEx.Smpp.ClientTest do
            _, _ -> :ok
          end)
 
-    if Process.alive?(smsc),
+    if is_pid(smsc) and Process.alive?(smsc),
       do:
         (try do
            GenServer.stop(smsc, :normal, 200)
@@ -237,6 +237,111 @@ defmodule JasminEx.Smpp.ClientTest do
       assert Client.status(client) == :bound
       stop_pair(smsc, client)
     end
+  end
+
+  describe "pending-window cleanup on involuntary :bound exit" do
+    test "every N pending submit_sm caller gets {:error, :disconnected} when the SMSC drops the socket" do
+      {:ok, port, smsc} = start_smsc()
+      # Withhold submit_sm_resp so callers stay pending until the TCP drop.
+      :ok = FakeSMSC.withhold_response(smsc, :submit_sm)
+      {:ok, client} = start_client(port)
+
+      assert :ok = wait_until(fn -> Client.status(client) == :bound end)
+
+      # Spawn N concurrent senders; each fires `Client.send_submit_sm/2`
+      # which goes through `:gen_statem.call` (so the reply lands back at
+      # the caller via the from-tag pinpoint). Forward the result to
+      # the test process.
+      n = 3
+      test_pid = self()
+
+      for i <- 1..n do
+        spawn_link(fn ->
+          body = %JasminEx.Smpp.PDU.Body.SubmitSM{
+            source_addr_ton: :INTERNATIONAL,
+            source_addr_npi: :ISDN,
+            source_addr: "src",
+            dest_addr_ton: :NATIONAL,
+            dest_addr_npi: :ISDN,
+            destination_addr: "555#{1000 + i}",
+            short_message: "msg#{i}"
+          }
+
+          reply =
+            try do
+              Client.send_submit_sm(client, body)
+            catch
+              _kind, reason -> {:caught, reason}
+            end
+
+          send(test_pid, {:reply_for, i, reply})
+        end)
+      end
+
+      # Wait for each caller to have parked a pending entry.
+      :ok =
+        wait_until(
+          fn ->
+            {_state, data} = :sys.get_state(client)
+            map_size(data.pending) >= n
+          end,
+          500
+        )
+
+      # Drop the harness side of the TCP conn.
+      :ok = GenServer.stop(smsc)
+
+      Enum.each(1..n, fn i ->
+        receive do
+          {:reply_for, ^i, reply} ->
+            assert reply == {:error, :disconnected}, "caller #{i} got #{inspect(reply)}"
+        after
+          1_000 ->
+            flunk("caller #{i} did not receive {:error, :disconnected} within 1s")
+        end
+      end)
+
+      stop_pair(nil, client)
+    end
+  end
+
+  describe "unmatched-sequence guard" do
+    test "a *_resp with an unknown sequence_number is logged and discarded, session stays :bound" do
+      {:ok, port, smsc} = start_smsc()
+      {:ok, client} = start_client(port)
+
+      assert :ok = wait_until(fn -> Client.status(client) == :bound end)
+
+      # Harness sends a submit_sm_resp for sequence_number 999 (no
+      # matching pending entry); the client must NOT crash and must
+      # stay in :bound.
+      _ = FakeSMSC.send_bytes(smsc, pdu_bytes(:submit_sm_resp, :ESME_ROK, 999, "no-such-msg"))
+
+      Process.sleep(50)
+      assert Client.status(client) == :bound
+
+      stop_pair(smsc, client)
+    end
+
+    test "a generic_nack with sequence_number 0 is logged and discarded, session stays :bound" do
+      {:ok, port, smsc} = start_smsc()
+      {:ok, client} = start_client(port)
+
+      assert :ok = wait_until(fn -> Client.status(client) == :bound end)
+
+      _ = FakeSMSC.send_bytes(smsc, pdu_bytes(:generic_nack, :ESME_RINVCMDID, 0, ""))
+
+      Process.sleep(50)
+      assert Client.status(client) == :bound
+
+      stop_pair(smsc, client)
+    end
+  end
+
+  defp pdu_bytes(command, status, seq, body) do
+    PDU.build(command: command, status: status, sequence_number: seq, body: body)
+    |> PDU.encode()
+    |> IO.iodata_to_binary()
   end
 
   ## helpers

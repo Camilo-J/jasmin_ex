@@ -200,8 +200,6 @@ defmodule JasminEx.Smpp.FakeSMSC do
 
   # keep listener reference even when conn is set; it's the OS port that
   # re-accepts on subsequent connect attempts.
-defp accept_loop_keepalive_unused(_), do: :ok
-
   @impl true
   def terminate(_reason, state) do
     if state.conn,

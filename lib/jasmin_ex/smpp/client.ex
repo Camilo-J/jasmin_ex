@@ -42,6 +42,12 @@ defmodule JasminEx.Smpp.Client do
   @spec status(pid()) :: :disconnected | :connecting | :bind_pending | :bound
   def status(pid), do: :gen_statem.call(pid, :status, 5_000)
 
+  @spec send_submit_sm(pid(), map()) ::
+          {:ok, non_neg_integer()} | {:error, :timeout | :disconnected | term()}
+  def send_submit_sm(pid, %Body.SubmitSM{} = body) do
+    :gen_statem.call(pid, {:send_submit_sm, body}, 5_000)
+  end
+
   ## ── gen_statem callbacks ──────────────────────────────────────────────────
 
   @impl true
@@ -68,7 +74,33 @@ defmodule JasminEx.Smpp.Client do
   end
 
   @impl true
+  def handle_event({:call, from}, {:send_submit_sm, body}, :bound, data) do
+    seq = next_seq(data.seq)
+    pdu = build_submit_pdu(body, seq)
+
+    :gen_tcp.send(data.socket, IO.iodata_to_binary(PDU.encode(pdu)))
+
+    Process.send_after(self(), {:submit_sm_timeout, seq, from}, data.config.response_timeout_ms)
+
+    pending = Map.put(data.pending, seq, %{from: from, command_id: :submit_sm})
+    new_data = %{data | seq: seq, pending: pending}
+    {:keep_state, new_data, []}
+  end
+
+  @impl true
   def handle_event({:call, _from}, _msg, _state, data), do: {:keep_state, data, []}
+
+  @impl true
+  def handle_event(:info, {:submit_sm_timeout, seq, from}, :bound, data) do
+    case Map.pop(data.pending, seq) do
+      {nil, _} ->
+        data
+
+      {_entry, pending} ->
+        if from != nil, do: :gen_statem.reply(from, {:error, :timeout})
+        %{data | pending: pending}
+    end
+  end
 
   @impl true
   def handle_event({:timeout, :reconnect}, :try_connect, :disconnected, data) do
@@ -171,6 +203,18 @@ defmodule JasminEx.Smpp.Client do
   defp next_seq(seq) when seq >= @seq_wrap, do: 1
   defp next_seq(seq), do: seq + 1
 
+  # Build a submit_sm PDU from a Body.SubmitSM struct + sequence_number.
+  # Encode failure maps to a `:bad_body` error reply path.
+  defp build_submit_pdu(body, seq) do
+    case Body.encode(:submit_sm, body) do
+      {:ok, body_bin} ->
+        PDU.build(command: :submit_sm, status: :ESME_ROK, sequence_number: seq, body: body_bin)
+
+      {:error, reason} ->
+        raise "submit_sm body encode failed: #{inspect(reason)}"
+    end
+  end
+
   defp send_heartbeat(%{socket: nil}), do: :error
 
   defp send_heartbeat(data) do
@@ -262,9 +306,33 @@ defmodule JasminEx.Smpp.Client do
     data
   end
 
-  # catch-all (also covers the task-12.4 invariant: any unknown seq or seq 0
-  # is logged via the noise path of the unknown-sequence guard clause)
+  # submit_sm_resp round-trip: SMSC acks our submit_sm. The pending entry
+  # carries `from` (the caller pid). We use `:gen_statem.reply/2` to send
+  # the {:ok, msg_id} back to the originating caller. Sequence_numbers
+  # not present in the pending map are silently ignored (task 12.4).
+  defp apply_pdu(data, %PDU{command: :submit_sm_resp, sequence_number: seq, body: body}, :bound) do
+    case Map.pop(data.pending, seq) do
+      {nil, _} ->
+        data
+
+      {%{from: from}, pending} ->
+        message_id = extract_message_id(body)
+        if from != nil, do: :gen_statem.reply(from, {:ok, message_id})
+        %{data | pending: pending}
+    end
+  end
+
+  # shared terminal handler — heartbeat respond + everything else: no-op.
   defp apply_pdu(data, _pdu, _state), do: data
+
+  # Pull the c-octet message_id out of submit_sm_resp body.
+  @empty_msgid ""
+  defp extract_message_id(body) do
+    case Body.decode(:submit_sm_resp, body) do
+      {:ok, %Body.SubmitSMResp{message_id: id}} -> id
+      _ -> @empty_msgid
+    end
+  end
 
   defp enquire_link_resp(seq) do
     PDU.build(command: :enquire_link_resp, status: :ESME_ROK, sequence_number: seq, body: <<>>)
@@ -307,15 +375,21 @@ defmodule JasminEx.Smpp.Client do
   defp transition(data, :disconnected, _reason), do: {:next_state, :disconnected, data, []}
 
   defp flush_pending(data, reply) do
-    Enum.each(data.pending, fn {_seq, %{from: from}} -> reply_to(from, reply) end)
-    data = %{data | pending: %{}}
-    data
+    Enum.each(data.pending, fn {_seq, %{from: from}} -> reply_to_pending(from, reply) end)
+    %{data | pending: %{}}
+  end
+
+  defp reply_to_pending(nil, _reply), do: :ok
+
+  defp reply_to_pending(from, reply) do
+    # Pending entries store the full `:gen_statem` from-tag (a `{pid,
+    # alias}` tuple) from `:gen_statem.call/3`. `:gen_statem.reply/2`
+    # routes the reply back to the originator's blocking call. Internal
+    # enquire_link entries use `from: nil` and are silently dropped.
+    :gen_statem.reply(from, reply)
   end
 
   defp flush_pending_for_disconnect(data), do: flush_pending(data, {:error, :disconnected})
-
-  defp reply_to(nil, _reply), do: :ok
-  defp reply_to(from, reply) when is_pid(from), do: send(from, reply)
 
   defp close_socket(%{socket: nil} = data), do: %{data | socket: nil, buffer: <<>>}
 
