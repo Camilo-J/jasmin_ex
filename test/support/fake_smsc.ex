@@ -85,12 +85,16 @@ defmodule JasminEx.Smpp.FakeSMSC do
   def subscribe(pid), do: GenServer.call(pid, {:subscribe, self()})
 
   @doc """
-  Override the response status sent for `:bind_*_resp` so subsequent
-  bind attempts reject with a specific SMPP error.
+  Override the response status sent for the next `:bind_transmitter` /
+  `:bind_receiver` / `:bind_transceiver` request — i.e. the inbound
+  bind command gets a non-:ESME_ROK reply. Subsequent bind attempts
+  (e.g. on reconnect) reset to default `:auto_reply` if you
+  re-inject; there is no automatic per-message handshake, just a single
+  script entry keyed by the request form.
   """
   @spec inject_bind_resp(pid(), atom()) :: :ok
   def inject_bind_resp(pid, status) do
-    GenServer.call(pid, {:set_script, :bind_transmitter_resp, {:reply_status, status}})
+    GenServer.call(pid, {:set_script, :bind_transmitter, {:reply_status, status}})
   end
 
   @doc """
