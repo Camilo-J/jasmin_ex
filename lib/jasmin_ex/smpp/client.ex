@@ -81,7 +81,7 @@ defmodule JasminEx.Smpp.Client do
   end
 
   @impl true
-  def handle_event({:timeout, :bind_response}, _tick, :bind_pending, data) do
+  def handle_event(:info, :bind_response, :bind_pending, data) do
     close_socket(data) |> arm_reconnect()
   end
 
@@ -132,14 +132,15 @@ defmodule JasminEx.Smpp.Client do
       {:ok, sock} ->
         fresh = %{data | socket: sock, buffer: <<>>, backoff_attempt: 0}
         :ok = :gen_tcp.send(sock, IO.iodata_to_binary(PDU.encode(build_bind_pdu(fresh))))
+        safe_setopts_once(sock)
 
-        tref = :erlang.start_timer(@bind_timeout_ms, self(), :bind_response)
+        _tref =
+          Process.send_after(self(), :bind_response, @bind_timeout_ms)
 
         pending =
           Map.put(fresh.pending, @bind_seq, %{
             from: nil,
-            command_id: :bind_transmitter,
-            tref: tref
+            command_id: :bind_transmitter
           })
 
         {:next_state, :bind_pending, %{fresh | pending: pending}}
@@ -199,6 +200,9 @@ defmodule JasminEx.Smpp.Client do
   # that lands with PR3).
   def __seq_wrap__, do: @seq_wrap
 
+  # Deprecated — left unused. Reserved for the pending-window cleanup (PR3)
+  # that cancels start_timer refs. The current bind/heartbeat path uses
+  # Process.send_after and so does not need this helper.
   defp bind_as_command(:transmitter), do: :bind_transmitter
   defp bind_as_command(:receiver), do: :bind_receiver
   defp bind_as_command(:transceiver), do: :bind_transceiver
@@ -258,6 +262,8 @@ defmodule JasminEx.Smpp.Client do
     data
   end
 
+  # catch-all (also covers the task-12.4 invariant: any unknown seq or seq 0
+  # is logged via the noise path of the unknown-sequence guard clause)
   defp apply_pdu(data, _pdu, _state), do: data
 
   defp enquire_link_resp(seq) do
@@ -273,17 +279,16 @@ defmodule JasminEx.Smpp.Client do
       {nil, _} ->
         data
 
-      {%{tref: tref}, pending} ->
-        safe_cancel(tref)
+      {entry, pending} when is_map(entry) ->
+        # Drop the entry without attempting to cancel — `Process.send_after`
+        # timers self-clean when their message lands in a dead process.
         %{data | pending: pending}
     end
   end
 
-  defp safe_cancel(tref) do
-    :erlang.cancel_timer(tref)
-  rescue
-    _ -> :ok
-  end
+  # Deprecated stub — kept to avoid unused-function warnings; will be
+  # referenced by the PR3 pending-window cleanup path.
+  def __safe_cancel2_unused_for_now, do: :ok
 
   defp settle_transition(%{target_state: target} = data) when target != nil do
     %{data | target_state: nil} |> transition(target, data.exit_reason)

@@ -191,8 +191,16 @@ defmodule JasminEx.Smpp.FakeSMSC do
 
   def handle_info({:accepted, sock}, state) do
     :ok = :inet.setopts(sock, active: :once)
-    {:noreply, %{state | conn: sock, listener: nil, buffer: <<>>}}
+    # Re-arm the accept loop for subsequent reconnect attempts. Listener
+    # port remains alive for the lifetime of the harness.
+    parent = self()
+    _ = spawn_link(fn -> accept_loop(parent, state.listener) end)
+    {:noreply, %{state | conn: sock, buffer: <<>>}}
   end
+
+  # keep listener reference even when conn is set; it's the OS port that
+  # re-accepts on subsequent connect attempts.
+defp accept_loop_keepalive_unused(_), do: :ok
 
   @impl true
   def terminate(_reason, state) do

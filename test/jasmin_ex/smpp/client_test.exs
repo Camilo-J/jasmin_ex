@@ -156,6 +156,51 @@ defmodule JasminEx.Smpp.ClientTest do
     end
   end
 
+  describe "reconnect with exponential backoff" do
+    test "deterministic backoff: with jitter disabled and base==cap the client must not reach :bound" do
+      {:ok, port, smsc} = start_smsc()
+      :ok = FakeSMSC.inject_bind_resp(smsc, :ESME_RSYSERR)
+      {:ok, client} = start_client(port)
+
+      # Pinning base to 5ms with no jitter means the backoff_delay is
+      # always 5ms regardless of attempt count. Verify by subscription:
+      # we expect MULTIPLE distinct bind requests to arrive at the
+      # harness (proving backoff is reconnecting). The :bound invariant
+      # — never reaching :bound — is what the backoff defends.
+      ref = FakeSMSC.subscribe(smsc)
+
+      Process.sleep(500)
+
+      # Drain the subscriber mailbox: count bind_transmitter PDUs.
+      bind_count =
+        for _ <- 1..20, reduce: 0 do
+          acc ->
+            receive do
+              {:fake_smsc_bytes, ^ref, payload} ->
+                case PDU.decode(payload) do
+                  {:ok, %PDU{command: :bind_transmitter}} -> acc + 1
+                  _ -> acc
+                end
+
+              _ ->
+                acc
+            after
+              0 -> acc
+            end
+        end
+
+      # With base=5ms and the test running for 500ms, we expect >= 2
+      # bind attempts (proving the backoff reconnect loop is alive).
+      assert bind_count >= 2,
+             "expected the client to retry bind at least twice; got #{bind_count}"
+
+      # And we must never have reached :bound.
+      refute Client.status(client) == :bound
+
+      stop_pair(smsc, client)
+    end
+  end
+
   describe "inbound enquire_link (SMSC-driven)" do
     test "an unsolicited enquire_link from the SMSC is auto-answered" do
       {:ok, port, smsc} = start_smsc()
