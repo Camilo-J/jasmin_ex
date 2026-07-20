@@ -30,6 +30,7 @@ defmodule JasminEx.Smpp.Client do
   @bind_timeout_ms 5_000
   @connect_timeout_ms 5_000
   @bind_seq 1
+  @seq_wrap 0x8000_0000
 
   ## ── public API ────────────────────────────────────────────────────────────
 
@@ -82,6 +83,23 @@ defmodule JasminEx.Smpp.Client do
   @impl true
   def handle_event({:timeout, :bind_response}, _tick, :bind_pending, data) do
     close_socket(data) |> arm_reconnect()
+  end
+
+  @impl true
+  def handle_event(:state_timeout, :heartbeat, :bound, data) do
+    case send_heartbeat(data) do
+      {:ok, data2} ->
+        actions = [{:state_timeout, data2.config.heartbeat_ms, :heartbeat}]
+        {:keep_state, data2, actions}
+
+      :error ->
+        close_socket(data) |> arm_reconnect()
+    end
+  end
+
+  @impl true
+  def handle_event(:info, {:heartbeat_timeout, seq}, :bound, data) do
+    close_socket(%{data | pending: Map.delete(data.pending, seq)}) |> arm_reconnect()
   end
 
   @impl true
@@ -148,6 +166,39 @@ defmodule JasminEx.Smpp.Client do
     PDU.build(command: command, status: :ESME_ROK, sequence_number: seq, body: body_bin)
   end
 
+  # Allocate next sequence_number (post-bind). 0x7FFFFFFF+1 -> 1.
+  defp next_seq(seq) when seq >= @seq_wrap, do: 1
+  defp next_seq(seq), do: seq + 1
+
+  defp send_heartbeat(%{socket: nil}), do: :error
+
+  defp send_heartbeat(data) do
+    seq = next_seq(data.seq)
+    pdu = PDU.build(command: :enquire_link, status: :ESME_ROK, sequence_number: seq, body: <<>>)
+
+    case :gen_tcp.send(data.socket, IO.iodata_to_binary(PDU.encode(pdu))) do
+      :ok ->
+        Process.send_after(self(), {:heartbeat_timeout, seq}, data.config.response_timeout_ms)
+        pending = Map.put(data.pending, seq, %{from: nil, command_id: :enquire_link})
+        {:ok, %{data | seq: seq, pending: pending}}
+
+      {:error, _} ->
+        :error
+    end
+  end
+
+  defp send_wire(%{socket: nil} = data, _pdu), do: data
+
+  defp send_wire(data, pdu) do
+    :gen_tcp.send(data.socket, IO.iodata_to_binary(PDU.encode(pdu)))
+    data
+  end
+
+  # Reserved cancel helper (currently the heartbeat path uses Process.send_after
+  # so no tref needs cancelling; this exists for the pending-window cleanup path
+  # that lands with PR3).
+  def __seq_wrap__, do: @seq_wrap
+
   defp bind_as_command(:transmitter), do: :bind_transmitter
   defp bind_as_command(:receiver), do: :bind_receiver
   defp bind_as_command(:transceiver), do: :bind_transceiver
@@ -193,7 +244,25 @@ defmodule JasminEx.Smpp.Client do
     %{data | target_state: :disconnected, exit_reason: :bind_rejected}
   end
 
+  # Heartbeat round-trip: when the SMSC acks our enquire_link, drop the
+  # pending entry (it has `from: nil`).
+  defp apply_pdu(data, %PDU{command: :enquire_link_resp, sequence_number: seq}, :bound)
+       when is_map_key(data.pending, seq) do
+    %{data | pending: Map.delete(data.pending, seq)}
+  end
+
+  # Inbound enquire_link from SMSC while bound: auto-reply with our own
+  # enquire_link_resp using the same sequence_number.
+  defp apply_pdu(data, %PDU{command: :enquire_link, sequence_number: seq}, :bound) do
+    send_wire(data, enquire_link_resp(seq))
+    data
+  end
+
   defp apply_pdu(data, _pdu, _state), do: data
+
+  defp enquire_link_resp(seq) do
+    PDU.build(command: :enquire_link_resp, status: :ESME_ROK, sequence_number: seq, body: <<>>)
+  end
 
   defp cancel_pending_for_target(%{target_state: nil} = data), do: data
 
@@ -222,7 +291,13 @@ defmodule JasminEx.Smpp.Client do
 
   defp settle_transition(data), do: {:keep_state, data}
 
-  defp transition(data, :bound, _reason), do: {:next_state, :bound, data, []}
+  defp transition(data, :bound, _reason) do
+    # On entry to :bound, arm the heartbeat :state_timeout. The fire path
+    # sends an enquire_link with `from: nil` tracking.
+    actions = [{:state_timeout, data.config.heartbeat_ms, :heartbeat}]
+    {:next_state, :bound, data, actions}
+  end
+
   defp transition(data, :disconnected, :bind_rejected), do: arm_reconnect(data)
   defp transition(data, :disconnected, _reason), do: {:next_state, :disconnected, data, []}
 

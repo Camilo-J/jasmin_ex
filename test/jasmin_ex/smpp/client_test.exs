@@ -1,17 +1,15 @@
 defmodule JasminEx.Smpp.ClientTest do
   @moduledoc false
   # Integration scenarios for the SMPP client session lifecycle (PR2).
-
-  # Uses the FakeSMSC harness from test/support/. Each test stands up a
-  # fresh harness, configures the appropriate script for the scenario,
-  # starts a Client, drives the lifecycle, and asserts on the resulting
-  # state. Tests are intentionally `async: false` because each scenario
-  # owns its own listening port and harness instance — there is no
-  # cross-test dependency but the harness global VM is shared.
   use ExUnit.Case, async: false
 
   alias JasminEx.Smpp.Client
   alias JasminEx.Smpp.FakeSMSC
+  alias JasminEx.Smpp.PDU
+
+  # Short timers so heartbeat tests don't run for 30s by default.
+  @heartbeat_ms 50
+  @response_timeout_ms 200
 
   defp start_smsc(opts \\ []) do
     {:ok, port, pid} = FakeSMSC.start_link(opts)
@@ -25,7 +23,12 @@ defmodule JasminEx.Smpp.ClientTest do
       system_id: "user",
       password: "pw",
       system_type: "type",
-      bind_as: :transmitter
+      bind_as: :transmitter,
+      heartbeat_ms: @heartbeat_ms,
+      response_timeout_ms: @response_timeout_ms,
+      reconnect_base_ms: 5,
+      reconnect_cap_ms: 5,
+      reconnect_jitter: false
     ]
 
     Client.start_link(base ++ opts)
@@ -69,10 +72,6 @@ defmodule JasminEx.Smpp.ClientTest do
          end)
   end
 
-  defp wait_smsc_connected(smsc) do
-    :ok = FakeSMSC.wait_connected(smsc)
-  end
-
   describe "bind lifecycle" do
     test "successful bind (status 0) transitions the client to :bound" do
       {:ok, port, smsc} = start_smsc()
@@ -88,52 +87,118 @@ defmodule JasminEx.Smpp.ClientTest do
       :ok = FakeSMSC.inject_bind_resp(smsc, :ESME_RSYSERR)
       {:ok, client} = start_client(port)
 
-      # The client must NOT enter :bound; it transitions to :disconnected
-      # and is allowed to stay there while backoff is pending (or for the
-      # duration of the test). Either is acceptable for "stays out of :bound".
       assert :ok = wait_until(fn -> Client.status(client) != :connecting end)
       refute Client.status(client) == :bound
       stop_pair(smsc, client)
     end
   end
 
-  describe "socket drop transitions out of mid-connect / mid-bind states" do
+  describe "socket drop transitions out of mid-connect / mid-bind" do
     test "closing the harness socket during :connecting forces :disconnected" do
-      # The harness Listener socket accepts our connect, then immediately
-      # drops the connection before any data flows. We check the client
-      # observes this and stays out of :bound.
       {:ok, port, smsc} = start_smsc()
-
-      # Force the harness to close the connection on arrival of any bind
-      # request — the bind request itself won't be acked, so the client
-      # never receives a bind_resp. To force the close BEFORE bind is
-      # written by the client (so it's effectively mid-connect), we use
-      # the listener-level close: harness won't even read bytes.
       :ok = FakeSMSC.close_on_command(smsc, :bind_transmitter)
-
       {:ok, client} = start_client(port)
 
       assert :ok = wait_until(fn -> Client.status(client) != :connecting end)
-      refute Client.status(client) == :bound
       assert Client.status(client) in [:disconnected, :bind_pending]
-      stop_pair(smsc, client)
-    end
-
-    test "closing the harness socket during :bind_pending forces :disconnected" do
-      # Same as above but we explicitly let the bind request reach the
-      # closure — verify bind_pending -> disconnected transition.
-      {:ok, port, smsc} = start_smsc()
-      :ok = FakeSMSC.close_on_command(smsc, :bind_transmitter)
-
-      {:ok, client} = start_client(port)
-
-      # Wait for client to attempt bind (will be :bind_pending momentarily)
-      # then witness the close. We allow either :bind_pending to drain
-      # into :disconnected via the close, OR staying in :bind_pending
-      # if backoff hasn't yet kicked in — both states are non-:bound.
-      assert :ok = wait_until(fn -> Client.status(client) != :connecting end)
       refute Client.status(client) == :bound
       stop_pair(smsc, client)
     end
+  end
+
+  describe "heartbeat (client-driven enquire_link)" do
+    test "client sends enquire_link periodically while :bound, harness responds" do
+      {:ok, port, smsc} = start_smsc()
+      ref = FakeSMSC.subscribe(smsc)
+      {:ok, client} = start_client(port)
+
+      assert :ok = wait_until(fn -> Client.status(client) == :bound end)
+
+      # Subscribe to FakeSMSC bytes; we expect an enquire_link to land
+      # there once the heartbeat interval elapses.
+      enquire_seen =
+        wait_until(
+          fn ->
+            draining =
+              receive do
+                {:fake_smsc_bytes, ^ref, payload} ->
+                  case PDU.decode(payload) do
+                    {:ok, %PDU{command: :enquire_link}} -> true
+                    _ -> false
+                  end
+
+                _ ->
+                  false
+              after
+                0 -> false
+              end
+
+            draining
+          end,
+          @heartbeat_ms * 5
+        )
+
+      assert enquire_seen == :ok, "expected an enquire_link PDU from the client"
+      assert Client.status(client) == :bound
+      stop_pair(smsc, client)
+    end
+
+    test "an unanswered heartbeat times out and forces :bound -> :disconnected" do
+      {:ok, port, smsc} = start_smsc()
+      # Drop ALL enquire_link_resp so the heartbeat times out.
+      :ok = FakeSMSC.withhold_response(smsc, :enquire_link)
+      {:ok, client} = start_client(port)
+
+      assert :ok = wait_until(fn -> Client.status(client) == :bound end)
+      assert :ok = wait_until(fn -> Client.status(client) == :disconnected end)
+      refute Client.status(client) == :bound
+      stop_pair(smsc, client)
+    end
+  end
+
+  describe "inbound enquire_link (SMSC-driven)" do
+    test "an unsolicited enquire_link from the SMSC is auto-answered" do
+      {:ok, port, smsc} = start_smsc()
+      ref = FakeSMSC.subscribe(smsc)
+      {:ok, client} = start_client(port)
+
+      assert :ok = wait_until(fn -> Client.status(client) == :bound end)
+
+      # Send an unsolicited enquire_link from the harness -> the client
+      # must respond with an enquire_link_resp, observed by our subscriber.
+      _ = FakeSMSC.send_bytes(smsc, enquire_link_bytes(:enquire_link, 99))
+
+      # Drain the subscriber mailbox.
+      seen_resp =
+        wait_until(
+          fn ->
+            receive do
+              {:fake_smsc_bytes, ^ref, payload} ->
+                case PDU.decode(payload) do
+                  {:ok, %PDU{command: :enquire_link_resp}} -> true
+                  _ -> false
+                end
+
+              _ ->
+                false
+            after
+              0 -> false
+            end
+          end,
+          500
+        )
+
+      assert seen_resp == :ok, "expected an enquire_link_resp from the client"
+      assert Client.status(client) == :bound
+      stop_pair(smsc, client)
+    end
+  end
+
+  ## helpers
+
+  defp enquire_link_bytes(command, seq) do
+    PDU.build(command: command, status: :ESME_ROK, sequence_number: seq, body: <<>>)
+    |> PDU.encode()
+    |> IO.iodata_to_binary()
   end
 end
