@@ -11,6 +11,11 @@ defmodule JasminEx.MixProject do
       dialyzer: [
         plt_file: {:no_warn, "priv/plts/project.plt"},
         plt_core_path: "priv/plts/core.plt"
+      ],
+      test_ignore_filters: [
+        # `test/support/*` is test scaffolding (loaded via test_helper.exs),
+        # not ExUnit test files — exclude it from the test_load_filters scan.
+        ~r/test\/support\/.+\.ex$/
       ]
     ]
   end
