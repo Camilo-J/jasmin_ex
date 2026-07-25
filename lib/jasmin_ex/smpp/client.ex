@@ -1,19 +1,10 @@
 defmodule JasminEx.Smpp.Client do
   @moduledoc """
-  SMPP 3.4 client session — a `:gen_statem` owning a single `:gen_tcp`
-  socket to an SMSC.
-
-  ## Public API (PR2 surface)
-
-    * `start_link/1`  — boot the session.
-    * `status/1`      — current lifecycle state (`:disconnected`,
-      `:connecting`, `:bind_pending`, or `:bound`).
-
-  Submit/recv semantics, windowing, `deliver_sm` dispatch, and graceful
-  unbind land in PR3. This module ships enough for the bind lifecycle,
-  mid-flow socket drops, heartbeat (enquire_link), reconnect with
-  exponential backoff, and the pending-window cleanup invariant.
+  SMPP 3.4 client session backed by a `:gen_statem` and one TCP socket.
   """
+
+  require Logger
+
   alias JasminEx.Smpp.Framing
   alias JasminEx.Smpp.PDU
   alias JasminEx.Smpp.PDU.Body
@@ -26,400 +17,389 @@ defmodule JasminEx.Smpp.Client do
   @default_reconnect_factor 2
   @default_reconnect_cap_ms 30_000
   @default_jitter true
-
-  @bind_timeout_ms 5_000
   @connect_timeout_ms 5_000
-  @bind_seq 1
-  @seq_wrap 0x8000_0000
-
-  ## ── public API ────────────────────────────────────────────────────────────
+  @seq_wrap 0x7FFF_FFFF
 
   @spec start_link(keyword()) :: {:ok, pid()} | {:error, term()}
-  def start_link(opts) do
-    :gen_statem.start_link(__MODULE__, build_config(opts), [])
-  end
+  def start_link(opts), do: :gen_statem.start_link(__MODULE__, build_config(opts), [])
 
   @spec status(pid()) :: :disconnected | :connecting | :bind_pending | :bound
   def status(pid), do: :gen_statem.call(pid, :status, 5_000)
 
-  @spec send_submit_sm(pid(), map()) ::
-          {:ok, non_neg_integer()} | {:error, :timeout | :disconnected | term()}
-  def send_submit_sm(pid, %Body.SubmitSM{} = body) do
-    :gen_statem.call(pid, {:send_submit_sm, body}, 5_000)
-  end
-
-  ## ── gen_statem callbacks ──────────────────────────────────────────────────
+  @spec send_submit_sm(pid(), Body.SubmitSM.t()) :: {:ok, String.t()} | {:error, term()}
+  def send_submit_sm(pid, %Body.SubmitSM{} = body),
+    do: :gen_statem.call(pid, {:send_submit_sm, body}, 5_000)
 
   @impl true
-  def callback_mode, do: :handle_event_function
+  def callback_mode, do: :state_functions
 
   @impl true
   def init(config) do
-    {:ok, :disconnected,
-     %{
-       config: config,
-       socket: nil,
-       buffer: <<>>,
-       seq: 1,
-       pending: %{},
-       backoff_attempt: 0,
-       target_state: nil,
-       exit_reason: nil
-     }, [{{:timeout, :reconnect}, 0, :try_connect}]}
+    data = %{
+      config: config,
+      socket: nil,
+      buffer: <<>>,
+      seq: 1,
+      pending: %{},
+      cancelled: [],
+      backoff_attempt: 0,
+      target_state: nil,
+      exit_reason: nil
+    }
+
+    {:ok, :disconnected, data, [reconnect_action(0)]}
   end
 
-  @impl true
-  def handle_event({:call, from}, :status, state, data) do
-    {:keep_state, data, [{:reply, from, state}]}
+  # :disconnected -> :connecting is explicit so lifecycle state reflects the
+  # design even though the TCP connect operation itself is synchronous.
+  def disconnected({:call, from}, :status, data), do: reply_state(from, :disconnected, data)
+
+  def disconnected({:timeout, :reconnect}, :try_connect, data) do
+    {:next_state, :connecting, data, [{:state_timeout, 0, :connect}]}
   end
 
-  @impl true
-  def handle_event({:call, from}, {:send_submit_sm, body}, :bound, data) do
-    seq = next_seq(data.seq)
+  def disconnected(_event_type, _event, data), do: {:keep_state, data}
+
+  def connecting({:call, from}, :status, data), do: reply_state(from, :connecting, data)
+
+  def connecting(:state_timeout, :connect, data) do
+    case :gen_tcp.connect(
+           data.config.host,
+           data.config.port,
+           [:binary, packet: :raw, active: :once],
+           @connect_timeout_ms
+         ) do
+      {:ok, socket} -> send_bind(%{data | socket: socket, buffer: <<>>})
+      {:error, _reason} -> data |> close_socket() |> arm_reconnect()
+    end
+  end
+
+  def connecting(:info, {:tcp_closed, socket}, %{socket: socket} = data),
+    do: data |> close_socket() |> arm_reconnect()
+
+  def connecting(:info, {:tcp_error, socket, _reason}, %{socket: socket} = data),
+    do: data |> close_socket() |> arm_reconnect()
+
+  def connecting(_event_type, _event, data), do: {:keep_state, data}
+
+  def bind_pending({:call, from}, :status, data), do: reply_state(from, :bind_pending, data)
+
+  def bind_pending({:timeout, {:pending, seq}}, :pending_timeout, data) do
+    data
+    |> remove_pending(seq)
+    |> close_socket()
+    |> arm_reconnect()
+  end
+
+  def bind_pending(:info, {:tcp, socket, bytes}, %{socket: socket} = data),
+    do: receive_tcp(:bind_pending, data, socket, bytes)
+
+  def bind_pending(:info, {:tcp_closed, socket}, %{socket: socket} = data),
+    do: data |> close_socket() |> flush_pending({:error, :disconnected}) |> arm_reconnect()
+
+  def bind_pending(:info, {:tcp_error, socket, _reason}, %{socket: socket} = data),
+    do: data |> close_socket() |> flush_pending({:error, :disconnected}) |> arm_reconnect()
+
+  def bind_pending(_event_type, _event, data), do: {:keep_state, data}
+
+  def bound({:call, from}, :status, data), do: reply_state(from, :bound, data)
+
+  def bound({:call, from}, {:send_submit_sm, body}, data) do
+    {seq, data} = take_sequence(data)
     pdu = build_submit_pdu(body, seq)
 
-    :gen_tcp.send(data.socket, IO.iodata_to_binary(PDU.encode(pdu)))
+    case :gen_tcp.send(data.socket, IO.iodata_to_binary(PDU.encode(pdu))) do
+      :ok ->
+        pending = Map.put(data.pending, seq, %{from: from, command_id: :submit_sm})
+        data = %{data | pending: pending}
+        {:keep_state, data, [pending_timeout_action(seq, data.config.response_timeout_ms)]}
 
-    Process.send_after(self(), {:submit_sm_timeout, seq, from}, data.config.response_timeout_ms)
-
-    pending = Map.put(data.pending, seq, %{from: from, command_id: :submit_sm})
-    new_data = %{data | seq: seq, pending: pending}
-    {:keep_state, new_data, []}
-  end
-
-  @impl true
-  def handle_event({:call, _from}, _msg, _state, data), do: {:keep_state, data, []}
-
-  @impl true
-  def handle_event(:info, {:submit_sm_timeout, seq, from}, :bound, data) do
-    case Map.pop(data.pending, seq) do
-      {nil, _} ->
-        data
-
-      {_entry, pending} ->
-        if from != nil, do: :gen_statem.reply(from, {:error, :timeout})
-        %{data | pending: pending}
+      {:error, _reason} ->
+        {:keep_state, data, [{:reply, from, {:error, :disconnected}}]}
     end
   end
 
-  @impl true
-  def handle_event({:timeout, :reconnect}, :try_connect, :disconnected, data) do
-    try_connect(data)
+  def bound({:timeout, {:pending, seq}}, :pending_timeout, data) do
+    case Map.pop(data.pending, seq) do
+      {nil, _pending} ->
+        {:keep_state, data}
+
+      {%{from: nil}, pending} ->
+        %{data | pending: pending}
+        |> close_socket()
+        |> flush_pending({:error, :disconnected})
+        |> arm_reconnect()
+
+      {%{from: from}, pending} ->
+        :gen_statem.reply(from, {:error, :timeout})
+        {:keep_state, %{data | pending: pending}}
+    end
   end
 
-  @impl true
-  def handle_event({:timeout, :reconnect}, :try_connect, :connecting, data) do
-    close_socket(data) |> arm_reconnect()
-  end
-
-  @impl true
-  def handle_event(:info, :bind_response, :bind_pending, data) do
-    close_socket(data) |> arm_reconnect()
-  end
-
-  @impl true
-  def handle_event(:state_timeout, :heartbeat, :bound, data) do
+  def bound(:state_timeout, :heartbeat, data) do
     case send_heartbeat(data) do
-      {:ok, data2} ->
-        actions = [{:state_timeout, data2.config.heartbeat_ms, :heartbeat}]
-        {:keep_state, data2, actions}
+      {:ok, data, action} ->
+        {:keep_state, data, [action, {:state_timeout, data.config.heartbeat_ms, :heartbeat}]}
 
       :error ->
-        close_socket(data) |> arm_reconnect()
+        data |> close_socket() |> flush_pending({:error, :disconnected}) |> arm_reconnect()
     end
   end
 
-  @impl true
-  def handle_event(:info, {:heartbeat_timeout, seq}, :bound, data) do
-    close_socket(%{data | pending: Map.delete(data.pending, seq)}) |> arm_reconnect()
-  end
+  def bound(:info, {:tcp, socket, bytes}, %{socket: socket} = data),
+    do: receive_tcp(:bound, data, socket, bytes)
 
-  @impl true
-  def handle_event(:info, {:tcp, sock, data_in}, state, %{socket: sock} = data) do
-    %{data | buffer: data.buffer <> data_in} |> process_inbound(state, sock)
-  end
+  def bound(:info, {:tcp_closed, socket}, %{socket: socket} = data),
+    do: data |> close_socket() |> flush_pending({:error, :disconnected}) |> arm_reconnect()
 
-  @impl true
-  def handle_event(:info, {:tcp_closed, sock}, _state, %{socket: sock} = data) do
-    data |> close_socket() |> flush_pending_for_disconnect() |> arm_reconnect()
-  end
+  def bound(:info, {:tcp_error, socket, _reason}, %{socket: socket} = data),
+    do: data |> close_socket() |> flush_pending({:error, :disconnected}) |> arm_reconnect()
 
-  @impl true
-  def handle_event(:info, {:tcp_error, sock, _reason}, _state, %{socket: sock} = data) do
-    data |> close_socket() |> flush_pending_for_disconnect() |> arm_reconnect()
-  end
+  def bound(_event_type, _event, data), do: {:keep_state, data}
 
-  @impl true
-  def handle_event(:info, _other, _state, data), do: {:keep_state, data, []}
+  defp send_bind(data) do
+    {seq, data} = take_sequence(data)
+    pdu = build_bind_pdu(data.config, seq)
 
-  @impl true
-  def handle_event(_type, _event, _state, data), do: {:keep_state, data, []}
+    case :gen_tcp.send(data.socket, IO.iodata_to_binary(PDU.encode(pdu))) do
+      :ok ->
+        pending = Map.put(data.pending, seq, %{from: nil, command_id: :bind_transmitter})
 
-  ## ── private helpers ────────────────────────────────────────────────────────
-
-  defp try_connect(data) do
-    %{host: host, port: port} = data.config
-
-    case :gen_tcp.connect(host, port, [:binary, packet: :raw, active: :once], @connect_timeout_ms) do
-      {:ok, sock} ->
-        fresh = %{data | socket: sock, buffer: <<>>, backoff_attempt: 0}
-        :ok = :gen_tcp.send(sock, IO.iodata_to_binary(PDU.encode(build_bind_pdu(fresh))))
-        safe_setopts_once(sock)
-
-        _tref =
-          Process.send_after(self(), :bind_response, @bind_timeout_ms)
-
-        pending =
-          Map.put(fresh.pending, @bind_seq, %{
-            from: nil,
-            command_id: :bind_transmitter
-          })
-
-        {:next_state, :bind_pending, %{fresh | pending: pending}}
+        {:next_state, :bind_pending, %{data | pending: pending},
+         [pending_timeout_action(seq, data.config.response_timeout_ms)]}
 
       {:error, _reason} ->
         data |> close_socket() |> arm_reconnect()
     end
   end
 
-  defp build_bind_pdu(%{config: cfg, seq: seq}) do
-    command = bind_as_command(cfg.bind_as)
+  defp receive_tcp(state, data, socket, bytes) do
+    {pdus, leftover} = Framing.feed(<<>>, data.buffer <> bytes)
 
-    body_struct = %Body.Bind{
-      system_id: cfg.system_id,
-      password: cfg.password,
-      system_type: cfg.system_type,
-      interface_version: 0x34,
-      addr_ton: :UNKNOWN,
-      addr_npi: :UNKNOWN,
-      address_range: ""
-    }
+    data =
+      Enum.reduce(pdus, %{data | buffer: leftover}, fn pdu_bin, acc ->
+        dispatch_pdu(acc, pdu_bin, state)
+      end)
 
-    {:ok, body_bin} = Body.encode(command, body_struct)
-    PDU.build(command: command, status: :ESME_ROK, sequence_number: seq, body: body_bin)
+    safe_setopts_once(socket)
+    settle_inbound(state, data)
   end
 
-  # Allocate next sequence_number (post-bind). 0x7FFFFFFF+1 -> 1.
-  defp next_seq(seq) when seq >= @seq_wrap, do: 1
-  defp next_seq(seq), do: seq + 1
+  defp dispatch_pdu(data, pdu_bin, state) do
+    case PDU.decode(pdu_bin) do
+      {:ok, pdu} -> apply_pdu(data, pdu, state)
+      {:error, _reason} -> data
+    end
+  end
 
-  # Build a submit_sm PDU from a Body.SubmitSM struct + sequence_number.
-  # Encode failure maps to a `:bad_body` error reply path.
-  defp build_submit_pdu(body, seq) do
-    case Body.encode(:submit_sm, body) do
-      {:ok, body_bin} ->
-        PDU.build(command: :submit_sm, status: :ESME_ROK, sequence_number: seq, body: body_bin)
+  defp apply_pdu(
+         data,
+         %PDU{command: command, sequence_number: seq, status: status},
+         :bind_pending
+       ) do
+    case {bind_request_for(command), Map.get(data.pending, seq)} do
+      {bind_command, %{command_id: bind_command}} when not is_nil(bind_command) ->
+        data = cancel_pending(data, seq)
 
-      {:error, reason} ->
-        raise "submit_sm body encode failed: #{inspect(reason)}"
+        case status do
+          :ESME_ROK -> %{data | target_state: :bound}
+          _ -> %{data | target_state: :disconnected, exit_reason: :bind_rejected}
+        end
+
+      _ ->
+        log_unknown_response(command, seq)
+        data
+    end
+  end
+
+  defp apply_pdu(data, %PDU{command: :enquire_link_resp, sequence_number: seq}, :bound),
+    do: resolve_internal_response(data, :enquire_link, seq)
+
+  defp apply_pdu(data, %PDU{command: :submit_sm_resp, sequence_number: seq, body: body}, :bound) do
+    case Map.pop(data.pending, seq) do
+      {nil, _pending} ->
+        log_unknown_response(:submit_sm_resp, seq)
+        data
+
+      {%{command_id: :submit_sm, from: from}, pending} ->
+        :gen_statem.reply(from, {:ok, extract_message_id(body)})
+        %{data | pending: pending, cancelled: [seq | data.cancelled]}
+
+      {_entry, _pending} ->
+        log_unknown_response(:submit_sm_resp, seq)
+        data
+    end
+  end
+
+  defp apply_pdu(data, %PDU{command: :enquire_link, sequence_number: seq}, :bound) do
+    send_wire(data, enquire_link_resp(seq))
+  end
+
+  defp apply_pdu(data, %PDU{command: command, sequence_number: seq}, _state)
+       when command in [
+              :bind_transmitter_resp,
+              :bind_receiver_resp,
+              :bind_transceiver_resp,
+              :submit_sm_resp,
+              :enquire_link_resp,
+              :generic_nack
+            ] do
+    log_unknown_response(command, seq)
+    data
+  end
+
+  defp apply_pdu(data, _pdu, _state), do: data
+
+  defp settle_inbound(:bind_pending, %{target_state: :bound} = data) do
+    data = %{data | target_state: nil, backoff_attempt: 0}
+
+    {:next_state, :bound, data,
+     cancellation_actions(data) ++ [{:state_timeout, data.config.heartbeat_ms, :heartbeat}]}
+  end
+
+  defp settle_inbound(:bind_pending, %{target_state: :disconnected} = data) do
+    %{data | target_state: nil} |> close_socket() |> arm_reconnect()
+  end
+
+  defp settle_inbound(_state, data),
+    do: {:keep_state, clear_cancellations(data), cancellation_actions(data)}
+
+  defp resolve_internal_response(data, command_id, seq) do
+    case Map.get(data.pending, seq) do
+      %{command_id: ^command_id, from: nil} ->
+        cancel_pending(data, seq)
+
+      _ ->
+        log_unknown_response(:enquire_link_resp, seq)
+        data
     end
   end
 
   defp send_heartbeat(%{socket: nil}), do: :error
 
   defp send_heartbeat(data) do
-    seq = next_seq(data.seq)
+    {seq, data} = take_sequence(data)
     pdu = PDU.build(command: :enquire_link, status: :ESME_ROK, sequence_number: seq, body: <<>>)
 
     case :gen_tcp.send(data.socket, IO.iodata_to_binary(PDU.encode(pdu))) do
       :ok ->
-        Process.send_after(self(), {:heartbeat_timeout, seq}, data.config.response_timeout_ms)
         pending = Map.put(data.pending, seq, %{from: nil, command_id: :enquire_link})
-        {:ok, %{data | seq: seq, pending: pending}}
 
-      {:error, _} ->
+        {:ok, %{data | pending: pending},
+         pending_timeout_action(seq, data.config.response_timeout_ms)}
+
+      {:error, _reason} ->
         :error
     end
   end
 
-  defp send_wire(%{socket: nil} = data, _pdu), do: data
+  defp build_bind_pdu(config, seq) do
+    command = bind_as_command(config.bind_as)
 
-  defp send_wire(data, pdu) do
-    :gen_tcp.send(data.socket, IO.iodata_to_binary(PDU.encode(pdu)))
-    data
+    body = %Body.Bind{
+      system_id: config.system_id,
+      password: config.password,
+      system_type: config.system_type,
+      interface_version: 0x34,
+      addr_ton: :UNKNOWN,
+      addr_npi: :UNKNOWN,
+      address_range: ""
+    }
+
+    {:ok, body_bin} = Body.encode(command, body)
+    PDU.build(command: command, status: :ESME_ROK, sequence_number: seq, body: body_bin)
   end
 
-  # Reserved cancel helper (currently the heartbeat path uses Process.send_after
-  # so no tref needs cancelling; this exists for the pending-window cleanup path
-  # that lands with PR3).
-  def __seq_wrap__, do: @seq_wrap
-
-  # Deprecated — left unused. Reserved for the pending-window cleanup (PR3)
-  # that cancels start_timer refs. The current bind/heartbeat path uses
-  # Process.send_after and so does not need this helper.
-  defp bind_as_command(:transmitter), do: :bind_transmitter
-  defp bind_as_command(:receiver), do: :bind_receiver
-  defp bind_as_command(:transceiver), do: :bind_transceiver
-
-  # Decode chained bytes, dispatch complete PDUs by mutating `data` and
-  # recording a target_state / exit_reason. The post-loop step applies
-  # the queuing transition and re-arms active mode.
-  defp process_inbound(%{socket: nil} = data, _state, _sock), do: {:keep_state, data}
-
-  defp process_inbound(%{buffer: buffer} = data, state, sock) do
-    {pdus, leftover} = Framing.feed(<<>>, buffer)
-
-    settled =
-      Enum.reduce(pdus, data, fn pdu_bin, acc -> dispatch_pdu(acc, pdu_bin, state) end)
-      |> Map.put(:buffer, leftover)
-      |> cancel_pending_for_target()
-      |> settle_transition()
-
-    safe_setopts_once(sock)
-    settled
+  defp build_submit_pdu(body, seq) do
+    {:ok, body_bin} = Body.encode(:submit_sm, body)
+    PDU.build(command: :submit_sm, status: :ESME_ROK, sequence_number: seq, body: body_bin)
   end
 
-  defp dispatch_pdu(data, pdu_bin, state) do
-    case PDU.decode(pdu_bin) do
-      {:ok, pdu} -> apply_pdu(data, pdu, state)
-      {:error, _} -> data
-    end
-  end
+  defp take_sequence(data), do: {data.seq, %{data | seq: next_seq(data.seq)}}
+  defp next_seq(seq) when seq >= @seq_wrap, do: 1
+  defp next_seq(seq), do: seq + 1
 
-  defp apply_pdu(
-         data,
-         %PDU{command: :bind_transmitter_resp, sequence_number: @bind_seq, status: :ESME_ROK},
-         :bind_pending
-       ) do
-    %{data | target_state: :bound}
-  end
+  defp pending_timeout_action(seq, timeout),
+    do: {{:timeout, {:pending, seq}}, timeout, :pending_timeout}
 
-  defp apply_pdu(
-         data,
-         %PDU{command: :bind_transmitter_resp, sequence_number: @bind_seq, status: _other},
-         :bind_pending
-       ) do
-    %{data | target_state: :disconnected, exit_reason: :bind_rejected}
-  end
+  defp cancellation_actions(data),
+    do: Enum.map(data.cancelled, &{{:timeout, {:pending, &1}}, :cancel})
 
-  # Heartbeat round-trip: when the SMSC acks our enquire_link, drop the
-  # pending entry (it has `from: nil`).
-  defp apply_pdu(data, %PDU{command: :enquire_link_resp, sequence_number: seq}, :bound)
-       when is_map_key(data.pending, seq) do
-    %{data | pending: Map.delete(data.pending, seq)}
-  end
+  defp clear_cancellations(data), do: %{data | cancelled: []}
 
-  # Inbound enquire_link from SMSC while bound: auto-reply with our own
-  # enquire_link_resp using the same sequence_number.
-  defp apply_pdu(data, %PDU{command: :enquire_link, sequence_number: seq}, :bound) do
-    send_wire(data, enquire_link_resp(seq))
-    data
-  end
+  defp cancel_pending(data, seq),
+    do: %{data | pending: Map.delete(data.pending, seq), cancelled: [seq | data.cancelled]}
 
-  # submit_sm_resp round-trip: SMSC acks our submit_sm. The pending entry
-  # carries `from` (the caller pid). We use `:gen_statem.reply/2` to send
-  # the {:ok, msg_id} back to the originating caller. Sequence_numbers
-  # not present in the pending map are silently ignored (task 12.4).
-  defp apply_pdu(data, %PDU{command: :submit_sm_resp, sequence_number: seq, body: body}, :bound) do
-    case Map.pop(data.pending, seq) do
-      {nil, _} ->
-        data
-
-      {%{from: from}, pending} ->
-        message_id = extract_message_id(body)
-        if from != nil, do: :gen_statem.reply(from, {:ok, message_id})
-        %{data | pending: pending}
-    end
-  end
-
-  # shared terminal handler — heartbeat respond + everything else: no-op.
-  defp apply_pdu(data, _pdu, _state), do: data
-
-  # Pull the c-octet message_id out of submit_sm_resp body.
-  @empty_msgid ""
-  defp extract_message_id(body) do
-    case Body.decode(:submit_sm_resp, body) do
-      {:ok, %Body.SubmitSMResp{message_id: id}} -> id
-      _ -> @empty_msgid
-    end
-  end
-
-  defp enquire_link_resp(seq) do
-    PDU.build(command: :enquire_link_resp, status: :ESME_ROK, sequence_number: seq, body: <<>>)
-  end
-
-  defp cancel_pending_for_target(%{target_state: nil} = data), do: data
-
-  defp cancel_pending_for_target(%{target_state: _} = data), do: cancel_pending(data, @bind_seq)
-
-  defp cancel_pending(data, seq) do
-    case Map.pop(data.pending, seq) do
-      {nil, _} ->
-        data
-
-      {entry, pending} when is_map(entry) ->
-        # Drop the entry without attempting to cancel — `Process.send_after`
-        # timers self-clean when their message lands in a dead process.
-        %{data | pending: pending}
-    end
-  end
-
-  # Deprecated stub — kept to avoid unused-function warnings; will be
-  # referenced by the PR3 pending-window cleanup path.
-  def __safe_cancel2_unused_for_now, do: :ok
-
-  defp settle_transition(%{target_state: target} = data) when target != nil do
-    %{data | target_state: nil} |> transition(target, data.exit_reason)
-  end
-
-  defp settle_transition(data), do: {:keep_state, data}
-
-  defp transition(data, :bound, _reason) do
-    # On entry to :bound, arm the heartbeat :state_timeout. The fire path
-    # sends an enquire_link with `from: nil` tracking.
-    actions = [{:state_timeout, data.config.heartbeat_ms, :heartbeat}]
-    {:next_state, :bound, data, actions}
-  end
-
-  defp transition(data, :disconnected, :bind_rejected), do: arm_reconnect(data)
-  defp transition(data, :disconnected, _reason), do: {:next_state, :disconnected, data, []}
+  defp remove_pending(data, seq), do: %{data | pending: Map.delete(data.pending, seq)}
 
   defp flush_pending(data, reply) do
     Enum.each(data.pending, fn {_seq, %{from: from}} -> reply_to_pending(from, reply) end)
-    %{data | pending: %{}}
+    %{data | pending: %{}, cancelled: Map.keys(data.pending) ++ data.cancelled}
   end
 
+  defp arm_reconnect(data) do
+    actions = cancellation_actions(data) ++ [reconnect_action(backoff_delay(data))]
+
+    {:next_state, :disconnected,
+     %{clear_cancellations(data) | backoff_attempt: data.backoff_attempt + 1}, actions}
+  end
+
+  defp reconnect_action(delay), do: {{:timeout, :reconnect}, delay, :try_connect}
+  defp reply_state(from, state, data), do: {:keep_state, data, [{:reply, from, state}]}
   defp reply_to_pending(nil, _reply), do: :ok
+  defp reply_to_pending(from, reply), do: :gen_statem.reply(from, reply)
+  defp close_socket(%{socket: nil} = data), do: %{data | buffer: <<>>}
 
-  defp reply_to_pending(from, reply) do
-    # Pending entries store the full `:gen_statem` from-tag (a `{pid,
-    # alias}` tuple) from `:gen_statem.call/3`. `:gen_statem.reply/2`
-    # routes the reply back to the originator's blocking call. Internal
-    # enquire_link entries use `from: nil` and are silently dropped.
-    :gen_statem.reply(from, reply)
-  end
-
-  defp flush_pending_for_disconnect(data), do: flush_pending(data, {:error, :disconnected})
-
-  defp close_socket(%{socket: nil} = data), do: %{data | socket: nil, buffer: <<>>}
-
-  defp close_socket(%{socket: sock} = data) do
-    :gen_tcp.close(sock)
+  defp close_socket(%{socket: socket} = data) do
+    :gen_tcp.close(socket)
     %{data | socket: nil, buffer: <<>>}
   rescue
     _ -> %{data | socket: nil, buffer: <<>>}
   end
 
-  defp safe_setopts_once(sock) do
-    :inet.setopts(sock, active: :once)
+  defp send_wire(%{socket: nil} = data, _pdu), do: data
+
+  defp send_wire(data, pdu),
+    do:
+      (
+        :gen_tcp.send(data.socket, IO.iodata_to_binary(PDU.encode(pdu)))
+        data
+      )
+
+  defp safe_setopts_once(socket) do
+    :inet.setopts(socket, active: :once)
   rescue
     _ -> :ok
   end
 
-  defp arm_reconnect(data) do
-    backoff = backoff_delay(data)
+  defp bind_as_command(:transmitter), do: :bind_transmitter
+  defp bind_as_command(:receiver), do: :bind_receiver
+  defp bind_as_command(:transceiver), do: :bind_transceiver
+  defp bind_request_for(:bind_transmitter_resp), do: :bind_transmitter
+  defp bind_request_for(:bind_receiver_resp), do: :bind_receiver
+  defp bind_request_for(:bind_transceiver_resp), do: :bind_transceiver
+  defp bind_request_for(_command), do: nil
 
-    {:next_state, :disconnected, %{data | backoff_attempt: data.backoff_attempt + 1},
-     [{{:timeout, :reconnect}, backoff, :try_connect}]}
+  defp log_unknown_response(command, seq),
+    do: Logger.warning("unknown sequence_number #{seq} for #{inspect(command)}, discarding")
+
+  defp enquire_link_resp(seq),
+    do:
+      PDU.build(command: :enquire_link_resp, status: :ESME_ROK, sequence_number: seq, body: <<>>)
+
+  defp extract_message_id(body) do
+    case Body.decode(:submit_sm_resp, body) do
+      {:ok, %Body.SubmitSMResp{message_id: id}} -> id
+      _ -> ""
+    end
   end
 
   defp backoff_delay(%{
-         config: %{reconnect: %{base_ms: base, factor: f, cap_ms: cap, jitter: j}},
-         backoff_attempt: n
+         config: %{reconnect: %{base_ms: base, factor: factor, cap_ms: cap, jitter: jitter}},
+         backoff_attempt: attempt
        }) do
-    exp = base * Integer.pow(f, n)
-    capped = min(exp, cap)
-    if j, do: :rand.uniform(capped), else: capped
+    delay = min(base * Integer.pow(factor, attempt), cap)
+    if jitter, do: :rand.uniform(delay), else: delay
   end
 
   defp build_config(opts) do

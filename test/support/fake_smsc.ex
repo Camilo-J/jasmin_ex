@@ -30,7 +30,6 @@ defmodule JasminEx.Smpp.FakeSMSC do
   alias JasminEx.Smpp.PDU.Body, as: Body
 
   @default_action :auto_reply
-  @reply_seq 1
 
   @req_resp_map %{
     bind_receiver: :bind_receiver_resp,
@@ -279,10 +278,10 @@ defmodule JasminEx.Smpp.FakeSMSC do
     Map.get(state.script, command_id, Map.get(state.script, :default, @default_action))
   end
 
-  defp apply_action(state, %PDU{command: cmd}, :auto_reply), do: reply_to(state, cmd, :ESME_ROK)
+  defp apply_action(state, %PDU{} = pdu, :auto_reply), do: reply_to(state, pdu, :ESME_ROK)
 
-  defp apply_action(state, %PDU{command: cmd}, {:reply_status, status}),
-    do: reply_to(state, cmd, status)
+  defp apply_action(state, %PDU{} = pdu, {:reply_status, status}),
+    do: reply_to(state, pdu, status)
 
   defp apply_action(state, _pdu, :withhold), do: state
 
@@ -291,15 +290,20 @@ defmodule JasminEx.Smpp.FakeSMSC do
     %{state | conn: nil, buffer: <<>>}
   end
 
-  defp reply_to(%{conn: nil} = state, _cmd, _status), do: state
+  defp reply_to(%{conn: nil} = state, _pdu, _status), do: state
 
-  defp reply_to(state, request_cmd, status) do
+  defp reply_to(state, %PDU{command: request_cmd, sequence_number: sequence_number}, status) do
     case Map.fetch(@req_resp_map, request_cmd) do
       {:ok, resp_cmd} ->
         body = encode_resp_body(resp_cmd)
 
         wire =
-          PDU.build(command: resp_cmd, status: status, sequence_number: @reply_seq, body: body)
+          PDU.build(
+            command: resp_cmd,
+            status: status,
+            sequence_number: sequence_number,
+            body: body
+          )
           |> PDU.encode()
           |> IO.iodata_to_binary()
 

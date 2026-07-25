@@ -3,9 +3,12 @@ defmodule JasminEx.Smpp.ClientTest do
   # Integration scenarios for the SMPP client session lifecycle (PR2).
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias JasminEx.Smpp.Client
   alias JasminEx.Smpp.FakeSMSC
   alias JasminEx.Smpp.PDU
+  alias JasminEx.Smpp.PDU.Body
 
   # Short timers so heartbeat tests don't run for 30s by default.
   @heartbeat_ms 50
@@ -55,7 +58,7 @@ defmodule JasminEx.Smpp.ClientTest do
   end
 
   defp stop_pair(smsc, client) do
-    if Process.alive?(client),
+    if is_pid(client) and Process.alive?(client),
       do:
         (try do
            GenServer.stop(client, :normal, 200)
@@ -73,6 +76,26 @@ defmodule JasminEx.Smpp.ClientTest do
   end
 
   describe "bind lifecycle" do
+    test "FakeSMSC echoes a request sequence_number in its response" do
+      {:ok, port, smsc} = start_smsc()
+
+      {:ok, socket} =
+        :gen_tcp.connect(~c"localhost", port, [:binary, packet: :raw, active: false], 500)
+
+      request = pdu_bytes(:enquire_link, :ESME_ROK, 42, "")
+
+      assert :ok = :gen_tcp.send(socket, request)
+      assert {:ok, response} = :gen_tcp.recv(socket, 0, 500)
+      assert {:ok, %PDU{command: :enquire_link_resp, sequence_number: 42}} = PDU.decode(response)
+
+      :gen_tcp.close(socket)
+      stop_pair(smsc, nil)
+    end
+
+    test "uses the design-required :state_functions callback mode" do
+      assert Client.callback_mode() == :state_functions
+    end
+
     test "successful bind (status 0) transitions the client to :bound" do
       {:ok, port, smsc} = start_smsc()
       {:ok, client} = start_client(port)
@@ -157,6 +180,21 @@ defmodule JasminEx.Smpp.ClientTest do
   end
 
   describe "reconnect with exponential backoff" do
+    test "rebinds after a TCP drop once heartbeat traffic has advanced the sequence" do
+      {:ok, port, smsc} = start_smsc()
+      {:ok, client} = start_client(port)
+
+      assert :ok = wait_until(fn -> Client.status(client) == :bound end)
+      assert :ok = wait_until(fn -> heartbeat_has_advanced_sequence?(client) end)
+
+      :ok = FakeSMSC.close_on_command(smsc, :submit_sm)
+
+      assert {:error, :disconnected} = Client.send_submit_sm(client, submit_sm("drop"))
+      assert :ok = wait_until(fn -> Client.status(client) == :bound end)
+
+      stop_pair(smsc, client)
+    end
+
     test "deterministic backoff: with jitter disabled and base==cap the client must not reach :bound" do
       {:ok, port, smsc} = start_smsc()
       :ok = FakeSMSC.inject_bind_resp(smsc, :ESME_RSYSERR)
@@ -240,6 +278,69 @@ defmodule JasminEx.Smpp.ClientTest do
   end
 
   describe "pending-window cleanup on involuntary :bound exit" do
+    test "wraps the sequence_number after 0x7FFFFFFF without emitting the high bit" do
+      {:ok, port, smsc} = start_smsc()
+      ref = FakeSMSC.subscribe(smsc)
+      :ok = FakeSMSC.withhold_response(smsc, :submit_sm)
+      {:ok, client} = start_client(port)
+
+      assert :ok = wait_until(fn -> Client.status(client) == :bound end)
+      :sys.replace_state(client, fn {state, data} -> {state, %{data | seq: 0x7FFF_FFFF}} end)
+
+      test_pid = self()
+
+      for message <- ["wrap", "wrap-next"] do
+        spawn_link(fn ->
+          send(
+            test_pid,
+            {String.to_atom(message), Client.send_submit_sm(client, submit_sm(message))}
+          )
+        end)
+      end
+
+      assert %{wrap: 0x7FFF_FFFF, "wrap-next": 1} = await_submit_sequences(ref, %{}, 2)
+
+      :ok = FakeSMSC.close_on_command(smsc, :enquire_link)
+      assert_receive {:wrap, {:error, :disconnected}}, 500
+      assert_receive {:"wrap-next", {:error, :disconnected}}, 500
+      stop_pair(smsc, client)
+    end
+
+    test "routes out-of-order submit_sm responses to their originating callers" do
+      {:ok, port, smsc} = start_smsc()
+      ref = FakeSMSC.subscribe(smsc)
+      :ok = FakeSMSC.withhold_response(smsc, :submit_sm)
+      {:ok, client} = start_client(port)
+
+      assert :ok = wait_until(fn -> Client.status(client) == :bound end)
+
+      test_pid = self()
+
+      for {label, message} <- [{:first, "first"}, {:second, "second"}] do
+        spawn_link(fn ->
+          send(test_pid, {label, Client.send_submit_sm(client, submit_sm(message))})
+        end)
+      end
+
+      sequences = await_submit_sequences(ref, %{}, 2)
+      assert map_size(sequences) == 2
+
+      Enum.each(Enum.reverse(Map.values(sequences)), fn sequence_number ->
+        assert :ok =
+                 FakeSMSC.send_bytes(
+                   smsc,
+                   submit_sm_resp_bytes(sequence_number, "msg-#{sequence_number}")
+                 )
+      end)
+
+      assert_receive {:first, {:ok, first_message_id}}, 500
+      assert_receive {:second, {:ok, second_message_id}}, 500
+      assert first_message_id == "msg-#{sequences.first}"
+      assert second_message_id == "msg-#{sequences.second}"
+
+      stop_pair(smsc, client)
+    end
+
     test "every N pending submit_sm caller gets {:error, :disconnected} when the SMSC drops the socket" do
       {:ok, port, smsc} = start_smsc()
       # Withhold submit_sm_resp so callers stay pending until the TCP drop.
@@ -315,9 +416,13 @@ defmodule JasminEx.Smpp.ClientTest do
       # Harness sends a submit_sm_resp for sequence_number 999 (no
       # matching pending entry); the client must NOT crash and must
       # stay in :bound.
-      _ = FakeSMSC.send_bytes(smsc, pdu_bytes(:submit_sm_resp, :ESME_ROK, 999, "no-such-msg"))
+      log =
+        capture_log(fn ->
+          _ = FakeSMSC.send_bytes(smsc, pdu_bytes(:submit_sm_resp, :ESME_ROK, 999, "no-such-msg"))
+          Process.sleep(50)
+        end)
 
-      Process.sleep(50)
+      assert log =~ "unknown sequence_number 999"
       assert Client.status(client) == :bound
 
       stop_pair(smsc, client)
@@ -329,9 +434,13 @@ defmodule JasminEx.Smpp.ClientTest do
 
       assert :ok = wait_until(fn -> Client.status(client) == :bound end)
 
-      _ = FakeSMSC.send_bytes(smsc, pdu_bytes(:generic_nack, :ESME_RINVCMDID, 0, ""))
+      log =
+        capture_log(fn ->
+          _ = FakeSMSC.send_bytes(smsc, pdu_bytes(:generic_nack, :ESME_RINVCMDID, 0, ""))
+          Process.sleep(50)
+        end)
 
-      Process.sleep(50)
+      assert log =~ "unknown sequence_number 0"
       assert Client.status(client) == :bound
 
       stop_pair(smsc, client)
@@ -342,6 +451,58 @@ defmodule JasminEx.Smpp.ClientTest do
     PDU.build(command: command, status: status, sequence_number: seq, body: body)
     |> PDU.encode()
     |> IO.iodata_to_binary()
+  end
+
+  defp submit_sm_resp_bytes(sequence_number, message_id) do
+    {:ok, body} =
+      Body.encode(
+        :submit_sm_resp,
+        %Body.SubmitSMResp{message_id: message_id}
+      )
+
+    pdu_bytes(:submit_sm_resp, :ESME_ROK, sequence_number, IO.iodata_to_binary(body))
+  end
+
+  defp submit_sm(message) do
+    %JasminEx.Smpp.PDU.Body.SubmitSM{
+      source_addr_ton: :INTERNATIONAL,
+      source_addr_npi: :ISDN,
+      source_addr: "src",
+      dest_addr_ton: :NATIONAL,
+      dest_addr_npi: :ISDN,
+      destination_addr: "5551000",
+      short_message: message
+    }
+  end
+
+  defp heartbeat_has_advanced_sequence?(client) do
+    {_state, data} = :sys.get_state(client)
+    data.seq > 1
+  end
+
+  defp await_submit_sequences(_ref, sequences, expected) when map_size(sequences) == expected,
+    do: sequences
+
+  defp await_submit_sequences(ref, sequences, expected) do
+    receive do
+      {:fake_smsc_bytes, ^ref, payload} ->
+        case PDU.decode(payload) do
+          {:ok, %PDU{command: :submit_sm, sequence_number: sequence_number, body: body}} ->
+            {:ok, %Body.SubmitSM{short_message: message}} = Body.decode(:submit_sm, body)
+
+            await_submit_sequences(
+              ref,
+              Map.put(sequences, String.to_atom(message), sequence_number),
+              expected
+            )
+
+          _ ->
+            await_submit_sequences(ref, sequences, expected)
+        end
+    after
+      500 ->
+        flunk("did not receive #{expected} submit_sm requests")
+    end
   end
 
   ## helpers
