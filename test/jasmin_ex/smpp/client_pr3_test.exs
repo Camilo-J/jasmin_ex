@@ -58,6 +58,17 @@ defmodule JasminEx.Smpp.ClientPR3Test do
 
   defp await_bound(client), do: wait_until(fn -> Client.status(client) == :bound end)
 
+  # Reaching :bind_pending only proves the client's connect/2 returned. The
+  # harness accepts asynchronously, so send_bytes/2 can still answer
+  # {:error, :no_connection} until it has handled its own :accepted message.
+  # Any test that injects bytes while the client is still binding must wait for
+  # both sides, not just the client.
+  defp await_bind_pending(client, smsc) do
+    with :ok <- wait_until(fn -> Client.status(client) == :bind_pending end) do
+      FakeSMSC.wait_connected(smsc)
+    end
+  end
+
   defp stop(pid) when is_pid(pid) do
     if Process.alive?(pid) do
       try do
@@ -99,7 +110,7 @@ defmodule JasminEx.Smpp.ClientPR3Test do
       {port, smsc} = start_smsc()
       :ok = FakeSMSC.withhold_response(smsc, :bind_transmitter)
       {:ok, client} = start_client(port, response_timeout_ms: 500)
-      assert :ok = wait_until(fn -> Client.status(client) == :bind_pending end)
+      assert :ok = await_bind_pending(client, smsc)
 
       assert :ok = FakeSMSC.send_bytes(smsc, pdu_bytes(:bind_transmitter_resp, 999, <<0>>))
       Process.sleep(20)
@@ -283,7 +294,7 @@ defmodule JasminEx.Smpp.ClientPR3Test do
       {:ok, client} =
         start_client(port, deliver_handler: {SendToPid, handler}, response_timeout_ms: 500)
 
-      assert :ok = wait_until(fn -> Client.status(client) == :bind_pending end)
+      assert :ok = await_bind_pending(client, smsc)
       ref = FakeSMSC.subscribe(smsc)
       bind_seq = pending_bind_seq(client)
 
