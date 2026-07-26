@@ -65,6 +65,7 @@ defmodule JasminEx.Smpp.PDU.Constants do
     ESME_RTHROTTLED: 0x0000_0058,
     ESME_RINVSCHED: 0x0000_0061,
     ESME_RINVEXPIRY: 0x0000_0062,
+    ESME_RX_T_APPN: 0x0000_0064,
     ESME_RINVOPTPARSTREAM: 0x0000_00C0,
     ESME_ROPTPARNOTALLWD: 0x0000_00C1,
     ESME_RINVPARLEN: 0x0000_00C2,
@@ -74,6 +75,11 @@ defmodule JasminEx.Smpp.PDU.Constants do
   }
 
   @command_status_atoms Map.new(@command_status, fn {atom, int} -> {int, atom} end)
+
+  # Derived from the table above so the union cannot drift from the encodable
+  # set. Callers that produce a command_status — such as deliver_sm handlers —
+  # spec against this instead of a bare atom().
+  @type command_status :: unquote(Enum.reduce(Map.keys(@command_status), &{:|, [], [&1, &2]}))
 
   # ── TON (Type of Number)
   @ton %{
@@ -174,33 +180,4 @@ defmodule JasminEx.Smpp.PDU.Constants do
 
   @spec data_coding_atoms() :: [atom()]
   def data_coding_atoms, do: Map.keys(@data_coding)
-
-  # ── Helpers used elsewhere in the codec ────────────────────────────────────
-
-  @doc """
-  Returns the request-form command_id atom for a given response-form atom.
-
-  e.g. `resp_to_request(:submit_sm_resp) == {:ok, :submit_sm}`.
-  Useful for matching an inbound response against an in-flight submit_sm.
-  """
-  @spec resp_to_request(atom()) :: {:ok, atom()} | :error
-  def resp_to_request(resp) when is_atom(resp) do
-    str = Atom.to_string(resp)
-
-    case String.split(str, "_resp") do
-      [base] when base != "" ->
-        base_atom = String.to_atom(base)
-
-        if Map.has_key?(@command_ids, base_atom) do
-          {:ok, base_atom}
-        else
-          :error
-        end
-
-      _ ->
-        :error
-    end
-  end
-
-  def resp_to_request(_), do: :error
 end
