@@ -251,7 +251,11 @@ defmodule JasminEx.Smpp.Client do
 
     case :gen_tcp.send(data.socket, IO.iodata_to_binary(PDU.encode(pdu))) do
       :ok ->
-        pending = Map.put(data.pending, seq, %{from: nil, command_id: :bind_transmitter})
+        pending =
+          Map.put(data.pending, seq, %{
+            from: nil,
+            command_id: bind_as_command(data.config.bind_as)
+          })
 
         {:next_state, :bind_pending, %{data | pending: pending},
          [pending_timeout_action(seq, data.config.response_timeout_ms)]}
