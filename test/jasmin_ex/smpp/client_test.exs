@@ -34,7 +34,7 @@ defmodule JasminEx.Smpp.ClientTest do
       reconnect_jitter: false
     ]
 
-    Client.start_link(base ++ opts)
+    Client.start_link(Keyword.merge(base, opts))
   end
 
   defp wait_until(predicate, timeout \\ 1_000) do
@@ -76,6 +76,41 @@ defmodule JasminEx.Smpp.ClientTest do
   end
 
   describe "bind lifecycle" do
+    for {bind_as, request_command, response_command} <- [
+          {:transmitter, :bind_transmitter, :bind_transmitter_resp},
+          {:receiver, :bind_receiver, :bind_receiver_resp},
+          {:transceiver, :bind_transceiver, :bind_transceiver_resp}
+        ] do
+      test "#{bind_as} bind reaches :bound after its matching response" do
+        bind_as = unquote(bind_as)
+        request_command = unquote(request_command)
+        response_command = unquote(response_command)
+
+        {:ok, port, smsc} = start_smsc()
+        :ok = FakeSMSC.withhold_response(smsc, request_command)
+        ref = FakeSMSC.subscribe(smsc)
+        {:ok, client} = start_client(port, bind_as: bind_as)
+
+        assert :ok = FakeSMSC.wait_connected(smsc, 500)
+
+        assert_receive {:fake_smsc_bytes, ^ref, payload}, 500
+
+        assert {:ok, %PDU{command: ^request_command, sequence_number: sequence_number}} =
+                 PDU.decode(payload)
+
+        assert Client.status(client) == :bind_pending
+
+        assert :ok =
+                 FakeSMSC.send_bytes(
+                   smsc,
+                   pdu_bytes(response_command, :ESME_ROK, sequence_number, "")
+                 )
+
+        assert :ok = wait_until(fn -> Client.status(client) == :bound end)
+        stop_pair(smsc, client)
+      end
+    end
+
     test "FakeSMSC echoes a request sequence_number in its response" do
       {:ok, port, smsc} = start_smsc()
 
