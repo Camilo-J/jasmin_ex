@@ -113,6 +113,16 @@ defmodule JasminEx.Smpp.FakeSMSC do
     GenServer.call(pid, {:set_script, command_id, :close})
   end
 
+  @doc "Queue responses for a command until `release_reordered/1` is called."
+  @spec reorder_responses(pid(), atom()) :: :ok
+  def reorder_responses(pid, command_id) do
+    GenServer.call(pid, {:set_script, command_id, :reorder})
+  end
+
+  @doc "Release queued responses newest-first to exercise response correlation."
+  @spec release_reordered(pid()) :: :ok
+  def release_reordered(pid), do: GenServer.call(pid, :release_reordered)
+
   # ── GenServer callbacks ───────────────────────────────────────────────────
 
   @impl true
@@ -131,7 +141,8 @@ defmodule JasminEx.Smpp.FakeSMSC do
        script: script,
        subscribers: %{},
        conn: nil,
-       buffer: <<>>
+       buffer: <<>>,
+       queued_responses: []
      }}
   end
 
@@ -155,6 +166,17 @@ defmodule JasminEx.Smpp.FakeSMSC do
 
   def handle_call({:set_script, command_id, action}, _from, %{script: script} = state) do
     {:reply, :ok, %{state | script: Map.put(script, command_id, action)}}
+  end
+
+  def handle_call(:release_reordered, _from, state) do
+    state =
+      Enum.reduce(
+        state.queued_responses,
+        %{state | queued_responses: []},
+        &reply_to(&2, &1, :ESME_ROK)
+      )
+
+    {:reply, :ok, state}
   end
 
   @impl true
@@ -284,6 +306,9 @@ defmodule JasminEx.Smpp.FakeSMSC do
     do: reply_to(state, pdu, status)
 
   defp apply_action(state, _pdu, :withhold), do: state
+
+  defp apply_action(state, %PDU{} = pdu, :reorder),
+    do: %{state | queued_responses: [pdu | state.queued_responses]}
 
   defp apply_action(state, _pdu, :close) do
     if state.conn, do: :gen_tcp.close(state.conn)
