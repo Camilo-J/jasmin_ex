@@ -736,6 +736,11 @@ defmodule JasminEx.Smpp.Client do
   defp build_config(opts) do
     response_timeout_ms = Keyword.get(opts, :response_timeout_ms, @default_response_timeout_ms)
 
+    unbind_drain_timeout_ms =
+      opts
+      |> Keyword.get(:unbind_drain_timeout_ms, response_timeout_ms)
+      |> validate_unbind_drain_timeout!()
+
     %{
       host: Keyword.fetch!(opts, :host),
       port: Keyword.fetch!(opts, :port),
@@ -745,7 +750,7 @@ defmodule JasminEx.Smpp.Client do
       bind_as: Keyword.fetch!(opts, :bind_as),
       heartbeat_ms: Keyword.get(opts, :heartbeat_ms, @default_heartbeat_ms),
       response_timeout_ms: response_timeout_ms,
-      unbind_drain_timeout_ms: Keyword.get(opts, :unbind_drain_timeout_ms, response_timeout_ms),
+      unbind_drain_timeout_ms: unbind_drain_timeout_ms,
       reconnect: %{
         base_ms: Keyword.get(opts, :reconnect_base_ms, @default_reconnect_base_ms),
         factor: Keyword.get(opts, :reconnect_factor, @default_reconnect_factor),
@@ -754,6 +759,14 @@ defmodule JasminEx.Smpp.Client do
       },
       deliver_handler: normalize_deliver_handler(Keyword.get(opts, :deliver_handler))
     }
+  end
+
+  defp validate_unbind_drain_timeout!(timeout) when is_integer(timeout) and timeout >= 0,
+    do: timeout
+
+  defp validate_unbind_drain_timeout!(timeout) do
+    raise ArgumentError,
+          ":unbind_drain_timeout_ms must be a non-negative integer, got: #{inspect(timeout)}"
   end
 
   defp normalize_deliver_handler({handler, context}) when is_atom(handler),

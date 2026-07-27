@@ -505,6 +505,33 @@ defmodule JasminEx.Smpp.ClientPR3Test do
   end
 
   describe "graceful unbind" do
+    test "rejects invalid effective unbind drain timeouts before starting" do
+      for timeout <- [-1, 1.5] do
+        message =
+          ":unbind_drain_timeout_ms must be a non-negative integer, got: #{inspect(timeout)}"
+
+        assert_raise ArgumentError, message, fn ->
+          start_client(1, unbind_drain_timeout_ms: timeout)
+        end
+      end
+    end
+
+    test "zero drain timeout immediately releases unresolved submits" do
+      {port, smsc} = start_smsc()
+      :ok = FakeSMSC.withhold_response(smsc, :submit_sm)
+      {:ok, client} = start_client(port, unbind_drain_timeout_ms: 0)
+      assert :ok = await_bound(client)
+      ref = FakeSMSC.subscribe_pdus(smsc)
+
+      task = Task.async(fn -> Client.send_submit_sm(client, submit_sm("immediate-deadline")) end)
+      assert %PDU{command: :submit_sm} = await_pdu_event(ref, :submit_sm)
+      assert :ok = Client.unbind(client)
+
+      assert {:unknown, :unbind_deadline} = Task.await(task, 500)
+      assert %PDU{command: :unbind} = await_pdu_event(ref, :unbind)
+      stop(smsc)
+    end
+
     test "unbind replies instead of blocking when the session is not bound" do
       {port, smsc} = start_smsc()
       :ok = FakeSMSC.withhold_response(smsc, :bind_transmitter)
