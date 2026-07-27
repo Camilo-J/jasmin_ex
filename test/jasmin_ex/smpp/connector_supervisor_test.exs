@@ -5,13 +5,17 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
   alias JasminEx.Application
   alias JasminEx.Smpp.Client
   alias JasminEx.Smpp.ConnectorSupervisor
+  alias JasminEx.Smpp.ConnectorSupervisor.Instance
   alias JasminEx.Smpp.FakeSMSC
+  alias JasminEx.Smpp.PDU.Body
 
   @invalid_connectors_message "invalid SMPP connector configuration: expected [], one non-empty keyword connector configuration, or a list of non-empty keyword connector configurations"
 
-  test "uses an explicit three-restarts-in-five-seconds intensity" do
-    assert {:ok, {flags, []}} = ConnectorSupervisor.init([])
+  test "gives each connector an explicit three-restarts-in-five-seconds intensity" do
+    assert {:ok, {flags, [child]}} = Instance.init(connector_config(1111))
     assert %{intensity: 3, period: 5, strategy: :one_for_one} = flags
+    assert child.restart == :transient
+    assert child.start == {Client, :start_link, [connector_config(1111)]}
   end
 
   test "normalizes zero, one, and multiple connector configurations" do
@@ -21,14 +25,15 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
     assert {:ok, {_flags, []}} = ConnectorSupervisor.init([])
 
     assert {:ok, {_flags, [single]}} = ConnectorSupervisor.init(first)
-    assert single.id == {:smpp_client, 0}
-    assert single.start == {Client, :start_link, [first]}
+    assert single.id == {:smpp_connector, 0}
+    assert single.start == {Instance, :start_link, [first]}
+    assert single.restart == :transient
 
     assert {:ok, {_flags, [first_child, second_child]}} =
              ConnectorSupervisor.init([first, second])
 
-    assert first_child.start == {Client, :start_link, [first]}
-    assert second_child.start == {Client, :start_link, [second]}
+    assert first_child.start == {Instance, :start_link, [first]}
+    assert second_child.start == {Instance, :start_link, [second]}
   end
 
   test "rejects invalid top-level and malformed list shapes" do
@@ -45,14 +50,15 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
     {:ok, port, smsc} = FakeSMSC.start_link()
     {:ok, supervisor} = ConnectorSupervisor.start_link(connector_config(port))
 
-    [{_id, first_client, :worker, [Client]}] = Supervisor.which_children(supervisor)
+    connector = child_pid(supervisor, {:smpp_connector, 0})
+    first_client = child_pid(connector, :smpp_client)
     assert :ok = wait_until(fn -> Client.status(first_client) == :bound end)
 
     Process.exit(first_client, :kill)
 
     assert :ok =
              wait_until(fn ->
-               case Supervisor.which_children(supervisor) do
+               case Supervisor.which_children(connector) do
                  [{_id, client, :worker, [Client]}] when is_pid(client) ->
                    client != first_client and Client.status(client) == :bound
 
@@ -61,7 +67,7 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
                end
              end)
 
-    [{_id, restarted_client, :worker, [Client]}] = Supervisor.which_children(supervisor)
+    restarted_client = child_pid(connector, :smpp_client)
     refute restarted_client == first_client
 
     GenServer.stop(supervisor)
@@ -74,7 +80,8 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
     {:ok, supervisor} =
       ConnectorSupervisor.start_link(connector_config(port))
 
-    [{_id, client, :worker, [Client]}] = Supervisor.which_children(supervisor)
+    connector = child_pid(supervisor, {:smpp_connector, 0})
+    client = child_pid(connector, :smpp_client)
     assert :ok = wait_until(fn -> Client.status(client) == :bound end)
     monitor = Process.monitor(client)
     assert :ok = Client.unbind(client)
@@ -82,13 +89,78 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
 
     assert :ok =
              wait_until(fn ->
-               Enum.all?(Supervisor.which_children(supervisor), fn {_id, pid, _type, _modules} ->
+               Enum.all?(Supervisor.which_children(connector), fn {_id, pid, _type, _modules} ->
                  pid == :undefined
                end)
              end)
 
     GenServer.stop(supervisor)
     GenServer.stop(smsc)
+  end
+
+  test "a connector crash loop does not terminate or disrupt a healthy sibling" do
+    {:ok, crashing_port, crashing_smsc} = FakeSMSC.start_link()
+    {:ok, healthy_port, healthy_smsc} = FakeSMSC.start_link()
+
+    {:ok, supervisor} =
+      ConnectorSupervisor.start_link([
+        connector_config(crashing_port),
+        connector_config(healthy_port)
+      ])
+
+    crashing_connector = child_pid(supervisor, {:smpp_connector, 0})
+    healthy_connector = child_pid(supervisor, {:smpp_connector, 1})
+    crashing_client = child_pid(crashing_connector, :smpp_client)
+    healthy_client = child_pid(healthy_connector, :smpp_client)
+
+    assert :ok = wait_until(fn -> Client.status(crashing_client) == :bound end)
+    assert :ok = wait_until(fn -> Client.status(healthy_client) == :bound end)
+
+    handler_id = {__MODULE__, make_ref()}
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:jasmin_ex, :smpp, :bound],
+        &__MODULE__.handle_bound/4,
+        test_pid
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    crashing_client =
+      Enum.reduce(1..3, crashing_client, fn _restart, client ->
+        client_ref = Process.monitor(client)
+        Process.exit(client, :kill)
+        assert_receive {:DOWN, ^client_ref, :process, ^client, :killed}, 500
+        assert_receive {:connector_bound, restarted_client}, 500
+        assert restarted_client == child_pid(crashing_connector, :smpp_client)
+        restarted_client
+      end)
+
+    connector_ref = Process.monitor(crashing_connector)
+    client_ref = Process.monitor(crashing_client)
+    Process.exit(crashing_client, :kill)
+
+    assert_receive {:DOWN, ^client_ref, :process, ^crashing_client, :killed}, 500
+    assert_receive {:DOWN, ^connector_ref, :process, ^crashing_connector, :shutdown}, 500
+
+    assert Process.alive?(supervisor)
+    assert healthy_connector == child_pid(supervisor, {:smpp_connector, 1})
+    assert healthy_client == child_pid(healthy_connector, :smpp_client)
+    assert Client.status(healthy_client) == :bound
+
+    assert {:ok, "fake-msg-id"} =
+             Client.send_submit_sm(healthy_client, submit_sm("still-healthy"))
+
+    GenServer.stop(supervisor)
+    GenServer.stop(crashing_smsc)
+    GenServer.stop(healthy_smsc)
+  end
+
+  def handle_bound(_event, _measurements, metadata, test_pid) do
+    send(test_pid, {:connector_bound, metadata.client})
   end
 
   test "application only wires a connector supervisor when connector config is present" do
@@ -110,6 +182,27 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
       reconnect_cap_ms: 5,
       reconnect_jitter: false
     ]
+  end
+
+  defp child_pid(supervisor, id) do
+    {^id, pid, _type, _modules} =
+      Enum.find(Supervisor.which_children(supervisor), fn {child_id, _, _, _} ->
+        child_id == id
+      end)
+
+    pid
+  end
+
+  defp submit_sm(message) do
+    %Body.SubmitSM{
+      source_addr_ton: :INTERNATIONAL,
+      source_addr_npi: :ISDN,
+      source_addr: "src",
+      dest_addr_ton: :NATIONAL,
+      dest_addr_npi: :ISDN,
+      destination_addr: "5551000",
+      short_message: message
+    }
   end
 
   defp wait_until(predicate, timeout \\ 1_000) do
