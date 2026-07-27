@@ -224,7 +224,7 @@ defmodule JasminEx.Smpp.ClientTest do
 
       :ok = FakeSMSC.close_on_command(smsc, :submit_sm)
 
-      assert {:error, :disconnected} = Client.send_submit_sm(client, submit_sm("drop"))
+      assert {:unknown, :disconnected} = Client.send_submit_sm(client, submit_sm("drop"))
       assert :ok = wait_until(fn -> Client.status(client) == :bound end)
 
       stop_pair(smsc, client)
@@ -336,8 +336,8 @@ defmodule JasminEx.Smpp.ClientTest do
       assert %{wrap: 0x7FFF_FFFF, "wrap-next": 1} = await_submit_sequences(ref, %{}, 2)
 
       :ok = FakeSMSC.close_on_command(smsc, :enquire_link)
-      assert_receive {:wrap, {:error, :disconnected}}, 500
-      assert_receive {:"wrap-next", {:error, :disconnected}}, 500
+      assert_receive {:wrap, {:unknown, :disconnected}}, 500
+      assert_receive {:"wrap-next", {:unknown, :disconnected}}, 500
       stop_pair(smsc, client)
     end
 
@@ -376,7 +376,7 @@ defmodule JasminEx.Smpp.ClientTest do
       stop_pair(smsc, client)
     end
 
-    test "every N pending submit_sm caller gets {:error, :disconnected} when the SMSC drops the socket" do
+    test "every N pending submit_sm caller gets an unknown outcome when the SMSC drops the socket" do
       {:ok, port, smsc} = start_smsc()
       # Withhold submit_sm_resp so callers stay pending until the TCP drop.
       :ok = FakeSMSC.withhold_response(smsc, :submit_sm)
@@ -430,10 +430,10 @@ defmodule JasminEx.Smpp.ClientTest do
       Enum.each(1..n, fn i ->
         receive do
           {:reply_for, ^i, reply} ->
-            assert reply == {:error, :disconnected}, "caller #{i} got #{inspect(reply)}"
+            assert reply == {:unknown, :disconnected}, "caller #{i} got #{inspect(reply)}"
         after
           1_000 ->
-            flunk("caller #{i} did not receive {:error, :disconnected} within 1s")
+            flunk("caller #{i} did not receive {:unknown, :disconnected} within 1s")
         end
       end)
 
@@ -457,7 +457,7 @@ defmodule JasminEx.Smpp.ClientTest do
           Process.sleep(50)
         end)
 
-      assert log =~ "unknown sequence_number 999"
+      assert log =~ "late or unmatched SMPP response discarded"
       assert Client.status(client) == :bound
 
       stop_pair(smsc, client)
@@ -475,7 +475,7 @@ defmodule JasminEx.Smpp.ClientTest do
           Process.sleep(50)
         end)
 
-      assert log =~ "unknown sequence_number 0"
+      assert log =~ "late or unmatched SMPP response discarded"
       assert Client.status(client) == :bound
 
       stop_pair(smsc, client)

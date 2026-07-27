@@ -94,9 +94,18 @@ defmodule JasminEx.Smpp.ClientPR3Test do
   end
 
   defp pdu_bytes(command, sequence_number, body) do
-    PDU.build(command: command, status: :ESME_ROK, sequence_number: sequence_number, body: body)
+    pdu_bytes(command, :ESME_ROK, sequence_number, body)
+  end
+
+  defp pdu_bytes(command, status, sequence_number, body) do
+    PDU.build(command: command, status: status, sequence_number: sequence_number, body: body)
     |> PDU.encode()
     |> IO.iodata_to_binary()
+  end
+
+  defp submit_sm_resp_bytes(sequence_number, message_id) do
+    {:ok, body} = Body.encode(:submit_sm_resp, %Body.SubmitSMResp{message_id: message_id})
+    pdu_bytes(:submit_sm_resp, sequence_number, IO.iodata_to_binary(body))
   end
 
   defp deliver_sm_bytes(sequence_number, message) do
@@ -140,7 +149,7 @@ defmodule JasminEx.Smpp.ClientPR3Test do
       assert :ok = await_bound(client)
 
       :ok = FakeSMSC.close_on_command(smsc, :submit_sm)
-      assert {:error, :disconnected} = Client.send_submit_sm(client, submit_sm("drop"))
+      assert {:unknown, :disconnected} = Client.send_submit_sm(client, submit_sm("drop"))
 
       assert_receive {:telemetry, [:jasmin_ex, :smpp, :disconnected], %{}}, 500
       assert_receive {:telemetry, [:jasmin_ex, :smpp, :reconnect_scheduled], %{attempt: _}}, 500
@@ -197,6 +206,128 @@ defmodule JasminEx.Smpp.ClientPR3Test do
       assert Client.status(client) in [:disconnected, :connecting, :bind_pending]
       assert {:error, :disconnected} = Client.send_submit_sm(client, submit_sm("early"))
       assert Process.alive?(client)
+      stop(client)
+      stop(smsc)
+    end
+
+    test "a successful submit response returns its message ID" do
+      {port, smsc} = start_smsc()
+      {:ok, client} = start_client(port)
+      assert :ok = await_bound(client)
+
+      assert {:ok, "fake-msg-id"} = Client.send_submit_sm(client, submit_sm("accepted"))
+      stop(client)
+      stop(smsc)
+    end
+
+    test "a local submit write failure returns an unknown send failure exactly once" do
+      {port, smsc} = start_smsc()
+      {:ok, client} = start_client(port, reconnect_base_ms: 500, reconnect_cap_ms: 500)
+      assert :ok = await_bound(client)
+      ref = FakeSMSC.subscribe_pdus(smsc)
+      closed_socket = closed_tcp_socket()
+
+      :sys.replace_state(client, fn {state, data} ->
+        {state, %{data | socket: closed_socket}}
+      end)
+
+      caller = spawn_submit_caller(client, submit_sm("send-failed"), 100)
+
+      assert_receive {:submit_result, ^caller, {:unknown, {:send_failed, :closed}}}, 500
+      refute_receive {:fake_smsc_pdu, ^ref, %PDU{command: :submit_sm}}, 50
+      assert_receive {:no_late_submit_reply, ^caller}, 200
+      stop(client)
+      stop(smsc)
+    end
+
+    test "successful responses with empty or malformed message IDs are unknown exactly once" do
+      {port, smsc} = start_smsc()
+      :ok = FakeSMSC.withhold_response(smsc, :submit_sm)
+      {:ok, client} = start_client(port, response_timeout_ms: 80)
+      assert :ok = await_bound(client)
+      ref = FakeSMSC.subscribe_pdus(smsc)
+
+      for response_body <- [<<0>>, <<0xFF>>] do
+        caller = spawn_submit_caller(client, submit_sm("invalid-response"), 120)
+        %PDU{sequence_number: seq} = await_pdu_event(ref, :submit_sm)
+
+        assert :ok =
+                 FakeSMSC.send_bytes(
+                   smsc,
+                   pdu_bytes(:submit_sm_resp, :ESME_ROK, seq, response_body)
+                 )
+
+        assert_receive {:submit_result, ^caller, {:unknown, :invalid_response}}, 500
+        assert_receive {:no_late_submit_reply, ^caller}, 200
+        assert pending_count(client) == 0
+      end
+
+      assert Client.status(client) == :bound
+      stop(client)
+      stop(smsc)
+    end
+
+    for status <- [:ESME_RTHROTTLED, :ESME_RINVDSTADR] do
+      test "submit rejection #{status} is a definite protocol error" do
+        status = unquote(status)
+        {port, smsc} = start_smsc()
+        :ok = FakeSMSC.withhold_response(smsc, :submit_sm)
+        {:ok, client} = start_client(port)
+        assert :ok = await_bound(client)
+        ref = FakeSMSC.subscribe_pdus(smsc)
+
+        task = Task.async(fn -> Client.send_submit_sm(client, submit_sm("rejected")) end)
+        %PDU{sequence_number: seq} = await_pdu_event(ref, :submit_sm)
+
+        assert :ok = FakeSMSC.send_bytes(smsc, pdu_bytes(:submit_sm_resp, status, seq, <<0xFF>>))
+        assert {:error, {:submit_rejected, ^status}} = Task.await(task, 500)
+        stop(client)
+        stop(smsc)
+      end
+    end
+
+    test "a withheld submit response returns an explicit unknown timeout" do
+      {port, smsc} = start_smsc()
+      :ok = FakeSMSC.withhold_response(smsc, :submit_sm)
+      {:ok, client} = start_client(port, response_timeout_ms: 40)
+      assert :ok = await_bound(client)
+
+      assert {:unknown, :response_timeout} =
+               Client.send_submit_sm(client, submit_sm("withheld"))
+
+      stop(client)
+      stop(smsc)
+    end
+
+    test "the public call waits for protocol timeouts longer than five seconds" do
+      {port, smsc} = start_smsc()
+      :ok = FakeSMSC.withhold_response(smsc, :submit_sm)
+      {:ok, client} = start_client(port, response_timeout_ms: 6_000)
+      assert :ok = await_bound(client)
+      ref = FakeSMSC.subscribe_pdus(smsc)
+
+      task =
+        Task.async(fn ->
+          receive do: (:send -> Client.send_submit_sm(client, submit_sm("long")))
+        end)
+
+      :erlang.trace_pattern({:gen_statem, :call, 3}, true, [])
+      :erlang.trace(task.pid, true, [:call])
+
+      on_exit(fn ->
+        :erlang.trace_pattern({:gen_statem, :call, 3}, false, [])
+      end)
+
+      send(task.pid, :send)
+
+      assert_receive {:trace, caller, :call,
+                      {:gen_statem, :call, [^client, {:send_submit_sm, _body}, :infinity]}},
+                     500
+
+      assert caller == task.pid
+      %PDU{sequence_number: seq} = await_pdu_event(ref, :submit_sm)
+      assert :ok = FakeSMSC.send_bytes(smsc, submit_sm_resp_bytes(seq, "long-id"))
+      assert {:ok, "long-id"} = Task.await(task, 500)
       stop(client)
       stop(smsc)
     end
@@ -401,11 +532,159 @@ defmodule JasminEx.Smpp.ClientPR3Test do
       stop(smsc)
     end
 
-    test "unbind cancels the pending timers of the requests it flushes" do
+    test "new submits are rejected before bytes are written while existing submits drain" do
+      {port, smsc} = start_smsc()
+      :ok = FakeSMSC.withhold_response(smsc, :submit_sm)
+      {:ok, client} = start_client(port, response_timeout_ms: 500, unbind_drain_timeout_ms: 50)
+      assert :ok = await_bound(client)
+      ref = FakeSMSC.subscribe_pdus(smsc)
+
+      task = Task.async(fn -> Client.send_submit_sm(client, submit_sm("existing")) end)
+      assert %PDU{command: :submit_sm} = await_pdu_event(ref, :submit_sm)
+
+      assert :ok = Client.unbind(client)
+      assert {:error, :unbinding} = Client.send_submit_sm(client, submit_sm("new"))
+      refute_receive {:fake_smsc_pdu, ^ref, %PDU{command: :submit_sm}}, 30
+      assert {:unknown, :unbind_deadline} = Task.await(task, 500)
+      assert %PDU{command: :unbind} = await_pdu_event(ref, :unbind)
+      stop(smsc)
+    end
+
+    test "an existing submit response settles before the wire unbind is sent" do
+      {port, smsc} = start_smsc()
+      :ok = FakeSMSC.withhold_response(smsc, :submit_sm)
+
+      {:ok, client} =
+        start_client(port, response_timeout_ms: 500, unbind_drain_timeout_ms: 300)
+
+      assert :ok = await_bound(client)
+      ref = FakeSMSC.subscribe_pdus(smsc)
+
+      task = Task.async(fn -> Client.send_submit_sm(client, submit_sm("draining")) end)
+      %PDU{sequence_number: seq} = await_pdu_event(ref, :submit_sm)
+      assert :ok = Client.unbind(client)
+      refute_receive {:fake_smsc_pdu, ^ref, %PDU{command: :unbind}}, 30
+
+      assert :ok = FakeSMSC.send_bytes(smsc, submit_sm_resp_bytes(seq, "drained-id"))
+      assert {:ok, "drained-id"} = Task.await(task, 500)
+      assert %PDU{command: :unbind} = await_pdu_event(ref, :unbind)
+      stop(smsc)
+    end
+
+    test "out-of-order submit responses all drain before exactly one wire unbind" do
+      {port, smsc} = start_smsc()
+      :ok = FakeSMSC.reorder_responses(smsc, :submit_sm)
+
+      {:ok, client} =
+        start_client(port, response_timeout_ms: 500, unbind_drain_timeout_ms: 300)
+
+      assert :ok = await_bound(client)
+      ref = FakeSMSC.subscribe_pdus(smsc)
+
+      tasks =
+        for message <- ["first", "second"] do
+          Task.async(fn -> Client.send_submit_sm(client, submit_sm(message)) end)
+        end
+
+      assert %PDU{command: :submit_sm} = await_pdu_event(ref, :submit_sm)
+      assert %PDU{command: :submit_sm} = await_pdu_event(ref, :submit_sm)
+      assert :ok = Client.unbind(client)
+      refute_receive {:fake_smsc_pdu, ^ref, %PDU{command: :unbind}}, 30
+
+      assert :ok = FakeSMSC.release_reordered(smsc)
+      assert Enum.map(tasks, &Task.await(&1, 500)) == [{:ok, "fake-msg-id"}, {:ok, "fake-msg-id"}]
+      assert %PDU{command: :unbind} = await_pdu_event(ref, :unbind)
+      refute_receive {:fake_smsc_pdu, ^ref, %PDU{command: :unbind}}, 50
+      stop(smsc)
+    end
+
+    test "the drain deadline releases unresolved submits before sending wire unbind" do
+      {port, smsc} = start_smsc()
+      :ok = FakeSMSC.withhold_response(smsc, :submit_sm)
+
+      {:ok, client} =
+        start_client(port, response_timeout_ms: 500, unbind_drain_timeout_ms: 40)
+
+      assert :ok = await_bound(client)
+      ref = FakeSMSC.subscribe_pdus(smsc)
+
+      task = Task.async(fn -> Client.send_submit_sm(client, submit_sm("deadline")) end)
+      assert %PDU{command: :submit_sm} = await_pdu_event(ref, :submit_sm)
+      assert :ok = Client.unbind(client)
+
+      assert {:unknown, :unbind_deadline} = Task.await(task, 500)
+      assert %PDU{command: :unbind} = await_pdu_event(ref, :unbind)
+      stop(smsc)
+    end
+
+    test "disconnect while draining releases submits and does not reconnect" do
+      {port, smsc} = start_smsc()
+      :ok = FakeSMSC.withhold_response(smsc, :submit_sm)
+      {:ok, client} = start_client(port, response_timeout_ms: 500)
+      assert :ok = await_bound(client)
+      ref = FakeSMSC.subscribe_pdus(smsc)
+      monitor = Process.monitor(client)
+
+      task = Task.async(fn -> Client.send_submit_sm(client, submit_sm("disconnect")) end)
+      assert %PDU{command: :submit_sm} = await_pdu_event(ref, :submit_sm)
+      assert :ok = Client.unbind(client)
+      assert :ok = GenServer.stop(smsc)
+
+      assert {:unknown, :disconnected} = Task.await(task, 500)
+      assert_receive {:DOWN, ^monitor, :process, ^client, :normal}, 500
+      refute Process.alive?(client)
+    end
+
+    test "a cancelled submit timer cannot terminate a later drain" do
+      {port, smsc} = start_smsc()
+      :ok = FakeSMSC.withhold_response(smsc, :submit_sm)
+
+      {:ok, client} =
+        start_client(port, response_timeout_ms: 120, unbind_drain_timeout_ms: 500)
+
+      assert :ok = await_bound(client)
+      ref = FakeSMSC.subscribe_pdus(smsc)
+
+      first = Task.async(fn -> Client.send_submit_sm(client, submit_sm("first")) end)
+      %PDU{sequence_number: first_seq} = await_pdu_event(ref, :submit_sm)
+      assert :ok = FakeSMSC.send_bytes(smsc, submit_sm_resp_bytes(first_seq, "first-id"))
+      assert {:ok, "first-id"} = Task.await(first, 500)
+
+      Process.sleep(90)
+      second = Task.async(fn -> Client.send_submit_sm(client, submit_sm("second")) end)
+      %PDU{sequence_number: second_seq} = await_pdu_event(ref, :submit_sm)
+      assert :ok = Client.unbind(client)
+      Process.sleep(40)
+
+      assert Process.alive?(client)
+      assert Client.status(client) == :unbinding
+      refute_receive {:fake_smsc_pdu, ^ref, %PDU{command: :unbind}}, 20
+
+      assert :ok = FakeSMSC.send_bytes(smsc, submit_sm_resp_bytes(second_seq, "second-id"))
+      assert {:ok, "second-id"} = Task.await(second, 500)
+      assert %PDU{command: :unbind} = await_pdu_event(ref, :unbind)
+      stop(smsc)
+    end
+
+    test "wire unbind send failure stops instead of remaining bound" do
+      {port, smsc} = start_smsc()
+      {:ok, client} = start_client(port)
+      assert :ok = await_bound(client)
+      monitor = Process.monitor(client)
+
+      :sys.replace_state(client, fn {state, data} -> {state, %{data | socket: nil}} end)
+
+      assert {:error, {:send_failed, _reason}} = Client.unbind(client)
+      assert_receive {:DOWN, ^monitor, :process, ^client, :normal}, 500
+      refute Process.alive?(client)
+      stop(smsc)
+    end
+
+    test "a submit timeout during draining cannot be mistaken for the unbind timeout" do
       {port, smsc} = start_smsc()
       :ok = FakeSMSC.withhold_response(smsc, :submit_sm)
       :ok = FakeSMSC.withhold_response(smsc, :unbind)
-      {:ok, client} = start_client(port, response_timeout_ms: 400)
+      {:ok, client} = start_client(port, response_timeout_ms: 100, unbind_drain_timeout_ms: 500)
       assert :ok = await_bound(client)
 
       test_pid = self()
@@ -415,40 +694,12 @@ defmodule JasminEx.Smpp.ClientPR3Test do
       end)
 
       assert :ok = wait_until(fn -> pending_count(client) == 1 end)
-
-      # Let the flushed request's timer come close to firing before unbinding.
-      # If unbind leaves it armed it expires almost immediately inside
-      # :unbinding, whose catch-all stops the session long before the unbind
-      # timer would have. Both timers share response_timeout_ms, so only this
-      # head start makes the two outcomes distinguishable in time.
-      Process.sleep(320)
       assert :ok = Client.unbind(client)
-      assert_receive {:flushed, {:error, :unbinding}}, 500
+      assert_receive {:flushed, {:unknown, :response_timeout}}, 500
 
-      Process.sleep(150)
-      assert Process.alive?(client), "a stale flushed timer stopped the session during unbind"
+      assert Process.alive?(client)
       assert Client.status(client) == :unbinding
       stop(client)
-      stop(smsc)
-    end
-
-    test "unbind resolves pending requests with :unbinding and stops normally after unbind_resp" do
-      {port, smsc} = start_smsc()
-      :ok = FakeSMSC.withhold_response(smsc, :submit_sm)
-      {:ok, client} = start_client(port)
-      assert :ok = await_bound(client)
-
-      test_pid = self()
-
-      spawn_link(fn ->
-        send(test_pid, {:pending, Client.send_submit_sm(client, submit_sm("pending"))})
-      end)
-
-      assert :ok = wait_until(fn -> pending_count(client) == 1 end)
-
-      assert :ok = Client.unbind(client)
-      assert_receive {:pending, {:error, :unbinding}}, 500
-      assert :ok = wait_until(fn -> not Process.alive?(client) end)
       stop(smsc)
     end
 
@@ -485,6 +736,43 @@ defmodule JasminEx.Smpp.ClientPR3Test do
     after
       500 -> flunk("did not receive #{command} from client")
     end
+  end
+
+  defp await_pdu_event(ref, command) do
+    receive do
+      {:fake_smsc_pdu, ^ref, %PDU{command: ^command} = pdu} -> pdu
+      {:fake_smsc_pdu, ^ref, _other} -> await_pdu_event(ref, command)
+    after
+      500 -> flunk("did not receive decoded #{command} from client")
+    end
+  end
+
+  defp spawn_submit_caller(client, body, late_reply_wait_ms) do
+    parent = self()
+
+    spawn(fn ->
+      result = Client.send_submit_sm(client, body)
+      send(parent, {:submit_result, self(), result})
+
+      receive do
+        message -> send(parent, {:late_submit_reply, self(), message})
+      after
+        late_reply_wait_ms -> send(parent, {:no_late_submit_reply, self()})
+      end
+    end)
+  end
+
+  defp closed_tcp_socket do
+    {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false])
+    {:ok, {_address, port}} = :inet.sockname(listener)
+    accept = Task.async(fn -> :gen_tcp.accept(listener) end)
+    {:ok, socket} = :gen_tcp.connect(~c"localhost", port, [:binary, active: false])
+    {:ok, peer} = Task.await(accept)
+
+    :ok = :gen_tcp.close(peer)
+    :ok = :gen_tcp.close(socket)
+    :ok = :gen_tcp.close(listener)
+    socket
   end
 
   defp await_submits(_ref, 0), do: :ok
