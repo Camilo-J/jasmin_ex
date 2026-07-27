@@ -6,8 +6,9 @@ defmodule JasminEx.Smpp.Client do
 
     * `start_link/1` starts a session and begins connection attempts.
     * `status/1` reports the lifecycle state.
-    * `send_submit_sm/2` sends a request while bound and replies asynchronously
-      when its sequence-matched response arrives.
+    * `send_submit_sm/2` sends a request while bound and returns an accepted,
+      rejected, known-not-sent, or unknown outcome from its sequence-matched
+      response lifecycle. Acceptance by the SMSC does not mean handset delivery.
     * `unbind/1` closes the session deliberately after an SMPP unbind exchange.
 
   ## Lifecycle states
@@ -43,9 +44,21 @@ defmodule JasminEx.Smpp.Client do
   @spec status(pid()) :: :disconnected | :connecting | :bind_pending | :bound | :unbinding
   def status(pid), do: :gen_statem.call(pid, :status, 5_000)
 
-  @spec send_submit_sm(pid(), Body.SubmitSM.t()) :: {:ok, String.t()} | {:error, term()}
+  @type submit_unknown_reason ::
+          :response_timeout
+          | :disconnected
+          | :unbind_deadline
+          | :invalid_response
+          | {:send_failed, term()}
+
+  @type submit_result ::
+          {:ok, String.t()}
+          | {:error, {:submit_rejected, Constants.command_status()} | :disconnected | :unbinding}
+          | {:unknown, submit_unknown_reason()}
+
+  @spec send_submit_sm(pid(), Body.SubmitSM.t()) :: submit_result()
   def send_submit_sm(pid, %Body.SubmitSM{} = body),
-    do: :gen_statem.call(pid, {:send_submit_sm, body}, 5_000)
+    do: :gen_statem.call(pid, {:send_submit_sm, body}, :infinity)
 
   @spec unbind(pid()) :: :ok | {:error, term()}
   def unbind(pid), do: :gen_statem.call(pid, :unbind, 5_000)
@@ -64,7 +77,8 @@ defmodule JasminEx.Smpp.Client do
       cancelled: [],
       backoff_attempt: 0,
       target_state: nil,
-      exit_reason: nil
+      exit_reason: nil,
+      unbind_phase: nil
     }
 
     {:ok, :disconnected, data, [reconnect_action(0)]}
@@ -144,25 +158,22 @@ defmodule JasminEx.Smpp.Client do
   def bound({:call, from}, :status, data), do: reply_state(from, :bound, data)
 
   def bound({:call, from}, :unbind, data) do
-    {seq, data} = take_sequence(data)
-    pdu = PDU.build(command: :unbind, status: :ESME_ROK, sequence_number: seq, body: <<>>)
+    data = drop_internal_pending(data)
+    cancels = cancellation_actions(data)
+    data = clear_cancellations(data)
 
-    case :gen_tcp.send(data.socket, IO.iodata_to_binary(PDU.encode(pdu))) do
-      :ok ->
-        data = flush_pending(data, {:error, :unbinding})
-        # Flushing only settles the callers; without these cancel actions the
-        # per-sequence pending_timeout timers stay armed into :unbinding, where
-        # the catch-all handler stops the session on the first one to fire.
-        cancels = cancellation_actions(data)
-        pending = Map.put(data.pending, seq, %{from: nil, command_id: :unbind})
-        data = %{clear_cancellations(data) | pending: pending}
+    if pending_submits?(data) do
+      {:next_state, :unbinding, %{data | unbind_phase: :draining},
+       [{:reply, from, :ok}] ++ cancels ++ [unbind_drain_action(data)]}
+    else
+      case send_unbind(data) do
+        {:ok, data, action} ->
+          {:next_state, :unbinding, data, [{:reply, from, :ok}] ++ cancels ++ [action]}
 
-        {:next_state, :unbinding, data,
-         [{:reply, from, :ok}] ++
-           cancels ++ [pending_timeout_action(seq, data.config.response_timeout_ms)]}
-
-      {:error, _reason} ->
-        {:keep_state, data, [{:reply, from, {:error, :disconnected}}]}
+        {:error, reason, data} ->
+          {:stop_and_reply, :normal, [{:reply, from, {:error, {:send_failed, reason}}}],
+           close_socket(data)}
+      end
     end
   end
 
@@ -176,8 +187,9 @@ defmodule JasminEx.Smpp.Client do
         data = %{data | pending: pending}
         {:keep_state, data, [pending_timeout_action(seq, data.config.response_timeout_ms)]}
 
-      {:error, _reason} ->
-        {:keep_state, data, [{:reply, from, {:error, :disconnected}}]}
+      {:error, reason} ->
+        :gen_statem.reply(from, {:unknown, {:send_failed, reason}})
+        data |> close_socket() |> flush_pending({:unknown, :disconnected}) |> arm_reconnect()
     end
   end
 
@@ -189,11 +201,11 @@ defmodule JasminEx.Smpp.Client do
       {%{from: nil}, pending} ->
         %{data | pending: pending}
         |> close_socket()
-        |> flush_pending({:error, :disconnected})
+        |> flush_pending({:unknown, :disconnected})
         |> arm_reconnect()
 
-      {%{from: from}, pending} ->
-        :gen_statem.reply(from, {:error, :timeout})
+      {%{command_id: :submit_sm, from: from}, pending} ->
+        :gen_statem.reply(from, {:unknown, :response_timeout})
         {:keep_state, %{data | pending: pending}}
     end
   end
@@ -204,7 +216,7 @@ defmodule JasminEx.Smpp.Client do
         {:keep_state, data, [action, {:state_timeout, data.config.heartbeat_ms, :heartbeat}]}
 
       :error ->
-        data |> close_socket() |> flush_pending({:error, :disconnected}) |> arm_reconnect()
+        data |> close_socket() |> flush_pending({:unknown, :disconnected}) |> arm_reconnect()
     end
   end
 
@@ -212,11 +224,11 @@ defmodule JasminEx.Smpp.Client do
     do: receive_tcp(:bound, data, socket, bytes)
 
   def bound(:info, {:tcp_closed, socket}, %{socket: socket} = data),
-    do: data |> close_socket() |> flush_pending({:error, :disconnected}) |> arm_reconnect()
+    do: data |> close_socket() |> flush_pending({:unknown, :disconnected}) |> arm_reconnect()
 
   def bound(:info, {:tcp_error, socket, reason}, %{socket: socket} = data) do
     log_tcp_error(reason)
-    data |> close_socket() |> flush_pending({:error, :disconnected}) |> arm_reconnect()
+    data |> close_socket() |> flush_pending({:unknown, :disconnected}) |> arm_reconnect()
   end
 
   def bound(_event_type, _event, data), do: {:keep_state, data}
@@ -229,18 +241,42 @@ defmodule JasminEx.Smpp.Client do
   def unbinding({:call, from}, :unbind, data),
     do: {:keep_state, data, [{:reply, from, {:error, :unbinding}}]}
 
-  def unbinding({:timeout, {:pending, _seq}}, :pending_timeout, data),
-    do: {:stop, :normal, close_socket(data)}
+  def unbinding({:timeout, {:pending, seq}}, :pending_timeout, data) do
+    case Map.pop(data.pending, seq) do
+      {%{command_id: :submit_sm, from: from}, pending} ->
+        :gen_statem.reply(from, {:unknown, :response_timeout})
+        continue_unbinding(%{data | pending: pending})
+
+      {%{command_id: :unbind}, _pending} when data.unbind_phase == :waiting_for_response ->
+        {:stop, :normal, close_socket(data)}
+
+      _stale_or_unrelated ->
+        {:keep_state, data}
+    end
+  end
+
+  def unbinding({:timeout, :unbind_drain}, :deadline, %{unbind_phase: :draining} = data) do
+    data = flush_submit_pending(data, {:unknown, :unbind_deadline})
+    actions = cancellation_actions(data)
+
+    case send_unbind(clear_cancellations(data)) do
+      {:ok, data, action} -> {:keep_state, data, actions ++ [action]}
+      {:error, _reason, data} -> {:stop, :normal, close_socket(data)}
+    end
+  end
+
+  def unbinding({:timeout, :unbind_drain}, :deadline, data), do: {:keep_state, data}
 
   def unbinding(:info, {:tcp, socket, bytes}, %{socket: socket} = data),
     do: receive_tcp(:unbinding, data, socket, bytes)
 
   def unbinding(:info, {:tcp_closed, socket}, %{socket: socket} = data),
-    do: {:stop, :normal, close_socket(data)}
+    do:
+      {:stop, :normal, data |> flush_submit_pending({:unknown, :disconnected}) |> close_socket()}
 
   def unbinding(:info, {:tcp_error, socket, reason}, %{socket: socket} = data) do
     log_tcp_error(reason)
-    {:stop, :normal, close_socket(data)}
+    {:stop, :normal, data |> flush_submit_pending({:unknown, :disconnected}) |> close_socket()}
   end
 
   def unbinding(_event_type, _event, data), do: {:keep_state, data}
@@ -315,17 +351,18 @@ defmodule JasminEx.Smpp.Client do
   defp apply_pdu(data, %PDU{command: :enquire_link_resp, sequence_number: seq}, :bound),
     do: resolve_internal_response(data, :enquire_link, seq)
 
-  defp apply_pdu(data, %PDU{command: :submit_sm_resp, sequence_number: seq, body: body}, :bound) do
-    case Map.pop(data.pending, seq) do
-      {nil, _pending} ->
-        log_unknown_response(:submit_sm_resp, seq)
-        data
+  defp apply_pdu(
+         data,
+         %PDU{command: :submit_sm_resp, sequence_number: seq} = pdu,
+         state
+       )
+       when state in [:bound, :unbinding] do
+    case Map.get(data.pending, seq) do
+      %{command_id: :submit_sm, from: from} ->
+        :gen_statem.reply(from, submit_response(pdu))
+        cancel_pending(data, seq)
 
-      {%{command_id: :submit_sm, from: from}, pending} ->
-        :gen_statem.reply(from, {:ok, extract_message_id(body)})
-        %{data | pending: pending, cancelled: [seq | data.cancelled]}
-
-      {_entry, _pending} ->
+      _unmatched ->
         log_unknown_response(:submit_sm_resp, seq)
         data
     end
@@ -388,6 +425,8 @@ defmodule JasminEx.Smpp.Client do
 
   defp settle_inbound(:unbinding, %{target_state: :unbound} = data),
     do: {:stop, :normal, close_socket(data)}
+
+  defp settle_inbound(:unbinding, data), do: continue_unbinding(data)
 
   defp settle_inbound(_state, data) do
     actions = cancellation_actions(data)
@@ -452,6 +491,9 @@ defmodule JasminEx.Smpp.Client do
   defp pending_timeout_action(seq, timeout),
     do: {{:timeout, {:pending, seq}}, timeout, :pending_timeout}
 
+  defp unbind_drain_action(data),
+    do: {{:timeout, :unbind_drain}, data.config.unbind_drain_timeout_ms, :deadline}
+
   defp cancellation_actions(data),
     do: Enum.map(data.cancelled, &{{:timeout, {:pending, &1}}, :cancel})
 
@@ -465,6 +507,64 @@ defmodule JasminEx.Smpp.Client do
   defp flush_pending(data, reply) do
     Enum.each(data.pending, fn {_seq, %{from: from}} -> reply_to_pending(from, reply) end)
     %{data | pending: %{}, cancelled: Map.keys(data.pending) ++ data.cancelled}
+  end
+
+  defp flush_submit_pending(data, reply) do
+    Enum.reduce(data.pending, data, fn
+      {seq, %{command_id: :submit_sm, from: from}}, acc ->
+        reply_to_pending(from, reply)
+        cancel_pending(acc, seq)
+
+      {_seq, _entry}, acc ->
+        acc
+    end)
+  end
+
+  defp drop_internal_pending(data) do
+    Enum.reduce(data.pending, data, fn
+      {_seq, %{command_id: :submit_sm}}, acc -> acc
+      {seq, _entry}, acc -> cancel_pending(acc, seq)
+    end)
+  end
+
+  defp pending_submits?(data),
+    do: Enum.any?(data.pending, fn {_seq, entry} -> entry.command_id == :submit_sm end)
+
+  defp continue_unbinding(%{unbind_phase: :draining} = data) do
+    actions = cancellation_actions(data)
+    data = clear_cancellations(data)
+
+    if pending_submits?(data) do
+      {:keep_state, data, actions}
+    else
+      case send_unbind(data) do
+        {:ok, data, action} ->
+          {:keep_state, data, actions ++ [{{:timeout, :unbind_drain}, :cancel}, action]}
+
+        {:error, _reason, data} ->
+          {:stop, :normal, close_socket(data)}
+      end
+    end
+  end
+
+  defp continue_unbinding(data) do
+    actions = cancellation_actions(data)
+    {:keep_state, clear_cancellations(data), actions}
+  end
+
+  defp send_unbind(data) do
+    {seq, data} = take_sequence(data)
+    pdu = PDU.build(command: :unbind, status: :ESME_ROK, sequence_number: seq, body: <<>>)
+
+    case safe_tcp_send(data.socket, IO.iodata_to_binary(PDU.encode(pdu))) do
+      :ok ->
+        pending = Map.put(data.pending, seq, %{from: nil, command_id: :unbind})
+        data = %{data | pending: pending, unbind_phase: :waiting_for_response}
+        {:ok, data, pending_timeout_action(seq, data.config.response_timeout_ms)}
+
+      {:error, reason} ->
+        {:error, reason, data}
+    end
   end
 
   defp arm_reconnect(data) do
@@ -516,8 +616,13 @@ defmodule JasminEx.Smpp.Client do
   defp bind_request_for(:bind_transceiver_resp), do: :bind_transceiver
   defp bind_request_for(_command), do: nil
 
-  defp log_unknown_response(command, seq),
-    do: Logger.warning("unknown sequence_number #{seq} for #{inspect(command)}, discarding")
+  defp log_unknown_response(command, seq) do
+    Logger.warning(%{
+      message: "late or unmatched SMPP response discarded",
+      command: command,
+      sequence_number: seq
+    })
+  end
 
   defp log_tcp_error(reason), do: Logger.warning("SMPP TCP error: #{inspect(reason)}")
 
@@ -599,11 +704,25 @@ defmodule JasminEx.Smpp.Client do
     do:
       PDU.build(command: :enquire_link_resp, status: :ESME_ROK, sequence_number: seq, body: <<>>)
 
-  defp extract_message_id(body) do
+  defp submit_response(%PDU{status: status}) when status != :ESME_ROK,
+    do: {:error, {:submit_rejected, status}}
+
+  defp submit_response(%PDU{body: body}) do
     case Body.decode(:submit_sm_resp, body) do
-      {:ok, %Body.SubmitSMResp{message_id: id}} -> id
-      _ -> ""
+      {:ok, %Body.SubmitSMResp{message_id: id}} when is_binary(id) and byte_size(id) > 0 ->
+        {:ok, id}
+
+      _invalid ->
+        {:unknown, :invalid_response}
     end
+  end
+
+  defp safe_tcp_send(socket, bytes) do
+    :gen_tcp.send(socket, bytes)
+  rescue
+    error -> {:error, error}
+  catch
+    kind, reason -> {:error, {kind, reason}}
   end
 
   defp backoff_delay(%{
@@ -615,6 +734,8 @@ defmodule JasminEx.Smpp.Client do
   end
 
   defp build_config(opts) do
+    response_timeout_ms = Keyword.get(opts, :response_timeout_ms, @default_response_timeout_ms)
+
     %{
       host: Keyword.fetch!(opts, :host),
       port: Keyword.fetch!(opts, :port),
@@ -623,7 +744,8 @@ defmodule JasminEx.Smpp.Client do
       system_type: Keyword.fetch!(opts, :system_type),
       bind_as: Keyword.fetch!(opts, :bind_as),
       heartbeat_ms: Keyword.get(opts, :heartbeat_ms, @default_heartbeat_ms),
-      response_timeout_ms: Keyword.get(opts, :response_timeout_ms, @default_response_timeout_ms),
+      response_timeout_ms: response_timeout_ms,
+      unbind_drain_timeout_ms: Keyword.get(opts, :unbind_drain_timeout_ms, response_timeout_ms),
       reconnect: %{
         base_ms: Keyword.get(opts, :reconnect_base_ms, @default_reconnect_base_ms),
         factor: Keyword.get(opts, :reconnect_factor, @default_reconnect_factor),

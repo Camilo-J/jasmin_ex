@@ -83,6 +83,10 @@ defmodule JasminEx.Smpp.FakeSMSC do
   @spec subscribe(pid()) :: reference()
   def subscribe(pid), do: GenServer.call(pid, {:subscribe, self()})
 
+  @doc "Subscribe to one notification per complete decoded PDU."
+  @spec subscribe_pdus(pid()) :: reference()
+  def subscribe_pdus(pid), do: GenServer.call(pid, {:subscribe_pdus, self()})
+
   @doc """
   Override the response status sent for the next `:bind_transmitter` /
   `:bind_receiver` / `:bind_transceiver` request — i.e. the inbound
@@ -140,6 +144,7 @@ defmodule JasminEx.Smpp.FakeSMSC do
        port: bound_port,
        script: script,
        subscribers: %{},
+       pdu_subscribers: %{},
        conn: nil,
        buffer: <<>>,
        queued_responses: []
@@ -162,6 +167,11 @@ defmodule JasminEx.Smpp.FakeSMSC do
   def handle_call({:subscribe, pid}, _from, %{subscribers: subs} = state) do
     ref = make_ref()
     {:reply, ref, %{state | subscribers: Map.put(subs, ref, pid)}}
+  end
+
+  def handle_call({:subscribe_pdus, pid}, _from, %{pdu_subscribers: subs} = state) do
+    ref = make_ref()
+    {:reply, ref, %{state | pdu_subscribers: Map.put(subs, ref, pid)}}
   end
 
   def handle_call({:set_script, command_id, action}, _from, %{script: script} = state) do
@@ -286,13 +296,22 @@ defmodule JasminEx.Smpp.FakeSMSC do
 
   defp handle_pdu(state, bin) do
     case PDU.decode(bin) do
-      {:ok, pdu} -> apply_action(state, pdu, action_for(state, pdu.command))
-      {:error, _} -> state
+      {:ok, pdu} ->
+        state = notify_pdu_subscribers(state, pdu)
+        apply_action(state, pdu, action_for(state, pdu.command))
+
+      {:error, _} ->
+        state
     end
   end
 
   defp notify_subscribers(state, bin) do
     for {ref, pid} <- state.subscribers, do: send(pid, {:fake_smsc_bytes, ref, bin})
+    state
+  end
+
+  defp notify_pdu_subscribers(state, pdu) do
+    for {ref, pid} <- state.pdu_subscribers, do: send(pid, {:fake_smsc_pdu, ref, pdu})
     state
   end
 
