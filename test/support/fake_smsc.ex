@@ -262,8 +262,16 @@ defmodule JasminEx.Smpp.FakeSMSC do
         # transfer to the parent — the parent's own init runs in its
         # own process and the parent gen_server IS the eventual
         # connection handler.
-        :ok = :gen_tcp.controlling_process(sock, parent)
-        send(parent, {:accepted, sock})
+        case :gen_tcp.controlling_process(sock, parent) do
+          :ok ->
+            send(parent, {:accepted, sock})
+
+          {:error, :badarg} ->
+            :gen_tcp.close(sock)
+
+          {:error, reason} ->
+            exit({:socket_handoff_failed, reason})
+        end
 
       _ ->
         :ok
