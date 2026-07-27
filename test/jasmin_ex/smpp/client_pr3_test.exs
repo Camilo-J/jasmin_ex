@@ -11,6 +11,13 @@ defmodule JasminEx.Smpp.ClientPR3Test do
   alias JasminEx.Smpp.PDU.Body
 
   @response_timeout_ms 100
+  @lifecycle_events [
+    [:jasmin_ex, :smpp, :bound],
+    [:jasmin_ex, :smpp, :disconnected],
+    [:jasmin_ex, :smpp, :reconnect_scheduled],
+    [:jasmin_ex, :smpp, :rebound]
+  ]
+  @deliver_failed_event [:jasmin_ex, :smpp, :deliver_sm, :failed]
 
   defp start_smsc(opts \\ []) do
     {:ok, port, smsc} = FakeSMSC.start_link(opts)
@@ -67,6 +74,33 @@ defmodule JasminEx.Smpp.ClientPR3Test do
     with :ok <- wait_until(fn -> Client.status(client) == :bind_pending end) do
       FakeSMSC.wait_connected(smsc)
     end
+  end
+
+  def handle_telemetry(event, measurements, metadata, %{test_pid: test_pid, blocking: false}) do
+    send(test_pid, {:telemetry, event, measurements, metadata})
+  end
+
+  def handle_telemetry(event, measurements, metadata, %{test_pid: test_pid, blocking: true}) do
+    send(test_pid, {:telemetry_blocked, self(), event, measurements, metadata})
+
+    receive do
+      :continue -> :ok
+    end
+  end
+
+  defp attach_telemetry(events, blocking \\ false) do
+    handler_id = {__MODULE__, make_ref()}
+
+    :ok =
+      :telemetry.attach_many(
+        handler_id,
+        events,
+        &__MODULE__.handle_telemetry/4,
+        %{test_pid: self(), blocking: blocking}
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+    handler_id
   end
 
   defp stop(pid) when is_pid(pid) do
@@ -129,30 +163,128 @@ defmodule JasminEx.Smpp.ClientPR3Test do
       stop(smsc)
     end
 
-    test "emits disconnect and reconnect telemetry when a bound connection drops" do
+    test "emits initial bound only after the matching response and never emits rebound" do
       {port, smsc} = start_smsc()
-      handler_id = {__MODULE__, make_ref()}
-      test_pid = self()
+      :ok = FakeSMSC.withhold_response(smsc, :bind_transmitter)
+      attach_telemetry(@lifecycle_events)
+      {:ok, client} = start_client(port, response_timeout_ms: 500)
+      assert :ok = await_bind_pending(client, smsc)
+      refute_receive {:telemetry, [:jasmin_ex, :smpp, :bound], _, _}, 30
 
-      :ok =
-        :telemetry.attach_many(
-          handler_id,
-          [[:jasmin_ex, :smpp, :disconnected], [:jasmin_ex, :smpp, :reconnect_scheduled]],
-          fn event, _measurements, metadata, _config ->
-            send(test_pid, {:telemetry, event, metadata})
-          end,
-          nil
+      assert :ok =
+               FakeSMSC.send_bytes(
+                 smsc,
+                 pdu_bytes(:bind_transmitter_resp, pending_bind_seq(client), <<0>>)
+               )
+
+      assert :ok = await_bound(client)
+
+      assert_receive {:telemetry, [:jasmin_ex, :smpp, :bound], %{},
+                      %{client: ^client, bind_as: :transmitter, kind: :initial}},
+                     500
+
+      refute_receive {:telemetry, [:jasmin_ex, :smpp, :bound], _, _}, 30
+      refute_receive {:telemetry, [:jasmin_ex, :smpp, :rebound], _, _}, 30
+      stop(client)
+      stop(smsc)
+    end
+
+    test "startup retries keep initial bind semantics and expose deterministic scheduling" do
+      {port, smsc} = start_smsc(script: %{bind_transmitter: {:reply_status, :ESME_RSYSERR}})
+      attach_telemetry(@lifecycle_events)
+
+      {:ok, client} =
+        start_client(port,
+          reconnect_base_ms: 20,
+          reconnect_factor: 2,
+          reconnect_cap_ms: 100
         )
 
-      on_exit(fn -> :telemetry.detach(handler_id) end)
-      {:ok, client} = start_client(port)
+      for {attempt, delay_ms} <- [{1, 20}, {2, 40}] do
+        assert_receive {:telemetry, [:jasmin_ex, :smpp, :disconnected], %{},
+                        %{
+                          client: ^client,
+                          bind_as: :transmitter,
+                          state: :bind_pending,
+                          reason: :bind_rejected
+                        }},
+                       500
+
+        assert_receive {:telemetry, [:jasmin_ex, :smpp, :reconnect_scheduled],
+                        %{delay_ms: ^delay_ms},
+                        %{
+                          client: ^client,
+                          bind_as: :transmitter,
+                          attempt: ^attempt,
+                          reason: :bind_rejected
+                        }},
+                       500
+      end
+
+      :ok = FakeSMSC.auto_reply(smsc, :bind_transmitter)
       assert :ok = await_bound(client)
+
+      assert_receive {:telemetry, [:jasmin_ex, :smpp, :bound], %{},
+                      %{client: ^client, bind_as: :transmitter, kind: :initial}},
+                     500
+
+      stop(client)
+      stop(smsc)
+    end
+
+    test "orders disconnect, retry scheduling, and reconnect bound telemetry" do
+      {port, smsc} = start_smsc()
+      attach_telemetry(@lifecycle_events)
+      {:ok, client} = start_client(port, reconnect_base_ms: 30, reconnect_cap_ms: 30)
+      assert :ok = await_bound(client)
+
+      assert_receive {:telemetry, [:jasmin_ex, :smpp, :bound], %{}, %{kind: :initial}}, 500
 
       :ok = FakeSMSC.close_on_command(smsc, :submit_sm)
       assert {:unknown, :disconnected} = Client.send_submit_sm(client, submit_sm("drop"))
 
-      assert_receive {:telemetry, [:jasmin_ex, :smpp, :disconnected], %{}}, 500
-      assert_receive {:telemetry, [:jasmin_ex, :smpp, :reconnect_scheduled], %{attempt: _}}, 500
+      assert_receive {:telemetry, [:jasmin_ex, :smpp, :disconnected], %{},
+                      %{
+                        client: ^client,
+                        bind_as: :transmitter,
+                        state: :bound,
+                        reason: :tcp_closed
+                      }},
+                     500
+
+      assert_receive {:telemetry, [:jasmin_ex, :smpp, :reconnect_scheduled], %{delay_ms: 30},
+                      %{
+                        client: ^client,
+                        bind_as: :transmitter,
+                        attempt: 1,
+                        reason: :tcp_closed
+                      }},
+                     500
+
+      assert_receive {:telemetry, [:jasmin_ex, :smpp, :bound], %{},
+                      %{client: ^client, bind_as: :transmitter, kind: :reconnect}},
+                     500
+
+      {_state, data} = :sys.get_state(client)
+      assert data.backoff_attempt == 0
+      stop(client)
+      stop(smsc)
+    end
+
+    test "voluntary unbind emits neither disconnect nor retry telemetry" do
+      {port, smsc} = start_smsc()
+
+      attach_telemetry([
+        [:jasmin_ex, :smpp, :disconnected],
+        [:jasmin_ex, :smpp, :reconnect_scheduled]
+      ])
+
+      {:ok, client} = start_client(port)
+      assert :ok = await_bound(client)
+      monitor = Process.monitor(client)
+      assert :ok = Client.unbind(client)
+      assert_receive {:DOWN, ^monitor, :process, ^client, :normal}, 500
+      refute_receive {:telemetry, _, _, _}, 50
       stop(client)
       stop(smsc)
     end
@@ -358,6 +490,22 @@ defmodule JasminEx.Smpp.ClientPR3Test do
       stop(smsc)
     end
 
+    test "SendToPid uses the canonical context key and preserves its owner message" do
+      {:ok, handler} = SendToPid.start_link(owner: self())
+      client = self()
+      pdu = struct(Body.DeliverSM, Map.from_struct(submit_sm("canonical")))
+
+      assert :ok =
+               SendToPid.handle_deliver_sm(pdu, %{
+                 client: client,
+                 handler_context: handler,
+                 handler: :deprecated_alias_not_used
+               })
+
+      assert_receive {:smpp_deliver_sm, ^pdu, %{client: ^client}}, 500
+      stop(handler)
+    end
+
     test "a dead SendToPid owner negative-acknowledges deliver_sm so the SMSC retries" do
       {port, smsc} = start_smsc()
 
@@ -463,6 +611,50 @@ defmodule JasminEx.Smpp.ClientPR3Test do
       stop(smsc)
     end
 
+    test "passes canonical and compatibility handler context keys with the same value" do
+      {port, smsc} = start_smsc()
+
+      {:ok, client} =
+        start_client(port,
+          deliver_handler: {JasminEx.Smpp.CapturingDeliverHandler, self()}
+        )
+
+      assert :ok = await_bound(client)
+      assert :ok = FakeSMSC.send_bytes(smsc, deliver_sm_bytes(84, "context"))
+
+      assert_receive {:handler_context,
+                      %{
+                        client: ^client,
+                        handler_context: handler_context,
+                        handler: compatibility_context
+                      }},
+                     500
+
+      assert handler_context == self()
+      assert compatibility_context == handler_context
+      stop(client)
+      stop(smsc)
+    end
+
+    test "supports a legacy external handler that pattern-matches the handler alias" do
+      {port, smsc} = start_smsc()
+
+      {:ok, client} =
+        start_client(port, deliver_handler: {JasminEx.Smpp.LegacyDeliverHandler, self()})
+
+      assert :ok = await_bound(client)
+      ref = FakeSMSC.subscribe(smsc)
+
+      assert :ok = FakeSMSC.send_bytes(smsc, deliver_sm_bytes(89, "legacy"))
+      assert_receive {:legacy_handler, %Body.DeliverSM{short_message: "legacy"}}, 500
+
+      assert {:ok, %PDU{status: :ESME_ROK, sequence_number: 89}} =
+               ref |> await_pdu(:deliver_sm_resp) |> PDU.decode()
+
+      stop(client)
+      stop(smsc)
+    end
+
     test "a malformed deliver_sm body responds with a system error, not a retry" do
       {port, smsc} = start_smsc()
       {:ok, handler} = SendToPid.start_link(owner: self())
@@ -499,6 +691,70 @@ defmodule JasminEx.Smpp.ClientPR3Test do
       bytes = await_pdu(ref, :deliver_sm_resp)
       assert {:ok, %PDU{status: :ESME_RX_T_APPN, sequence_number: 83}} = PDU.decode(bytes)
       assert Client.status(client) == :bound
+      stop(client)
+      stop(smsc)
+    end
+  end
+
+  describe "deliver_sm failure telemetry" do
+    test "emits bounded no-handler failure before responding" do
+      assert_delivery_failure(nil, nil, :handler_not_configured, :ESME_RX_T_APPN, 85)
+    end
+
+    test "emits bounded unavailable failures without leaking handler details" do
+      for handler <- [
+            JasminEx.Smpp.RaisingDeliverHandler,
+            JasminEx.Smpp.InvalidDeliverHandler
+          ] do
+        log =
+          capture_log(fn ->
+            assert_delivery_failure(
+              handler,
+              :sensitive_handler_context,
+              :handler_unavailable,
+              :ESME_RX_T_APPN,
+              86
+            )
+          end)
+
+        refute log =~ "sensitive"
+        refute log =~ "handler failure sentinel"
+      end
+    end
+
+    test "emits bounded unencodable-status failure without leaking the status" do
+      log =
+        capture_log(fn ->
+          assert_delivery_failure(
+            JasminEx.Smpp.UnmappedStatusDeliverHandler,
+            :sensitive_handler_context,
+            :unencodable_status,
+            :ESME_RSYSERR,
+            87
+          )
+        end)
+
+      refute log =~ "sensitive"
+      refute log =~ "custom_failure"
+    end
+
+    test "does not report a valid handler negative acknowledgement as a client failure" do
+      {port, smsc} = start_smsc()
+      attach_telemetry([@deliver_failed_event])
+
+      {:ok, client} =
+        start_client(port,
+          deliver_handler: {JasminEx.Smpp.NegativeAckDeliverHandler, :opaque}
+        )
+
+      assert :ok = await_bound(client)
+      ref = FakeSMSC.subscribe(smsc)
+      assert :ok = FakeSMSC.send_bytes(smsc, deliver_sm_bytes(88, "negative-ack"))
+
+      assert {:ok, %PDU{status: :ESME_RTHROTTLED}} =
+               ref |> await_pdu(:deliver_sm_resp) |> PDU.decode()
+
+      refute_receive {:telemetry, @deliver_failed_event, _, _}, 50
       stop(client)
       stop(smsc)
     end
@@ -747,6 +1003,38 @@ defmodule JasminEx.Smpp.ClientPR3Test do
     map_size(data.pending)
   end
 
+  defp assert_delivery_failure(handler, context, reason, response_status, sequence_number) do
+    {port, smsc} = start_smsc()
+    handler_id = attach_telemetry([@deliver_failed_event], true)
+
+    opts = if handler, do: [deliver_handler: {handler, context}], else: []
+    {:ok, client} = start_client(port, opts)
+    assert :ok = await_bound(client)
+    ref = FakeSMSC.subscribe(smsc)
+    assert :ok = FakeSMSC.send_bytes(smsc, deliver_sm_bytes(sequence_number, "sensitive-body"))
+
+    assert_receive {:telemetry_blocked, telemetry_caller, @deliver_failed_event, %{},
+                    %{
+                      client: ^client,
+                      handler: ^handler,
+                      reason: ^reason,
+                      response_status: ^response_status
+                    } = metadata},
+                   500
+
+    assert telemetry_caller == client
+    assert map_size(metadata) == 4
+    refute_receive {:fake_smsc_bytes, ^ref, _response}, 30
+    send(telemetry_caller, :continue)
+
+    assert {:ok, %PDU{status: ^response_status, sequence_number: ^sequence_number}} =
+             ref |> await_pdu(:deliver_sm_resp) |> PDU.decode()
+
+    :ok = :telemetry.detach(handler_id)
+    stop(client)
+    stop(smsc)
+  end
+
   defp pending_bind_seq(client) do
     {_state, data} = :sys.get_state(client)
     [seq] = Map.keys(data.pending)
@@ -822,7 +1110,7 @@ defmodule JasminEx.Smpp.RaisingDeliverHandler do
   @behaviour JasminEx.Smpp.DeliverHandler
 
   @impl true
-  def handle_deliver_sm(_pdu, _context), do: raise("handler failure")
+  def handle_deliver_sm(_pdu, _context), do: raise("handler failure sentinel")
 end
 
 defmodule JasminEx.Smpp.UnmappedStatusDeliverHandler do
@@ -833,4 +1121,42 @@ defmodule JasminEx.Smpp.UnmappedStatusDeliverHandler do
   # reject it rather than pass it into PDU encoding.
   @impl true
   def handle_deliver_sm(_pdu, _context), do: {:error, :custom_failure}
+end
+
+defmodule JasminEx.Smpp.InvalidDeliverHandler do
+  @moduledoc false
+  @behaviour JasminEx.Smpp.DeliverHandler
+
+  @impl true
+  def handle_deliver_sm(_pdu, _context), do: {:unexpected, :sensitive_return}
+end
+
+defmodule JasminEx.Smpp.NegativeAckDeliverHandler do
+  @moduledoc false
+  @behaviour JasminEx.Smpp.DeliverHandler
+
+  @impl true
+  def handle_deliver_sm(_pdu, _context), do: {:error, :ESME_RTHROTTLED}
+end
+
+defmodule JasminEx.Smpp.CapturingDeliverHandler do
+  @moduledoc false
+  @behaviour JasminEx.Smpp.DeliverHandler
+
+  @impl true
+  def handle_deliver_sm(_pdu, %{handler_context: test_pid} = context) do
+    send(test_pid, {:handler_context, context})
+    :ok
+  end
+end
+
+defmodule JasminEx.Smpp.LegacyDeliverHandler do
+  @moduledoc false
+  @behaviour JasminEx.Smpp.DeliverHandler
+
+  @impl true
+  def handle_deliver_sm(pdu, %{handler: test_pid}) do
+    send(test_pid, {:legacy_handler, pdu})
+    :ok
+  end
 end

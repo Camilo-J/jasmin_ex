@@ -18,6 +18,36 @@ defmodule JasminEx.Smpp.Client do
   and terminates normally after an unbind response, socket close, or bounded
   timeout; it does not schedule reconnect. Involuntary TCP loss returns to
   `:disconnected` and schedules reconnect with backoff.
+
+  ## Telemetry
+
+  Telemetry handlers execute synchronously in the client process. The client
+  emits these events:
+
+    * `[:jasmin_ex, :smpp, :bound]` has measurements `%{}` and metadata
+      `%{client: pid, bind_as: atom, kind: :initial | :reconnect}`. Bound means
+      the SMSC session reached `:bound`; it does not mean a message was
+      delivered. Failed startup attempts do not change `kind` from `:initial`.
+    * `[:jasmin_ex, :smpp, :disconnected]` has measurements `%{}` and metadata
+      `%{client: pid, bind_as: atom, state: atom, reason: atom}`. `state` is the
+      involuntarily exited lifecycle state and `reason` is a bounded category.
+    * `[:jasmin_ex, :smpp, :reconnect_scheduled]` has measurements
+      `%{delay_ms: non_neg_integer}` and metadata
+      `%{client: pid, bind_as: atom, attempt: pos_integer, reason: atom}`. It is
+      emitted when the retry timer is scheduled; a successful bind resets the
+      next attempt to 1.
+    * `[:jasmin_ex, :smpp, :deliver_sm, :failed]` has measurements `%{}` and
+      metadata
+      `%{client: pid, handler: module | nil, reason: :handler_not_configured |
+      :handler_unavailable | :unencodable_status, response_status: atom}`. It
+      reports a local client failure before `deliver_sm_resp` is sent. A valid
+      handler negative acknowledgement is not a client failure.
+
+  Disconnect and retry reasons are bounded categories such as
+  `:connect_failed`, `:bind_send_failed`, `:bind_timeout`, `:bind_rejected`,
+  `:heartbeat_send_failed`, `:heartbeat_timeout`, `:tcp_closed`, `:tcp_error`,
+  and `:submit_send_failed`; raw socket and exception terms are never included.
+  Initial state and voluntary unbind emit neither disconnect nor retry events.
   """
 
   require Logger
@@ -76,6 +106,7 @@ defmodule JasminEx.Smpp.Client do
       pending: %{},
       cancelled: [],
       backoff_attempt: 0,
+      ever_bound: false,
       target_state: nil,
       exit_reason: nil,
       unbind_phase: nil
@@ -114,16 +145,16 @@ defmodule JasminEx.Smpp.Client do
            @connect_timeout_ms
          ) do
       {:ok, socket} -> send_bind(%{data | socket: socket, buffer: <<>>})
-      {:error, _reason} -> data |> close_socket() |> arm_reconnect()
+      {:error, _reason} -> data |> close_socket() |> arm_reconnect(:connecting, :connect_failed)
     end
   end
 
   def connecting(:info, {:tcp_closed, socket}, %{socket: socket} = data),
-    do: data |> close_socket() |> arm_reconnect()
+    do: data |> close_socket() |> arm_reconnect(:connecting, :tcp_closed)
 
   def connecting(:info, {:tcp_error, socket, reason}, %{socket: socket} = data) do
     log_tcp_error(reason)
-    data |> close_socket() |> arm_reconnect()
+    data |> close_socket() |> arm_reconnect(:connecting, :tcp_error)
   end
 
   def connecting(_event_type, _event, data), do: {:keep_state, data}
@@ -139,18 +170,26 @@ defmodule JasminEx.Smpp.Client do
     data
     |> remove_pending(seq)
     |> close_socket()
-    |> arm_reconnect()
+    |> arm_reconnect(:bind_pending, :bind_timeout)
   end
 
   def bind_pending(:info, {:tcp, socket, bytes}, %{socket: socket} = data),
     do: receive_tcp(:bind_pending, data, socket, bytes)
 
   def bind_pending(:info, {:tcp_closed, socket}, %{socket: socket} = data),
-    do: data |> close_socket() |> flush_pending({:error, :disconnected}) |> arm_reconnect()
+    do:
+      data
+      |> close_socket()
+      |> flush_pending({:error, :disconnected})
+      |> arm_reconnect(:bind_pending, :tcp_closed)
 
   def bind_pending(:info, {:tcp_error, socket, reason}, %{socket: socket} = data) do
     log_tcp_error(reason)
-    data |> close_socket() |> flush_pending({:error, :disconnected}) |> arm_reconnect()
+
+    data
+    |> close_socket()
+    |> flush_pending({:error, :disconnected})
+    |> arm_reconnect(:bind_pending, :tcp_error)
   end
 
   def bind_pending(_event_type, _event, data), do: {:keep_state, data}
@@ -189,7 +228,11 @@ defmodule JasminEx.Smpp.Client do
 
       {:error, reason} ->
         :gen_statem.reply(from, {:unknown, {:send_failed, reason}})
-        data |> close_socket() |> flush_pending({:unknown, :disconnected}) |> arm_reconnect()
+
+        data
+        |> close_socket()
+        |> flush_pending({:unknown, :disconnected})
+        |> arm_reconnect(:bound, :submit_send_failed)
     end
   end
 
@@ -202,7 +245,7 @@ defmodule JasminEx.Smpp.Client do
         %{data | pending: pending}
         |> close_socket()
         |> flush_pending({:unknown, :disconnected})
-        |> arm_reconnect()
+        |> arm_reconnect(:bound, :heartbeat_timeout)
 
       {%{command_id: :submit_sm, from: from}, pending} ->
         :gen_statem.reply(from, {:unknown, :response_timeout})
@@ -216,7 +259,10 @@ defmodule JasminEx.Smpp.Client do
         {:keep_state, data, [action, {:state_timeout, data.config.heartbeat_ms, :heartbeat}]}
 
       :error ->
-        data |> close_socket() |> flush_pending({:unknown, :disconnected}) |> arm_reconnect()
+        data
+        |> close_socket()
+        |> flush_pending({:unknown, :disconnected})
+        |> arm_reconnect(:bound, :heartbeat_send_failed)
     end
   end
 
@@ -224,11 +270,19 @@ defmodule JasminEx.Smpp.Client do
     do: receive_tcp(:bound, data, socket, bytes)
 
   def bound(:info, {:tcp_closed, socket}, %{socket: socket} = data),
-    do: data |> close_socket() |> flush_pending({:unknown, :disconnected}) |> arm_reconnect()
+    do:
+      data
+      |> close_socket()
+      |> flush_pending({:unknown, :disconnected})
+      |> arm_reconnect(:bound, :tcp_closed)
 
   def bound(:info, {:tcp_error, socket, reason}, %{socket: socket} = data) do
     log_tcp_error(reason)
-    data |> close_socket() |> flush_pending({:unknown, :disconnected}) |> arm_reconnect()
+
+    data
+    |> close_socket()
+    |> flush_pending({:unknown, :disconnected})
+    |> arm_reconnect(:bound, :tcp_error)
   end
 
   def bound(_event_type, _event, data), do: {:keep_state, data}
@@ -297,7 +351,7 @@ defmodule JasminEx.Smpp.Client do
          [pending_timeout_action(seq, data.config.response_timeout_ms)]}
 
       {:error, _reason} ->
-        data |> close_socket() |> arm_reconnect()
+        data |> close_socket() |> arm_reconnect(:connecting, :bind_send_failed)
     end
   end
 
@@ -412,15 +466,18 @@ defmodule JasminEx.Smpp.Client do
   defp apply_pdu(data, _pdu, _state), do: data
 
   defp settle_inbound(:bind_pending, %{target_state: :bound} = data) do
-    emit_transition(:rebound, %{})
-    data = %{data | target_state: nil, backoff_attempt: 0}
+    kind = if data.ever_bound, do: :reconnect, else: :initial
+    emit_lifecycle(:bound, data, %{kind: kind})
+    data = %{data | target_state: nil, backoff_attempt: 0, ever_bound: true}
 
     {:next_state, :bound, data,
      cancellation_actions(data) ++ [{:state_timeout, data.config.heartbeat_ms, :heartbeat}]}
   end
 
   defp settle_inbound(:bind_pending, %{target_state: :disconnected} = data) do
-    %{data | target_state: nil} |> close_socket() |> arm_reconnect()
+    %{data | target_state: nil}
+    |> close_socket()
+    |> arm_reconnect(:bind_pending, :bind_rejected)
   end
 
   defp settle_inbound(:unbinding, %{target_state: :unbound} = data),
@@ -567,13 +624,20 @@ defmodule JasminEx.Smpp.Client do
     end
   end
 
-  defp arm_reconnect(data) do
-    emit_transition(:disconnected, %{})
-    emit_transition(:reconnect_scheduled, %{attempt: data.backoff_attempt + 1})
-    actions = cancellation_actions(data) ++ [reconnect_action(backoff_delay(data))]
+  defp arm_reconnect(data, state, reason) do
+    attempt = data.backoff_attempt + 1
+    delay = backoff_delay(data)
+    emit_lifecycle(:disconnected, data, %{state: state, reason: reason})
 
-    {:next_state, :disconnected,
-     %{clear_cancellations(data) | backoff_attempt: data.backoff_attempt + 1}, actions}
+    :telemetry.execute(
+      [:jasmin_ex, :smpp, :reconnect_scheduled],
+      %{delay_ms: delay},
+      lifecycle_metadata(data, %{attempt: attempt, reason: reason})
+    )
+
+    actions = cancellation_actions(data) ++ [reconnect_action(delay)]
+
+    {:next_state, :disconnected, %{clear_cancellations(data) | backoff_attempt: attempt}, actions}
   end
 
   defp reconnect_action(delay), do: {{:timeout, :reconnect}, delay, :try_connect}
@@ -644,8 +708,8 @@ defmodule JasminEx.Smpp.Client do
       _other -> :error
     end
   rescue
-    error ->
-      Logger.error("deliver_sm body failed to decode: #{Exception.message(error)}")
+    _error ->
+      Logger.error("deliver_sm body failed to decode")
       :error
   end
 
@@ -657,48 +721,72 @@ defmodule JasminEx.Smpp.Client do
       "deliver_sm received but no deliver_handler is configured; asking the SMSC to retry"
     )
 
-    :ESME_RX_T_APPN
+    deliver_failure(nil, :handler_not_configured, :ESME_RX_T_APPN)
   end
 
   defp invoke_deliver_handler(%{config: %{deliver_handler: {handler, context}}}, pdu) do
-    case handler.handle_deliver_sm(pdu, Map.put(context, :client, self())) do
+    case handler.handle_deliver_sm(pdu, %{
+           client: self(),
+           handler_context: context,
+           handler: context
+         }) do
       :ok -> :ESME_ROK
-      {:error, status} -> encodable_status(status)
-      other -> handler_unavailable("returned #{inspect(other)}")
+      {:error, status} -> encodable_status(handler, status)
+      _other -> handler_unavailable(handler)
     end
   rescue
-    error -> handler_unavailable("raised: #{Exception.message(error)}")
+    _error -> handler_unavailable(handler)
   catch
-    kind, reason -> handler_unavailable("#{kind}: #{inspect(reason)}")
+    _kind, _reason -> handler_unavailable(handler)
   end
 
-  defp handler_unavailable(detail) do
-    Logger.error("deliver_sm handler #{detail}; asking the SMSC to retry")
-    :ESME_RX_T_APPN
+  defp handler_unavailable(handler) do
+    Logger.error("deliver_sm handler unavailable; asking the SMSC to retry")
+    deliver_failure(handler, :handler_unavailable, :ESME_RX_T_APPN)
   end
 
   # A handler may return any atom. Encoding an unmapped one raises inside
   # PDU.build/1 — outside this dispatch path's rescue — which would kill the
   # session instead of answering the SMSC, so it degrades to a system error.
-  defp encodable_status(status) when is_atom(status) do
+  defp encodable_status(handler, status) when is_atom(status) do
     case Constants.command_status_to_int(status) do
       {:ok, _int} -> status
-      :error -> unencodable_status(status)
+      :error -> unencodable_status(handler)
     end
   end
 
-  defp encodable_status(status), do: unencodable_status(status)
+  defp encodable_status(handler, _status), do: unencodable_status(handler)
 
-  defp unencodable_status(status) do
-    Logger.warning(
-      "deliver_sm handler returned unencodable status #{inspect(status)}, responding :ESME_RSYSERR"
-    )
-
-    :ESME_RSYSERR
+  defp unencodable_status(handler) do
+    Logger.warning("deliver_sm handler returned an unencodable status; responding :ESME_RSYSERR")
+    deliver_failure(handler, :unencodable_status, :ESME_RSYSERR)
   end
 
-  defp emit_transition(event, metadata),
-    do: :telemetry.execute([:jasmin_ex, :smpp, event], %{}, metadata)
+  defp deliver_failure(handler, reason, response_status) do
+    :telemetry.execute(
+      [:jasmin_ex, :smpp, :deliver_sm, :failed],
+      %{},
+      %{
+        client: self(),
+        handler: handler,
+        reason: reason,
+        response_status: response_status
+      }
+    )
+
+    response_status
+  end
+
+  defp emit_lifecycle(event, data, metadata),
+    do:
+      :telemetry.execute(
+        [:jasmin_ex, :smpp, event],
+        %{},
+        lifecycle_metadata(data, metadata)
+      )
+
+  defp lifecycle_metadata(data, metadata),
+    do: Map.merge(%{client: self(), bind_as: data.config.bind_as}, metadata)
 
   defp enquire_link_resp(seq),
     do:
@@ -769,8 +857,7 @@ defmodule JasminEx.Smpp.Client do
           ":unbind_drain_timeout_ms must be a non-negative integer, got: #{inspect(timeout)}"
   end
 
-  defp normalize_deliver_handler({handler, context}) when is_atom(handler),
-    do: {handler, %{handler: context}}
+  defp normalize_deliver_handler({handler, context}) when is_atom(handler), do: {handler, context}
 
-  defp normalize_deliver_handler(nil), do: {nil, %{}}
+  defp normalize_deliver_handler(nil), do: {nil, nil}
 end
