@@ -108,6 +108,12 @@ defmodule JasminEx.Smpp.FakeSMSC do
     GenServer.call(pid, {:set_script, command_id, :withhold})
   end
 
+  @doc "Restore automatic successful responses for the given command."
+  @spec auto_reply(pid(), atom()) :: :ok
+  def auto_reply(pid, command_id) do
+    GenServer.call(pid, {:set_script, command_id, :auto_reply})
+  end
+
   @doc """
   Close the socket the moment a given command arrives. Simulates SMSC
   vanishing mid-session (heartbeat-induced disconnect, mid-bind drop, etc.).
