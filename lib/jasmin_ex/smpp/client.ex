@@ -55,6 +55,7 @@ defmodule JasminEx.Smpp.Client do
   alias JasminEx.Smpp.Client.Config
   alias JasminEx.Smpp.Client.DeliverSMDispatch
   alias JasminEx.Smpp.Client.ReconnectPolicy
+  alias JasminEx.Smpp.Client.RequestWindow
   alias JasminEx.Smpp.Client.Transport
   alias JasminEx.Smpp.PDU
   alias JasminEx.Smpp.PDU.Body
@@ -63,8 +64,6 @@ defmodule JasminEx.Smpp.Client do
   @behaviour :gen_statem
 
   @connect_timeout_ms 5_000
-  @seq_wrap 0x7FFF_FFFF
-
   @spec start_link(keyword()) :: {:ok, pid()} | {:error, term()}
   def start_link(opts), do: :gen_statem.start_link(__MODULE__, Config.new!(opts), [])
 
@@ -99,9 +98,7 @@ defmodule JasminEx.Smpp.Client do
       config: config,
       socket: nil,
       buffer: <<>>,
-      seq: 1,
-      pending: %{},
-      cancelled: [],
+      request_window: RequestWindow.new(),
       backoff_attempt: 0,
       ever_bound: false,
       target_state: nil,
@@ -160,7 +157,7 @@ defmodule JasminEx.Smpp.Client do
 
   def bind_pending({:timeout, {:pending, seq}}, :pending_timeout, data) do
     data
-    |> remove_pending(seq)
+    |> expire_pending(seq)
     |> close_socket()
     |> arm_reconnect(:bind_pending, :bind_timeout)
   end
@@ -190,8 +187,7 @@ defmodule JasminEx.Smpp.Client do
 
   def bound({:call, from}, :unbind, data) do
     data = drop_internal_pending(data)
-    cancels = cancellation_actions(data)
-    data = clear_cancellations(data)
+    {cancels, data} = drain_cancellations(data)
 
     if pending_submits?(data) do
       {:next_state, :unbinding, %{data | unbind_phase: :draining},
@@ -214,8 +210,7 @@ defmodule JasminEx.Smpp.Client do
 
     case Transport.send(data.socket, pdu) do
       :ok ->
-        pending = Map.put(data.pending, seq, %{from: from, command_id: :submit_sm})
-        data = %{data | pending: pending}
+        data = insert_pending(data, seq, :submit_sm, from)
         {:keep_state, data, [pending_timeout_action(seq, data.config.response_timeout_ms)]}
 
       {:error, reason} ->
@@ -229,19 +224,19 @@ defmodule JasminEx.Smpp.Client do
   end
 
   def bound({:timeout, {:pending, seq}}, :pending_timeout, data) do
-    case Map.pop(data.pending, seq) do
-      {nil, _pending} ->
+    case expire_pending_entry(data, seq) do
+      {nil, data} ->
         {:keep_state, data}
 
-      {%{from: nil}, pending} ->
-        %{data | pending: pending}
+      {%{from: nil}, data} ->
+        data
         |> close_socket()
         |> flush_pending({:unknown, :disconnected})
         |> arm_reconnect(:bound, :heartbeat_timeout)
 
-      {%{command_id: :submit_sm, from: from}, pending} ->
+      {%{command_id: :submit_sm, from: from}, data} ->
         :gen_statem.reply(from, {:unknown, :response_timeout})
-        {:keep_state, %{data | pending: pending}}
+        {:keep_state, data}
     end
   end
 
@@ -288,24 +283,24 @@ defmodule JasminEx.Smpp.Client do
     do: {:keep_state, data, [{:reply, from, {:error, :unbinding}}]}
 
   def unbinding({:timeout, {:pending, seq}}, :pending_timeout, data) do
-    case Map.pop(data.pending, seq) do
-      {%{command_id: :submit_sm, from: from}, pending} ->
+    case expire_pending_entry(data, seq) do
+      {%{command_id: :submit_sm, from: from}, data} ->
         :gen_statem.reply(from, {:unknown, :response_timeout})
-        continue_unbinding(%{data | pending: pending})
+        continue_unbinding(data)
 
-      {%{command_id: :unbind}, _pending} when data.unbind_phase == :waiting_for_response ->
+      {%{command_id: :unbind}, data} when data.unbind_phase == :waiting_for_response ->
         {:stop, :normal, close_socket(data)}
 
-      _stale_or_unrelated ->
+      {_stale_or_unrelated, data} ->
         {:keep_state, data}
     end
   end
 
   def unbinding({:timeout, :unbind_drain}, :deadline, %{unbind_phase: :draining} = data) do
     data = flush_submit_pending(data, {:unknown, :unbind_deadline})
-    actions = cancellation_actions(data)
+    {actions, data} = drain_cancellations(data)
 
-    case send_unbind(clear_cancellations(data)) do
+    case send_unbind(data) do
       {:ok, data, action} -> {:keep_state, data, actions ++ [action]}
       {:error, _reason, data} -> {:stop, :normal, close_socket(data)}
     end
@@ -333,13 +328,9 @@ defmodule JasminEx.Smpp.Client do
 
     case Transport.send(data.socket, pdu) do
       :ok ->
-        pending =
-          Map.put(data.pending, seq, %{
-            from: nil,
-            command_id: bind_as_command(data.config.bind_as)
-          })
+        data = insert_pending(data, seq, bind_as_command(data.config.bind_as), nil)
 
-        {:next_state, :bind_pending, %{data | pending: pending},
+        {:next_state, :bind_pending, data,
          [pending_timeout_action(seq, data.config.response_timeout_ms)]}
 
       {:error, _reason} ->
@@ -372,16 +363,18 @@ defmodule JasminEx.Smpp.Client do
          %PDU{command: command, sequence_number: seq, status: status},
          :bind_pending
        ) do
-    case {bind_request_for(command), Map.get(data.pending, seq)} do
-      {bind_command, %{command_id: bind_command}} when not is_nil(bind_command) ->
-        data = cancel_pending(data, seq)
+    bind_command = bind_request_for(command)
+
+    case RequestWindow.resolve(data.request_window, seq, bind_command) do
+      {:ok, _entry, request_window} when not is_nil(bind_command) ->
+        data = %{data | request_window: request_window}
 
         case status do
           :ESME_ROK -> %{data | target_state: :bound}
           _ -> %{data | target_state: :disconnected, exit_reason: :bind_rejected}
         end
 
-      _ ->
+      {:error, _request_window} ->
         log_unknown_response(command, seq)
         data
     end
@@ -396,12 +389,12 @@ defmodule JasminEx.Smpp.Client do
          state
        )
        when state in [:bound, :unbinding] do
-    case Map.get(data.pending, seq) do
-      %{command_id: :submit_sm, from: from} ->
-        :gen_statem.reply(from, submit_response(pdu))
-        cancel_pending(data, seq)
+    case RequestWindow.resolve(data.request_window, seq, :submit_sm) do
+      {:ok, %{from: from}, request_window} ->
+        :gen_statem.reply(from, RequestWindow.classify_submit_response(pdu))
+        %{data | request_window: request_window}
 
-      _unmatched ->
+      {:error, _request_window} ->
         log_unknown_response(:submit_sm_resp, seq)
         data
     end
@@ -425,11 +418,11 @@ defmodule JasminEx.Smpp.Client do
     do: send_wire(data, enquire_link_resp(seq))
 
   defp apply_pdu(data, %PDU{command: :unbind_resp, sequence_number: seq}, :unbinding) do
-    case Map.get(data.pending, seq) do
-      %{command_id: :unbind} ->
-        %{data | target_state: :unbound}
+    case RequestWindow.resolve(data.request_window, seq, :unbind) do
+      {:ok, _entry, request_window} ->
+        %{data | request_window: request_window, target_state: :unbound}
 
-      _ ->
+      {:error, _request_window} ->
         log_unknown_response(:unbind_resp, seq)
         data
     end
@@ -455,8 +448,10 @@ defmodule JasminEx.Smpp.Client do
     emit_lifecycle(:bound, data, %{kind: kind})
     data = %{data | target_state: nil, backoff_attempt: 0, ever_bound: true}
 
+    {cancellations, data} = drain_cancellations(data)
+
     {:next_state, :bound, data,
-     cancellation_actions(data) ++ [{:state_timeout, data.config.heartbeat_ms, :heartbeat}]}
+     cancellations ++ [{:state_timeout, data.config.heartbeat_ms, :heartbeat}]}
   end
 
   defp settle_inbound(:bind_pending, %{target_state: :disconnected} = data) do
@@ -471,16 +466,16 @@ defmodule JasminEx.Smpp.Client do
   defp settle_inbound(:unbinding, data), do: continue_unbinding(data)
 
   defp settle_inbound(_state, data) do
-    actions = cancellation_actions(data)
-    {:keep_state, clear_cancellations(data), actions}
+    {actions, data} = drain_cancellations(data)
+    {:keep_state, data, actions}
   end
 
   defp resolve_internal_response(data, command_id, seq) do
-    case Map.get(data.pending, seq) do
-      %{command_id: ^command_id, from: nil} ->
-        cancel_pending(data, seq)
+    case RequestWindow.resolve(data.request_window, seq, command_id) do
+      {:ok, %{from: nil}, request_window} ->
+        %{data | request_window: request_window}
 
-      _ ->
+      _unmatched ->
         log_unknown_response(:enquire_link_resp, seq)
         data
     end
@@ -494,10 +489,9 @@ defmodule JasminEx.Smpp.Client do
 
     case Transport.send(data.socket, pdu) do
       :ok ->
-        pending = Map.put(data.pending, seq, %{from: nil, command_id: :enquire_link})
+        data = insert_pending(data, seq, :enquire_link, nil)
 
-        {:ok, %{data | pending: pending},
-         pending_timeout_action(seq, data.config.response_timeout_ms)}
+        {:ok, data, pending_timeout_action(seq, data.config.response_timeout_ms)}
 
       {:error, _reason} ->
         :error
@@ -526,55 +520,55 @@ defmodule JasminEx.Smpp.Client do
     PDU.build(command: :submit_sm, status: :ESME_ROK, sequence_number: seq, body: body_bin)
   end
 
-  defp take_sequence(data), do: {data.seq, %{data | seq: next_seq(data.seq)}}
-  defp next_seq(seq) when seq >= @seq_wrap, do: 1
-  defp next_seq(seq), do: seq + 1
+  defp take_sequence(data) do
+    {sequence, request_window} = RequestWindow.take_sequence(data.request_window)
+    {sequence, %{data | request_window: request_window}}
+  end
 
   defp pending_timeout_action(seq, timeout),
-    do: {{:timeout, {:pending, seq}}, timeout, :pending_timeout}
+    do: RequestWindow.pending_timeout_action(seq, timeout)
 
   defp unbind_drain_action(data),
     do: {{:timeout, :unbind_drain}, data.config.unbind_drain_timeout_ms, :deadline}
 
-  defp cancellation_actions(data),
-    do: Enum.map(data.cancelled, &{{:timeout, {:pending, &1}}, :cancel})
-
-  defp clear_cancellations(data), do: %{data | cancelled: []}
-
-  defp cancel_pending(data, seq),
-    do: %{data | pending: Map.delete(data.pending, seq), cancelled: [seq | data.cancelled]}
-
-  defp remove_pending(data, seq), do: %{data | pending: Map.delete(data.pending, seq)}
-
   defp flush_pending(data, reply) do
-    Enum.each(data.pending, fn {_seq, %{from: from}} -> reply_to_pending(from, reply) end)
-    %{data | pending: %{}, cancelled: Map.keys(data.pending) ++ data.cancelled}
+    {request_window, directives} = RequestWindow.flush(data.request_window, reply)
+    Enum.each(directives, fn {from, pending_reply} -> reply_to_pending(from, pending_reply) end)
+    %{data | request_window: request_window}
   end
 
   defp flush_submit_pending(data, reply) do
-    Enum.reduce(data.pending, data, fn
-      {seq, %{command_id: :submit_sm, from: from}}, acc ->
-        reply_to_pending(from, reply)
-        cancel_pending(acc, seq)
-
-      {_seq, _entry}, acc ->
-        acc
-    end)
+    {request_window, directives} = RequestWindow.flush_submits(data.request_window, reply)
+    Enum.each(directives, fn {from, pending_reply} -> reply_to_pending(from, pending_reply) end)
+    %{data | request_window: request_window}
   end
 
-  defp drop_internal_pending(data) do
-    Enum.reduce(data.pending, data, fn
-      {_seq, %{command_id: :submit_sm}}, acc -> acc
-      {seq, _entry}, acc -> cancel_pending(acc, seq)
-    end)
-  end
+  defp drop_internal_pending(data),
+    do: %{data | request_window: RequestWindow.drop_internal(data.request_window)}
 
   defp pending_submits?(data),
-    do: Enum.any?(data.pending, fn {_seq, entry} -> entry.command_id == :submit_sm end)
+    do: RequestWindow.pending_submits?(data.request_window)
+
+  defp insert_pending(data, seq, command_id, from),
+    do: %{data | request_window: RequestWindow.insert(data.request_window, seq, command_id, from)}
+
+  defp expire_pending(data, seq) do
+    {_entry, data} = expire_pending_entry(data, seq)
+    data
+  end
+
+  defp expire_pending_entry(data, seq) do
+    {entry, request_window} = RequestWindow.expire(data.request_window, seq)
+    {entry, %{data | request_window: request_window}}
+  end
+
+  defp drain_cancellations(data) do
+    {actions, request_window} = RequestWindow.drain_cancellations(data.request_window)
+    {actions, %{data | request_window: request_window}}
+  end
 
   defp continue_unbinding(%{unbind_phase: :draining} = data) do
-    actions = cancellation_actions(data)
-    data = clear_cancellations(data)
+    {actions, data} = drain_cancellations(data)
 
     if pending_submits?(data) do
       {:keep_state, data, actions}
@@ -590,8 +584,8 @@ defmodule JasminEx.Smpp.Client do
   end
 
   defp continue_unbinding(data) do
-    actions = cancellation_actions(data)
-    {:keep_state, clear_cancellations(data), actions}
+    {actions, data} = drain_cancellations(data)
+    {:keep_state, data, actions}
   end
 
   defp send_unbind(data) do
@@ -600,8 +594,11 @@ defmodule JasminEx.Smpp.Client do
 
     case safe_tcp_send(data.socket, pdu) do
       :ok ->
-        pending = Map.put(data.pending, seq, %{from: nil, command_id: :unbind})
-        data = %{data | pending: pending, unbind_phase: :waiting_for_response}
+        data = %{
+          insert_pending(data, seq, :unbind, nil)
+          | unbind_phase: :waiting_for_response
+        }
+
         {:ok, data, pending_timeout_action(seq, data.config.response_timeout_ms)}
 
       {:error, reason} ->
@@ -620,9 +617,10 @@ defmodule JasminEx.Smpp.Client do
       lifecycle_metadata(data, %{attempt: attempt, reason: reason})
     )
 
-    actions = cancellation_actions(data) ++ [reconnect_action(delay)]
+    {cancellations, data} = drain_cancellations(data)
+    actions = cancellations ++ [reconnect_action(delay)]
 
-    {:next_state, :disconnected, %{clear_cancellations(data) | backoff_attempt: attempt}, actions}
+    {:next_state, :disconnected, %{data | backoff_attempt: attempt}, actions}
   end
 
   defp reconnect_action(delay), do: {{:timeout, :reconnect}, delay, :try_connect}
@@ -689,19 +687,6 @@ defmodule JasminEx.Smpp.Client do
   defp enquire_link_resp(seq),
     do:
       PDU.build(command: :enquire_link_resp, status: :ESME_ROK, sequence_number: seq, body: <<>>)
-
-  defp submit_response(%PDU{status: status}) when status != :ESME_ROK,
-    do: {:error, {:submit_rejected, status}}
-
-  defp submit_response(%PDU{body: body}) do
-    case Body.decode(:submit_sm_resp, body) do
-      {:ok, %Body.SubmitSMResp{message_id: id}} when is_binary(id) and byte_size(id) > 0 ->
-        {:ok, id}
-
-      _invalid ->
-        {:unknown, :invalid_response}
-    end
-  end
 
   defp safe_tcp_send(socket, pdu) do
     Transport.send(socket, pdu)

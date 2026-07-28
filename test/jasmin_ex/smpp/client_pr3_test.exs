@@ -1012,7 +1012,7 @@ defmodule JasminEx.Smpp.ClientPR3Test do
 
   defp pending_count(client) do
     {_state, data} = :sys.get_state(client)
-    map_size(data.pending)
+    map_size(data.request_window.pending)
   end
 
   defp assert_delivery_failure(handler, context, reason, response_status, sequence_number) do
@@ -1049,7 +1049,7 @@ defmodule JasminEx.Smpp.ClientPR3Test do
 
   defp pending_bind_seq(client) do
     {_state, data} = :sys.get_state(client)
-    [seq] = Map.keys(data.pending)
+    [seq] = Map.keys(data.request_window.pending)
     seq
   end
 
