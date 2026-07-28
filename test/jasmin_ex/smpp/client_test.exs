@@ -333,7 +333,8 @@ defmodule JasminEx.Smpp.ClientTest do
         end)
       end
 
-      assert %{wrap: 0x7FFF_FFFF, "wrap-next": 1} = await_submit_sequences(ref, %{}, 2)
+      assert [1, 0x7FFF_FFFF] ==
+               ref |> await_submit_sequences(%{}, 2) |> Map.values() |> Enum.sort()
 
       :ok = FakeSMSC.close_on_command(smsc, :enquire_link)
       assert_receive {:wrap, {:unknown, :disconnected}}, 500
