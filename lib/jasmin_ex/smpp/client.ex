@@ -52,7 +52,9 @@ defmodule JasminEx.Smpp.Client do
 
   require Logger
 
+  alias JasminEx.Smpp.Client.Config
   alias JasminEx.Smpp.Client.DeliverSMDispatch
+  alias JasminEx.Smpp.Client.ReconnectPolicy
   alias JasminEx.Smpp.Framing
   alias JasminEx.Smpp.PDU
   alias JasminEx.Smpp.PDU.Body
@@ -60,17 +62,11 @@ defmodule JasminEx.Smpp.Client do
 
   @behaviour :gen_statem
 
-  @default_heartbeat_ms 30_000
-  @default_response_timeout_ms 5_000
-  @default_reconnect_base_ms 1_000
-  @default_reconnect_factor 2
-  @default_reconnect_cap_ms 30_000
-  @default_jitter true
   @connect_timeout_ms 5_000
   @seq_wrap 0x7FFF_FFFF
 
   @spec start_link(keyword()) :: {:ok, pid()} | {:error, term()}
-  def start_link(opts), do: :gen_statem.start_link(__MODULE__, build_config(opts), [])
+  def start_link(opts), do: :gen_statem.start_link(__MODULE__, Config.new!(opts), [])
 
   @spec status(pid()) :: :disconnected | :connecting | :bind_pending | :bound | :unbinding
   def status(pid), do: :gen_statem.call(pid, :status, 5_000)
@@ -727,51 +723,6 @@ defmodule JasminEx.Smpp.Client do
     kind, reason -> {:error, {kind, reason}}
   end
 
-  defp backoff_delay(%{
-         config: %{reconnect: %{base_ms: base, factor: factor, cap_ms: cap, jitter: jitter}},
-         backoff_attempt: attempt
-       }) do
-    delay = min(base * Integer.pow(factor, attempt), cap)
-    if jitter, do: :rand.uniform(delay), else: delay
-  end
-
-  defp build_config(opts) do
-    response_timeout_ms = Keyword.get(opts, :response_timeout_ms, @default_response_timeout_ms)
-
-    unbind_drain_timeout_ms =
-      opts
-      |> Keyword.get(:unbind_drain_timeout_ms, response_timeout_ms)
-      |> validate_unbind_drain_timeout!()
-
-    %{
-      host: Keyword.fetch!(opts, :host),
-      port: Keyword.fetch!(opts, :port),
-      system_id: Keyword.fetch!(opts, :system_id),
-      password: Keyword.fetch!(opts, :password),
-      system_type: Keyword.fetch!(opts, :system_type),
-      bind_as: Keyword.fetch!(opts, :bind_as),
-      heartbeat_ms: Keyword.get(opts, :heartbeat_ms, @default_heartbeat_ms),
-      response_timeout_ms: response_timeout_ms,
-      unbind_drain_timeout_ms: unbind_drain_timeout_ms,
-      reconnect: %{
-        base_ms: Keyword.get(opts, :reconnect_base_ms, @default_reconnect_base_ms),
-        factor: Keyword.get(opts, :reconnect_factor, @default_reconnect_factor),
-        cap_ms: Keyword.get(opts, :reconnect_cap_ms, @default_reconnect_cap_ms),
-        jitter: Keyword.get(opts, :reconnect_jitter, @default_jitter)
-      },
-      deliver_handler: normalize_deliver_handler(Keyword.get(opts, :deliver_handler))
-    }
-  end
-
-  defp validate_unbind_drain_timeout!(timeout) when is_integer(timeout) and timeout >= 0,
-    do: timeout
-
-  defp validate_unbind_drain_timeout!(timeout) do
-    raise ArgumentError,
-          ":unbind_drain_timeout_ms must be a non-negative integer, got: #{inspect(timeout)}"
-  end
-
-  defp normalize_deliver_handler({handler, context}) when is_atom(handler), do: {handler, context}
-
-  defp normalize_deliver_handler(nil), do: {nil, nil}
+  defp backoff_delay(%{config: config, backoff_attempt: attempt}),
+    do: ReconnectPolicy.delay(config.reconnect, attempt, &:rand.uniform/1)
 end
