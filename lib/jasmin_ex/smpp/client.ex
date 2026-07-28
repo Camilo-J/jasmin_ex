@@ -52,6 +52,7 @@ defmodule JasminEx.Smpp.Client do
 
   require Logger
 
+  alias JasminEx.Smpp.Client.DeliverSMDispatch
   alias JasminEx.Smpp.Framing
   alias JasminEx.Smpp.PDU
   alias JasminEx.Smpp.PDU.Body
@@ -428,7 +429,7 @@ defmodule JasminEx.Smpp.Client do
 
   defp apply_pdu(data, %PDU{command: :deliver_sm, sequence_number: seq, body: body}, state)
        when state in [:bound, :unbinding] do
-    status = dispatch_deliver_sm(data, body)
+    status = DeliverSMDispatch.dispatch(body, data.config.deliver_handler, self())
 
     send_wire(
       data,
@@ -689,93 +690,6 @@ defmodule JasminEx.Smpp.Client do
   end
 
   defp log_tcp_error(reason), do: Logger.warning("SMPP TCP error: #{inspect(reason)}")
-
-  # The two failure causes answer differently on purpose. A body that does not
-  # decode is a malformed PDU and will not decode on redelivery either, so it
-  # gets a system error. A handler that fails is our side being momentarily
-  # unable to process a well-formed message, so it asks for redelivery instead
-  # of dropping it.
-  defp dispatch_deliver_sm(data, body) do
-    case decode_deliver_sm(body) do
-      {:ok, pdu} -> invoke_deliver_handler(data, pdu)
-      :error -> :ESME_RSYSERR
-    end
-  end
-
-  defp decode_deliver_sm(body) do
-    case Body.decode(:deliver_sm, body) do
-      {:ok, %Body.DeliverSM{} = pdu} -> {:ok, pdu}
-      _other -> :error
-    end
-  rescue
-    _error ->
-      Logger.error("deliver_sm body failed to decode")
-      :error
-  end
-
-  # No handler means nothing consumed the message, so acknowledging it would
-  # silently discard real MO traffic. Treat it as the local misconfiguration it
-  # is and let the SMSC redeliver once a handler is wired up.
-  defp invoke_deliver_handler(%{config: %{deliver_handler: {nil, _context}}}, _pdu) do
-    Logger.error(
-      "deliver_sm received but no deliver_handler is configured; asking the SMSC to retry"
-    )
-
-    deliver_failure(nil, :handler_not_configured, :ESME_RX_T_APPN)
-  end
-
-  defp invoke_deliver_handler(%{config: %{deliver_handler: {handler, context}}}, pdu) do
-    case handler.handle_deliver_sm(pdu, %{
-           client: self(),
-           handler_context: context,
-           handler: context
-         }) do
-      :ok -> :ESME_ROK
-      {:error, status} -> encodable_status(handler, status)
-      _other -> handler_unavailable(handler)
-    end
-  rescue
-    _error -> handler_unavailable(handler)
-  catch
-    _kind, _reason -> handler_unavailable(handler)
-  end
-
-  defp handler_unavailable(handler) do
-    Logger.error("deliver_sm handler unavailable; asking the SMSC to retry")
-    deliver_failure(handler, :handler_unavailable, :ESME_RX_T_APPN)
-  end
-
-  # A handler may return any atom. Encoding an unmapped one raises inside
-  # PDU.build/1 — outside this dispatch path's rescue — which would kill the
-  # session instead of answering the SMSC, so it degrades to a system error.
-  defp encodable_status(handler, status) when is_atom(status) do
-    case Constants.command_status_to_int(status) do
-      {:ok, _int} -> status
-      :error -> unencodable_status(handler)
-    end
-  end
-
-  defp encodable_status(handler, _status), do: unencodable_status(handler)
-
-  defp unencodable_status(handler) do
-    Logger.warning("deliver_sm handler returned an unencodable status; responding :ESME_RSYSERR")
-    deliver_failure(handler, :unencodable_status, :ESME_RSYSERR)
-  end
-
-  defp deliver_failure(handler, reason, response_status) do
-    :telemetry.execute(
-      [:jasmin_ex, :smpp, :deliver_sm, :failed],
-      %{},
-      %{
-        client: self(),
-        handler: handler,
-        reason: reason,
-        response_status: response_status
-      }
-    )
-
-    response_status
-  end
 
   defp emit_lifecycle(event, data, metadata),
     do:
