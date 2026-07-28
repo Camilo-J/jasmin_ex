@@ -520,20 +520,32 @@ defmodule JasminEx.Smpp.ClientPR3Test do
       {:ok, client} = start_client(port, deliver_handler: {SendToPid, handler})
       assert :ok = await_bound(client)
       ref = FakeSMSC.subscribe(smsc)
+
+      :ok = :sys.suspend(handler)
+      assert :ok = FakeSMSC.send_bytes(smsc, deliver_sm_bytes(78, "after-owner"))
+
+      assert :ok =
+               wait_until(fn ->
+                 Process.info(handler, :message_queue_len) == {:message_queue_len, 1}
+               end)
+
+      owner_ref = Process.monitor(owner)
       Process.exit(owner, :kill)
+      assert_receive {:DOWN, ^owner_ref, :process, ^owner, :killed}, 500
 
       log =
         capture_log(fn ->
-          assert :ok = FakeSMSC.send_bytes(smsc, deliver_sm_bytes(78, "after-owner"))
-          Process.sleep(30)
+          :ok = :sys.resume(handler)
+
+          assert {:ok,
+                  %PDU{
+                    command: :deliver_sm_resp,
+                    sequence_number: 78,
+                    status: :ESME_RX_T_APPN
+                  }} = ref |> await_pdu(:deliver_sm_resp) |> PDU.decode()
         end)
 
       assert log =~ "no live consumer"
-      bytes = await_pdu(ref, :deliver_sm_resp)
-
-      assert {:ok, %PDU{command: :deliver_sm_resp, sequence_number: 78, status: :ESME_RX_T_APPN}} =
-               PDU.decode(bytes)
-
       assert Client.status(client) == :bound
       stop(client)
       stop(handler)

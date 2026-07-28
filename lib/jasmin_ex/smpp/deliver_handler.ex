@@ -77,13 +77,21 @@ defmodule JasminEx.Smpp.DeliverHandler.SendToPid do
   end
 
   def handle_call({:deliver, pdu, context}, _from, %{owner: owner} = state) when is_pid(owner) do
-    send(owner, {:smpp_deliver_sm, pdu, context})
-    {:reply, :ok, state}
+    if Process.alive?(owner) do
+      send(owner, {:smpp_deliver_sm, pdu, context})
+      {:reply, :ok, state}
+    else
+      reject_delivery(state)
+    end
   end
 
   def handle_call({:deliver, _pdu, _context}, _from, state) do
+    reject_delivery(state)
+  end
+
+  defp reject_delivery(state) do
     Logger.warning("deliver_sm received with no live consumer; asking the SMSC to retry")
-    {:reply, {:error, :ESME_RX_T_APPN}, state}
+    {:reply, {:error, :ESME_RX_T_APPN}, clear_owner(state)}
   end
 
   @impl true
