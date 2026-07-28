@@ -320,7 +320,11 @@ defmodule JasminEx.Smpp.ClientTest do
       {:ok, client} = start_client(port)
 
       assert :ok = wait_until(fn -> Client.status(client) == :bound end)
-      :sys.replace_state(client, fn {state, data} -> {state, %{data | seq: 0x7FFF_FFFF}} end)
+
+      :sys.replace_state(client, fn {state, data} ->
+        request_window = %{data.request_window | next_sequence: 0x7FFF_FFFF}
+        {state, %{data | request_window: request_window}}
+      end)
 
       test_pid = self()
 
@@ -420,7 +424,7 @@ defmodule JasminEx.Smpp.ClientTest do
         wait_until(
           fn ->
             {_state, data} = :sys.get_state(client)
-            map_size(data.pending) >= n
+            map_size(data.request_window.pending) >= n
           end,
           500
         )
@@ -513,7 +517,7 @@ defmodule JasminEx.Smpp.ClientTest do
 
   defp heartbeat_has_advanced_sequence?(client) do
     {_state, data} = :sys.get_state(client)
-    data.seq > 1
+    data.request_window.next_sequence > 1
   end
 
   defp await_submit_sequences(_ref, sequences, expected) when map_size(sequences) == expected,
