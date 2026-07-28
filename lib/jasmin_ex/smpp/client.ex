@@ -55,7 +55,7 @@ defmodule JasminEx.Smpp.Client do
   alias JasminEx.Smpp.Client.Config
   alias JasminEx.Smpp.Client.DeliverSMDispatch
   alias JasminEx.Smpp.Client.ReconnectPolicy
-  alias JasminEx.Smpp.Framing
+  alias JasminEx.Smpp.Client.Transport
   alias JasminEx.Smpp.PDU
   alias JasminEx.Smpp.PDU.Body
   alias JasminEx.Smpp.PDU.Constants
@@ -135,12 +135,7 @@ defmodule JasminEx.Smpp.Client do
   def connecting({:call, from}, :unbind, data), do: reply_disconnected(from, data)
 
   def connecting(:state_timeout, :connect, data) do
-    case :gen_tcp.connect(
-           data.config.host,
-           data.config.port,
-           [:binary, packet: :raw, active: :once],
-           @connect_timeout_ms
-         ) do
+    case Transport.connect(data.config.host, data.config.port, @connect_timeout_ms) do
       {:ok, socket} -> send_bind(%{data | socket: socket, buffer: <<>>})
       {:error, _reason} -> data |> close_socket() |> arm_reconnect(:connecting, :connect_failed)
     end
@@ -217,7 +212,7 @@ defmodule JasminEx.Smpp.Client do
     {seq, data} = take_sequence(data)
     pdu = build_submit_pdu(body, seq)
 
-    case :gen_tcp.send(data.socket, IO.iodata_to_binary(PDU.encode(pdu))) do
+    case Transport.send(data.socket, pdu) do
       :ok ->
         pending = Map.put(data.pending, seq, %{from: from, command_id: :submit_sm})
         data = %{data | pending: pending}
@@ -336,7 +331,7 @@ defmodule JasminEx.Smpp.Client do
     {seq, data} = take_sequence(data)
     pdu = build_bind_pdu(data.config, seq)
 
-    case :gen_tcp.send(data.socket, IO.iodata_to_binary(PDU.encode(pdu))) do
+    case Transport.send(data.socket, pdu) do
       :ok ->
         pending =
           Map.put(data.pending, seq, %{
@@ -353,11 +348,11 @@ defmodule JasminEx.Smpp.Client do
   end
 
   defp receive_tcp(state, data, socket, bytes) do
-    {pdus, leftover} = Framing.feed(<<>>, data.buffer <> bytes)
+    {pdus, leftover} = Transport.decode(data.buffer, bytes)
 
     {data, _last_state} =
-      Enum.reduce(pdus, {%{data | buffer: leftover}, state}, fn pdu_bin, {acc, acc_state} ->
-        acc = dispatch_pdu(acc, pdu_bin, acc_state)
+      Enum.reduce(pdus, {%{data | buffer: leftover}, state}, fn pdu, {acc, acc_state} ->
+        acc = apply_pdu(acc, pdu, acc_state)
         {acc, effective_state(acc_state, acc)}
       end)
 
@@ -371,13 +366,6 @@ defmodule JasminEx.Smpp.Client do
   # Otherwise a deliver_sm sharing the bind_resp packet is silently dropped.
   defp effective_state(:bind_pending, %{target_state: :bound}), do: :bound
   defp effective_state(state, _data), do: state
-
-  defp dispatch_pdu(data, pdu_bin, state) do
-    case PDU.decode(pdu_bin) do
-      {:ok, pdu} -> apply_pdu(data, pdu, state)
-      {:error, _reason} -> data
-    end
-  end
 
   defp apply_pdu(
          data,
@@ -504,7 +492,7 @@ defmodule JasminEx.Smpp.Client do
     {seq, data} = take_sequence(data)
     pdu = PDU.build(command: :enquire_link, status: :ESME_ROK, sequence_number: seq, body: <<>>)
 
-    case :gen_tcp.send(data.socket, IO.iodata_to_binary(PDU.encode(pdu))) do
+    case Transport.send(data.socket, pdu) do
       :ok ->
         pending = Map.put(data.pending, seq, %{from: nil, command_id: :enquire_link})
 
@@ -610,7 +598,7 @@ defmodule JasminEx.Smpp.Client do
     {seq, data} = take_sequence(data)
     pdu = PDU.build(command: :unbind, status: :ESME_ROK, sequence_number: seq, body: <<>>)
 
-    case safe_tcp_send(data.socket, IO.iodata_to_binary(PDU.encode(pdu))) do
+    case safe_tcp_send(data.socket, pdu) do
       :ok ->
         pending = Map.put(data.pending, seq, %{from: nil, command_id: :unbind})
         data = %{data | pending: pending, unbind_phase: :waiting_for_response}
@@ -648,7 +636,7 @@ defmodule JasminEx.Smpp.Client do
   defp close_socket(%{socket: nil} = data), do: %{data | buffer: <<>>}
 
   defp close_socket(%{socket: socket} = data) do
-    :gen_tcp.close(socket)
+    Transport.close(socket)
     %{data | socket: nil, buffer: <<>>}
   rescue
     _ -> %{data | socket: nil, buffer: <<>>}
@@ -659,12 +647,12 @@ defmodule JasminEx.Smpp.Client do
   defp send_wire(data, pdu),
     do:
       (
-        :gen_tcp.send(data.socket, IO.iodata_to_binary(PDU.encode(pdu)))
+        Transport.send(data.socket, pdu)
         data
       )
 
   defp safe_setopts_once(socket) do
-    :inet.setopts(socket, active: :once)
+    Transport.activate_once(socket)
   rescue
     _ -> :ok
   end
@@ -715,8 +703,8 @@ defmodule JasminEx.Smpp.Client do
     end
   end
 
-  defp safe_tcp_send(socket, bytes) do
-    :gen_tcp.send(socket, bytes)
+  defp safe_tcp_send(socket, pdu) do
+    Transport.send(socket, pdu)
   rescue
     error -> {:error, error}
   catch
