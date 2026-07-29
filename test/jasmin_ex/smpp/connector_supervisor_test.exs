@@ -163,9 +163,11 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
     send(test_pid, {:connector_bound, metadata.client})
   end
 
-  test "application only wires a connector supervisor when connector config is present" do
-    assert Application.children([]) == []
-    assert [{ConnectorSupervisor, [[]]}] = Application.children(smpp_connectors: [[]])
+  test "application adds a connector supervisor only when connector config is present" do
+    assert [%{id: JasminEx.StateStore.Connection}] = Application.children([])
+
+    assert [%{id: JasminEx.StateStore.Connection}, {ConnectorSupervisor, [[]]}] =
+             Application.children(smpp_connectors: [[]])
   end
 
   defp connector_config(port) do

@@ -33,6 +33,7 @@ defmodule JasminEx.MixProject do
     [
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
+      {:redix, "~> 1.6.0"},
       {:telemetry, "~> 1.0"}
     ]
   end
