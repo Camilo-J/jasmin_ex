@@ -1,5 +1,6 @@
 defmodule JasminEx.StateStore.IntegrationTest do
   use ExUnit.Case, async: false
+  @moduletag :integration
 
   alias JasminEx.StateStore
   alias JasminEx.StateStoreHarness
@@ -53,9 +54,11 @@ defmodule JasminEx.StateStore.IntegrationTest do
     store = StateStoreHarness.store(harness)
 
     assert StateStore.put(store, "recovery", "value", 1_000) == :ok
+    port = harness.port
     :ok = StateStoreHarness.stop_valkey!(harness)
     assert match?({:error, {:store, _reason}}, StateStore.fetch(store, "recovery"))
     :ok = StateStoreHarness.start_valkey!(harness)
+    assert harness.port == port
 
     assert StateStoreHarness.eventually(fn ->
              StateStore.put(store, "recovery", "recovered", 1_000) == :ok
