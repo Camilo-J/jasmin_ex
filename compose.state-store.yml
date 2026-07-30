@@ -1,15 +1,15 @@
 services:
   valkey:
-    image: valkey/valkey:9.1.1@sha256:2f4a4b0a42a72569b40567fae9016dc54aa76736250be28120b5fced8050c0f0
-    command: ["valkey-server", "--requirepass", "${STATE_STORE_TEST_PASSWORD}"]
+    image: ${STATE_STORE_TEST_IMAGE:-valkey/valkey:9.1.1@sha256:2f4a4b0a42a72569b40567fae9016dc54aa76736250be28120b5fced8050c0f0}
+    command: ${STATE_STORE_TEST_COMMAND:-valkey-server --requirepass state-store-test-password}
     environment:
       STATE_STORE_TEST_PASSWORD: ${STATE_STORE_TEST_PASSWORD}
     ports:
       - target: 6379
-        published: "6397"
+        published: "${STATE_STORE_TEST_PORT}"
         host_ip: 127.0.0.1
     healthcheck:
-      test: ["CMD-SHELL", "VALKEYCLI_AUTH=$$STATE_STORE_TEST_PASSWORD valkey-cli ping | grep -qx PONG"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$$STATE_STORE_TEST_PASSWORD redis-cli ping | grep -qx PONG"]
       interval: 1s
       timeout: 1s
       retries: 10

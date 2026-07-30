@@ -56,3 +56,66 @@ jobs:
 
       - name: Run tests
         run: mix test
+
+      - name: Run blocking Valkey state-store evidence
+        run: mix test --include integration test/jasmin_ex/state_store/integration_test.exs
+
+  state-store-redis-8-0-3:
+    name: state-store-redis-8-0-3
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      STATE_STORE_TEST_IMAGE: redis:8.0.3-bookworm@sha256:be0a135f1955140436b9114da96dd22fbedb874469400b6ef458cc0d42155de0
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up BEAM
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.20.2"
+          otp-version: "29"
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Run Redis compatibility evidence
+        run: mix test --include integration test/jasmin_ex/state_store/integration_test.exs 2>&1 | tee state-store-compatibility-redis-8-0-3.txt
+
+      - name: Upload Redis compatibility result
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-store-compatibility-redis-8-0-3
+          path: state-store-compatibility-redis-8-0-3.txt
+          if-no-files-found: error
+
+  state-store-dragonfly-v1-30-3:
+    name: state-store-dragonfly-v1-30-3
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      STATE_STORE_TEST_IMAGE: docker.dragonflydb.io/dragonflydb/dragonfly:v1.30.3@sha256:29d44a25a9e6937672f1c12e28c9f481f3d3c0441001ee56ed274a72f50593b7
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up BEAM
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.20.2"
+          otp-version: "29"
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Run Dragonfly compatibility evidence
+        run: mix test --include integration test/jasmin_ex/state_store/integration_test.exs 2>&1 | tee state-store-compatibility-dragonfly-v1-30-3.txt
+
+      - name: Upload Dragonfly compatibility result
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-store-compatibility-dragonfly-v1-30-3
+          path: state-store-compatibility-dragonfly-v1-30-3.txt
+          if-no-files-found: error
