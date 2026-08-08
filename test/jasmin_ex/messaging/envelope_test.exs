@@ -5,9 +5,9 @@ defmodule JasminEx.Messaging.EnvelopeTest do
   test "rejects unsupported versions without creating atoms from JSON values" do
     atom_name = "untrusted_connector_#{System.unique_integer([:positive])}"
     payload = ~s({"version":2,"connector_id":"#{atom_name}"})
-    atom_count = :erlang.system_info(:atom_count)
+    assert_raise ArgumentError, fn -> String.to_existing_atom(atom_name) end
     assert Envelope.decode(payload) == {:error, :unsupported_version}
-    assert :erlang.system_info(:atom_count) == atom_count
+    assert_raise ArgumentError, fn -> String.to_existing_atom(atom_name) end
   end
 
   test "rejects unknown version one keys without creating atoms" do

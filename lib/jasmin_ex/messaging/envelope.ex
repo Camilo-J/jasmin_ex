@@ -1,4 +1,6 @@
 defmodule JasminEx.Messaging.Envelope do
+  @moduledoc "Represents and serializes a queued messaging request."
+
   @version 1
   @fields [
     :gateway_id,

@@ -1,4 +1,6 @@
 defmodule JasminEx.Messaging.StateStoreJournal do
+  @moduledoc "Persists settlement journal records in a state store."
+
   alias JasminEx.Messaging.SettlementJournal.Record
   alias JasminEx.StateStore
 
@@ -14,9 +16,8 @@ defmodule JasminEx.Messaging.StateStoreJournal do
   end
 
   def read(store, gateway_id, attempt) do
-    with {:ok, payload} <- StateStore.fetch(store, key(gateway_id, attempt)),
-         {:ok, record} <- decode(payload) do
-      {:ok, record}
+    with {:ok, payload} <- StateStore.fetch(store, key(gateway_id, attempt)) do
+      decode(payload)
     end
   end
 

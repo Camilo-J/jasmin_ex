@@ -1,5 +1,9 @@
 defmodule JasminEx.Messaging.WorkQueue do
+  @moduledoc "Defines the interface for queueing and settling message deliveries."
+
   defmodule Delivery do
+    @moduledoc false
+
     @enforce_keys [:envelope, :reference]
     defstruct [:envelope, :reference]
   end

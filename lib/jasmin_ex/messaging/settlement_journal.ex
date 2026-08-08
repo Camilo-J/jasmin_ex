@@ -1,5 +1,9 @@
 defmodule JasminEx.Messaging.SettlementJournal do
+  @moduledoc "Tracks delivery settlement outcomes and redelivery decisions."
+
   defmodule Record do
+    @moduledoc false
+
     @enforce_keys [:gateway_id, :attempt, :state]
     defstruct [:gateway_id, :attempt, :state, evidence: %{}]
   end
