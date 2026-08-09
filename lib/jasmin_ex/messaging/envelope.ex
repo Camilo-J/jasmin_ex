@@ -15,7 +15,8 @@ defmodule JasminEx.Messaging.Envelope do
   defstruct @fields
 
   def new(attributes) when is_map(attributes) do
-    with {:ok, submit_sm} <- validate_submit_sm(Map.get(attributes, :submit_sm)),
+    with :ok <- reject_unknown_keys(attributes),
+         {:ok, submit_sm} <- validate_submit_sm(Map.get(attributes, :submit_sm)),
          true <- valid_attributes?(attributes) do
       {:ok, struct!(__MODULE__, Map.put(attributes, :submit_sm, submit_sm))}
     else
@@ -61,6 +62,10 @@ defmodule JasminEx.Messaging.Envelope do
   defp validate_version(%{"version" => @version}), do: :ok
   defp validate_version(%{"version" => _version}), do: {:error, :unsupported_version}
   defp validate_version(_attributes), do: {:error, :invalid_envelope}
+
+  defp reject_unknown_keys(attributes) do
+    if Map.keys(attributes) -- @fields == [], do: :ok, else: :error
+  end
 
   defp valid_attributes?(attributes) do
     Enum.all?(
