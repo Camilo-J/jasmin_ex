@@ -63,4 +63,33 @@ defmodule JasminEx.Messaging.EnvelopeTest do
              }
            }) == {:error, :invalid_envelope}
   end
+
+  test "rejects caller maps with unknown keys without raising" do
+    attributes = %{
+      gateway_id: "gateway-1",
+      connector_id: "connector-a",
+      attempt: 1,
+      max_attempts: 3,
+      enqueued_at: "2026-08-01T15:00:00Z",
+      expires_at: "2026-08-02T15:00:00Z",
+      submit_sm: %{
+        source_addr: "+12025550100",
+        destination_addr: "+12025550101",
+        short_message: "hello"
+      },
+      unexpected: "drop-me"
+    }
+
+    assert Envelope.new(attributes) == {:error, :invalid_envelope}
+  end
+
+  test "decode still projects only supported fields from JSON with extra keys" do
+    payload =
+      ~s({"version":1,"gateway_id":"gateway-1","connector_id":"connector-a","attempt":1,"max_attempts":3,"enqueued_at":"2026-08-01T15:00:00Z","expires_at":"2026-08-02T15:00:00Z","submit_sm":{"source_addr":"+12025550100","destination_addr":"+12025550101","short_message":"hello"},"extra":"ignored"})
+
+    assert {:ok, envelope} = Envelope.decode(payload)
+    assert envelope.gateway_id == "gateway-1"
+    assert envelope.connector_id == "connector-a"
+    refute Map.has_key?(Map.from_struct(envelope), :extra)
+  end
 end
