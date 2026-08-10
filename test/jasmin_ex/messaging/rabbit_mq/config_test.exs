@@ -76,6 +76,72 @@ defmodule JasminEx.Messaging.RabbitMQ.ConfigTest do
     assert config.ssl_options[:cacertfile] == ~c"/etc/ssl/certs/ca.pem"
   end
 
+  test "defaults the discrete host port from TLS while preserving explicit ports" do
+    base_opts = [host: "mq.internal", username: "svc", password: "token"]
+
+    assert Config.new!(base_opts).port == 5672
+    assert Config.new!(Keyword.put(base_opts, :tls, true)).port == 5671
+
+    assert Config.new!(Keyword.merge(base_opts, tls: true, port: 5673)).port == 5673
+  end
+
+  test "derives the virtual host from a percent-encoded endpoint path" do
+    config =
+      Config.new!(
+        endpoint: "amqp://broker.example/%2Fjasmin%2Fproduction",
+        username: "app",
+        password: "secret"
+      )
+
+    assert config.virtual_host == "/jasmin/production"
+  end
+
+  test "accepts a matching explicit virtual host for an endpoint path" do
+    config =
+      Config.new!(
+        endpoint: "amqp://broker.example/jasmin",
+        username: "app",
+        password: "secret",
+        virtual_host: "jasmin"
+      )
+
+    assert config.virtual_host == "jasmin"
+  end
+
+  test "preserves the default virtual host for root and absent endpoint paths" do
+    base_opts = [username: "app", password: "secret"]
+
+    assert Config.new!(Keyword.put(base_opts, :endpoint, "amqp://broker.example")).virtual_host ==
+             "/"
+
+    assert Config.new!(Keyword.put(base_opts, :endpoint, "amqp://broker.example/")).virtual_host ==
+             "/"
+  end
+
+  test "rejects a conflicting endpoint path and explicit virtual host" do
+    assert_raise ArgumentError, ~r/virtual_host conflicts with endpoint path/, fn ->
+      Config.new!(
+        endpoint: "amqp://broker.example/jasmin",
+        username: "app",
+        password: "secret",
+        virtual_host: "other"
+      )
+    end
+  end
+
+  test "rejects invalid endpoint path encoding without disclosing credentials" do
+    error =
+      assert_raise ArgumentError, ~r/endpoint path has invalid percent-encoding/, fn ->
+        Config.new!(
+          endpoint: "amqp://broker.example/%invalid",
+          username: "app",
+          password: "super-secret"
+        )
+      end
+
+    refute Exception.message(error) =~ "super-secret"
+  end
+
   test "rejects invalid endpoint scheme without disclosing credentials" do
     error =
       assert_raise ArgumentError, ~r/endpoint scheme is invalid/, fn ->

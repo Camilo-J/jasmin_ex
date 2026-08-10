@@ -50,12 +50,13 @@ defmodule JasminEx.Messaging.RabbitMQ.Config do
 
   @spec new!(keyword()) :: t()
   def new!(opts) when is_list(opts) do
-    {host, port, tls_from_endpoint} = endpoint(opts)
+    {host, endpoint_port, tls_from_endpoint, endpoint_path} = endpoint(opts)
     tls = tls(opts, tls_from_endpoint)
+    port = endpoint_port || port!(Keyword.get(opts, :port, default_port(tls)))
     ssl_options = ssl_options(opts, tls)
     username = required_string!(opts, :username)
     password = required_string!(opts, :password)
-    virtual_host = string_or_default!(opts, :virtual_host, @default_virtual_host)
+    virtual_host = virtual_host!(opts, endpoint_path)
     queue_prefix = queue_prefix!(opts)
 
     %__MODULE__{
@@ -93,8 +94,7 @@ defmodule JasminEx.Messaging.RabbitMQ.Config do
     case Keyword.get(opts, :endpoint) do
       nil ->
         host = required_host!(Keyword.get(opts, :host))
-        port = port!(Keyword.get(opts, :port, 5672))
-        {host, port, false}
+        {host, nil, false, nil}
 
       endpoint when is_binary(endpoint) ->
         parse_endpoint!(endpoint, opts)
@@ -117,8 +117,11 @@ defmodule JasminEx.Messaging.RabbitMQ.Config do
     host = required_host!(uri.host)
     default_port = if scheme == "amqps", do: 5671, else: 5672
     port = port!(uri.port || Keyword.get(opts, :port, default_port))
-    {host, port, scheme == "amqps"}
+    {host, port, scheme == "amqps", uri.path}
   end
+
+  defp default_port(true), do: 5671
+  defp default_port(false), do: 5672
 
   defp required_host!(host) when is_binary(host) and host != "", do: host
   defp required_host!(_host), do: raise(ArgumentError, "endpoint host is required")
@@ -175,6 +178,28 @@ defmodule JasminEx.Messaging.RabbitMQ.Config do
       value when is_binary(value) and value != "" -> value
       _ -> raise ArgumentError, "#{key} is required"
     end
+  end
+
+  defp virtual_host!(opts, endpoint_path) do
+    endpoint_virtual_host = decode_virtual_host!(endpoint_path)
+    configured_virtual_host = Keyword.get(opts, :virtual_host)
+
+    if endpoint_virtual_host && configured_virtual_host &&
+         endpoint_virtual_host != configured_virtual_host do
+      raise ArgumentError, "virtual_host conflicts with endpoint path"
+    end
+
+    string_or_default!(opts, :virtual_host, endpoint_virtual_host || @default_virtual_host)
+  end
+
+  defp decode_virtual_host!(path) when path in [nil, "", "/"], do: nil
+
+  defp decode_virtual_host!("/" <> encoded_virtual_host) do
+    if Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, encoded_virtual_host) do
+      raise ArgumentError, "endpoint path has invalid percent-encoding"
+    end
+
+    URI.decode(encoded_virtual_host)
   end
 
   defp string_or_default!(opts, key, default) do
