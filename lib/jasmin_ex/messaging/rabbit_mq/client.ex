@@ -1,0 +1,31 @@
+defmodule JasminEx.Messaging.RabbitMQ.Client do
+  @moduledoc false
+
+  def open_connection(opts) when is_list(opts) do
+    case AMQP.Connection.open(opts) do
+      {:ok, conn} -> {:ok, %{pid: conn.pid, conn: conn}}
+      error -> error
+    end
+  end
+
+  def close_connection(%{conn: conn}), do: AMQP.Connection.close(conn)
+  def connection_pid(%{pid: pid}), do: pid
+
+  def open_channel(%{conn: conn}) do
+    case AMQP.Channel.open(conn) do
+      {:ok, ch} -> {:ok, %{pid: ch.pid, channel: ch}}
+      error -> error
+    end
+  end
+
+  def close_channel(%{channel: ch}), do: AMQP.Channel.close(ch)
+  def select_confirms(%{channel: ch}), do: AMQP.Confirm.select(ch)
+
+  def declare_queue(%{channel: ch}, name, opts), do: AMQP.Queue.declare(ch, name, opts)
+
+  def publish(%{channel: ch}, exchange, key, payload, opts),
+    do: AMQP.Basic.publish(ch, exchange, key, payload, opts)
+
+  def wait_for_confirms(%{channel: ch}, ms) when is_integer(ms) and ms > 0,
+    do: AMQP.Confirm.wait_for_confirms(ch, {ms, :millisecond})
+end
