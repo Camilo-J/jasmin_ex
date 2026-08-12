@@ -5,6 +5,8 @@ defmodule JasminEx.Application do
 
   use Application
 
+  alias JasminEx.Messaging.RabbitMQ.Config, as: MessagingConfig
+  alias JasminEx.Messaging.RabbitMQ.Supervisor, as: MessagingSupervisor
   alias JasminEx.Smpp.ConnectorSupervisor
   alias JasminEx.StateStore.Config
 
@@ -12,7 +14,9 @@ defmodule JasminEx.Application do
 
   @spec children(keyword()) :: list()
   def children(config) do
-    [state_store_child(Keyword.get(config, :state_store, [])) | smpp_children(config)]
+    [state_store_child(Keyword.get(config, :state_store, []))] ++
+      messaging_children(Keyword.get(config, :messaging, [])) ++
+      smpp_children(config)
   end
 
   @impl true
@@ -20,6 +24,7 @@ defmodule JasminEx.Application do
     children =
       children(
         state_store: Application.get_env(:jasmin_ex, :state_store, []),
+        messaging: Application.get_env(:jasmin_ex, :messaging, []),
         smpp_connectors: Application.get_env(:jasmin_ex, :smpp_connectors, [])
       )
 
@@ -54,6 +59,15 @@ defmodule JasminEx.Application do
       health_check_interval: config.health_check_timeout_ms,
       ssl: config.tls
     ]
+  end
+
+  defp messaging_children(options) when is_list(options) do
+    if Keyword.get(options, :enabled, false) do
+      config = MessagingConfig.new!(options)
+      [{MessagingSupervisor, [config: config]}]
+    else
+      []
+    end
   end
 
   defp smpp_children(config) do
