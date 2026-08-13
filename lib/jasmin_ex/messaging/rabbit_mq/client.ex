@@ -28,4 +28,11 @@ defmodule JasminEx.Messaging.RabbitMQ.Client do
 
   def wait_for_confirms(%{channel: ch}, ms) when is_integer(ms) and ms > 0,
     do: AMQP.Confirm.wait_for_confirms(ch, {ms, :millisecond})
+
+  def qos(%{channel: ch}, opts), do: AMQP.Basic.qos(ch, opts)
+
+  def consume(%{channel: ch}, queue, consumer, opts),
+    do: AMQP.Basic.consume(ch, queue, consumer, opts)
+
+  def cancel(%{channel: ch}, consumer_tag), do: AMQP.Basic.cancel(ch, consumer_tag)
 end
