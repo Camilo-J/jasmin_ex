@@ -11,6 +11,10 @@ defmodule JasminEx.Smpp.Client do
       response lifecycle. Acceptance by the SMSC does not mean handset delivery.
     * `unbind/1` closes the session deliberately after an SMPP unbind exchange.
 
+  Optional `lifecycle_notify` is a pid that receives ordered session hooks
+  after a successful bind and after a later bind loss. Failed startup and
+  voluntary unbind do not emit these messages.
+
   ## Lifecycle states
 
   The session progresses through `:disconnected`, `:connecting`,
@@ -50,6 +54,12 @@ defmodule JasminEx.Smpp.Client do
   `:heartbeat_send_failed`, `:heartbeat_timeout`, `:tcp_closed`, `:tcp_error`,
   and `:submit_send_failed`; raw socket and exception terms are never included.
   Initial state and voluntary unbind emit neither disconnect nor retry events.
+
+  When `lifecycle_notify` is a pid, a successful bind sends
+  `{:smpp_bound, connector_id, kind}` with `kind` `:initial` or `:reconnect`.
+  Involuntary loss of a bound session first replies to any in-flight submit,
+  then sends `{:smpp_bind_lost, connector_id, reason}` before reconnect
+  scheduling.
   """
 
   require Logger
@@ -448,6 +458,7 @@ defmodule JasminEx.Smpp.Client do
   defp settle_inbound(:bind_pending, %{target_state: :bound} = data) do
     kind = if data.ever_bound, do: :reconnect, else: :initial
     emit_lifecycle(:bound, data, %{kind: kind})
+    notify_lifecycle(data, {:smpp_bound, data.config.connector_id, kind})
     data = %{data | target_state: nil, backoff_attempt: 0, ever_bound: true}
 
     {cancellations, data} = drain_cancellations(data)
@@ -609,6 +620,10 @@ defmodule JasminEx.Smpp.Client do
   end
 
   defp arm_reconnect(data, state, reason) do
+    if state == :bound do
+      notify_lifecycle(data, {:smpp_bind_lost, data.config.connector_id, reason})
+    end
+
     attempt = data.backoff_attempt + 1
     delay = backoff_delay(data)
     emit_lifecycle(:disconnected, data, %{state: state, reason: reason})
@@ -674,6 +689,11 @@ defmodule JasminEx.Smpp.Client do
   end
 
   defp log_tcp_error(reason), do: Logger.warning("SMPP TCP error: #{inspect(reason)}")
+
+  defp notify_lifecycle(%{config: %{lifecycle_notify: pid}}, message) when is_pid(pid),
+    do: send(pid, message)
+
+  defp notify_lifecycle(_data, _message), do: :ok
 
   defp emit_lifecycle(event, data, metadata),
     do:
