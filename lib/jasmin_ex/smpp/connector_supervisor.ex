@@ -9,6 +9,7 @@ defmodule JasminEx.Smpp.ConnectorSupervisor do
 
   use Supervisor
 
+  alias JasminEx.Smpp.Client.Config
   alias JasminEx.Smpp.ConnectorSupervisor.Instance
 
   @invalid_connectors_message "invalid SMPP connector configuration: expected [], one non-empty keyword connector configuration, or a list of non-empty keyword connector configurations"
@@ -21,10 +22,9 @@ defmodule JasminEx.Smpp.ConnectorSupervisor do
     children =
       connectors
       |> normalize_connectors()
-      |> Enum.with_index()
-      |> Enum.map(fn {opts, index} ->
+      |> Enum.map(fn opts ->
         %{
-          id: {:smpp_connector, index},
+          id: {:smpp_connector, Config.new!(opts).connector_id},
           start: {Instance, :start_link, [opts]},
           restart: :transient,
           type: :supervisor,

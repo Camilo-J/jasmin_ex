@@ -25,17 +25,19 @@ defmodule JasminEx.Smpp.Client do
   emits these events:
 
     * `[:jasmin_ex, :smpp, :bound]` has measurements `%{}` and metadata
-      `%{client: pid, bind_as: atom, kind: :initial | :reconnect}`. Bound means
-      the SMSC session reached `:bound`; it does not mean a message was
-      delivered. Failed startup attempts do not change `kind` from `:initial`.
+      `%{client: pid, bind_as: atom, connector_id: String.t(), kind: :initial |
+      :reconnect}`. Bound means the SMSC session reached `:bound`; it does not
+      mean a message was delivered. Failed startup attempts do not change `kind`
+      from `:initial`.
     * `[:jasmin_ex, :smpp, :disconnected]` has measurements `%{}` and metadata
-      `%{client: pid, bind_as: atom, state: atom, reason: atom}`. `state` is the
-      involuntarily exited lifecycle state and `reason` is a bounded category.
+      `%{client: pid, bind_as: atom, connector_id: String.t(), state: atom,
+      reason: atom}`. `state` is the involuntarily exited lifecycle state and
+      `reason` is a bounded category.
     * `[:jasmin_ex, :smpp, :reconnect_scheduled]` has measurements
       `%{delay_ms: non_neg_integer}` and metadata
-      `%{client: pid, bind_as: atom, attempt: pos_integer, reason: atom}`. It is
-      emitted when the retry timer is scheduled; a successful bind resets the
-      next attempt to 1.
+      `%{client: pid, bind_as: atom, connector_id: String.t(), attempt: pos_integer,
+      reason: atom}`. It is emitted when the retry timer is scheduled; a
+      successful bind resets the next attempt to 1.
     * `[:jasmin_ex, :smpp, :deliver_sm, :failed]` has measurements `%{}` and
       metadata
       `%{client: pid, handler: module | nil, reason: :handler_not_configured |
@@ -682,7 +684,11 @@ defmodule JasminEx.Smpp.Client do
       )
 
   defp lifecycle_metadata(data, metadata),
-    do: Map.merge(%{client: self(), bind_as: data.config.bind_as}, metadata)
+    do:
+      Map.merge(
+        %{client: self(), bind_as: data.config.bind_as, connector_id: data.config.connector_id},
+        metadata
+      )
 
   defp enquire_link_resp(seq),
     do:

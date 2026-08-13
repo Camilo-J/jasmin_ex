@@ -29,6 +29,7 @@ defmodule JasminEx.Smpp.ClientPR3Test do
   # silently discard every per-test override.
   defp start_client(port, opts \\ []) do
     defaults = [
+      connector_id: "connector-a",
       host: ~c"localhost",
       port: port,
       system_id: "user",

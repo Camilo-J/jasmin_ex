@@ -7,6 +7,7 @@ defmodule JasminEx.Smpp.Client.Config do
   @default_response_timeout_ms 5_000
 
   @enforce_keys [
+    :connector_id,
     :host,
     :port,
     :system_id,
@@ -22,6 +23,7 @@ defmodule JasminEx.Smpp.Client.Config do
   defstruct @enforce_keys
 
   @type t :: %__MODULE__{
+          connector_id: String.t(),
           host: term(),
           port: term(),
           system_id: term(),
@@ -45,6 +47,7 @@ defmodule JasminEx.Smpp.Client.Config do
       |> validate_unbind_drain_timeout!()
 
     %__MODULE__{
+      connector_id: connector_id!(opts),
       host: Keyword.fetch!(opts, :host),
       port: Keyword.fetch!(opts, :port),
       system_id: Keyword.fetch!(opts, :system_id),
@@ -57,6 +60,17 @@ defmodule JasminEx.Smpp.Client.Config do
       reconnect: ReconnectPolicy.new(opts),
       deliver_handler: normalize_deliver_handler(Keyword.get(opts, :deliver_handler))
     }
+  end
+
+  defp connector_id!(opts) do
+    case Keyword.fetch!(opts, :connector_id) do
+      connector_id when is_binary(connector_id) and connector_id != "" ->
+        connector_id
+
+      connector_id ->
+        raise ArgumentError,
+              ":connector_id must be a non-empty binary, got: #{inspect(connector_id)}"
+    end
   end
 
   defp validate_unbind_drain_timeout!(timeout) when is_integer(timeout) and timeout >= 0,
