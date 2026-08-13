@@ -32,8 +32,16 @@ defmodule JasminEx.Smpp.Client.ConfigTest do
                cap_ms: 30_000,
                jitter: true
              },
-             deliver_handler: {nil, nil}
+             deliver_handler: {nil, nil},
+             lifecycle_notify: nil
            } = Config.new!(@required_opts)
+  end
+
+  test "accepts an optional lifecycle_notify pid" do
+    listener = self()
+
+    assert %Config{lifecycle_notify: ^listener} =
+             Config.new!(Keyword.put(@required_opts, :lifecycle_notify, listener))
   end
 
   test "normalizes explicit values and deliver handler context" do
@@ -79,7 +87,9 @@ defmodule JasminEx.Smpp.Client.ConfigTest do
         reconnect_base_ms: 30,
         reconnect_base_ms: 40,
         deliver_handler: {__MODULE__, :first},
-        deliver_handler: {__MODULE__, :second}
+        deliver_handler: {__MODULE__, :second},
+        lifecycle_notify: self(),
+        lifecycle_notify: spawn(fn -> :ok end)
       ] ++ Keyword.delete(@required_opts, :host)
 
     config = Config.new!(opts)
@@ -91,6 +101,7 @@ defmodule JasminEx.Smpp.Client.ConfigTest do
     assert config.unbind_drain_timeout_ms == 15
     assert config.reconnect.base_ms == 30
     assert config.deliver_handler == {__MODULE__, :first}
+    assert config.lifecycle_notify == self()
   end
 
   test "raises for every missing required key" do
@@ -128,6 +139,18 @@ defmodule JasminEx.Smpp.Client.ConfigTest do
     assert_raise ArgumentError,
                  ":unbind_drain_timeout_ms must be a non-negative integer, got: -1",
                  fn -> Config.new!(unbind_drain_timeout_ms: -1) end
+  end
+
+  test "rejects a non-pid lifecycle_notify" do
+    message = fn value ->
+      ":lifecycle_notify must be a pid or nil, got: #{inspect(value)}"
+    end
+
+    for value <- ["listener", :self, 1] do
+      assert_raise ArgumentError, message.(value), fn ->
+        Config.new!(Keyword.put(@required_opts, :lifecycle_notify, value))
+      end
+    end
   end
 
   test "preserves malformed deliver handler failure behavior" do

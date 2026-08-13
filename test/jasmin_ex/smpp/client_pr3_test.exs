@@ -1011,6 +1011,183 @@ defmodule JasminEx.Smpp.ClientPR3Test do
     end
   end
 
+  describe "lifecycle notify hook" do
+    test "does not notify before a successful bind" do
+      {port, smsc} = start_smsc()
+      :ok = FakeSMSC.withhold_response(smsc, :bind_transmitter)
+      {:ok, client} = start_client(port, lifecycle_notify: self(), response_timeout_ms: 500)
+      assert :ok = await_bind_pending(client, smsc)
+
+      refute_receive {:smpp_bound, _, _}, 30
+      refute_receive {:smpp_bind_lost, _, _}, 30
+
+      stop(client)
+      stop(smsc)
+    end
+
+    test "notifies {:smpp_bound, connector_id, :initial} after successful bind" do
+      {port, smsc} = start_smsc()
+      {:ok, client} = start_client(port, connector_id: "alpha", lifecycle_notify: self())
+      assert :ok = await_bound(client)
+
+      assert_receive {:smpp_bound, "alpha", :initial}, 500
+      refute_receive {:smpp_bound, _, _}, 30
+      refute_receive {:smpp_bind_lost, _, _}, 30
+
+      stop(client)
+      stop(smsc)
+    end
+
+    test "notifies bind loss after the in-flight submit returns and before reconnect scheduling" do
+      {port, smsc} = start_smsc()
+      attach_telemetry(@lifecycle_events)
+
+      {:ok, client} =
+        start_client(port,
+          connector_id: "alpha",
+          lifecycle_notify: self(),
+          reconnect_base_ms: 30,
+          reconnect_cap_ms: 30
+        )
+
+      assert :ok = await_bound(client)
+      assert_receive {:smpp_bound, "alpha", :initial}, 500
+
+      :ok = FakeSMSC.close_on_command(smsc, :submit_sm)
+      assert {:unknown, :disconnected} = Client.send_submit_sm(client, submit_sm("drop"))
+
+      events = drain_lifecycle_notify_events()
+      lost_index = Enum.find_index(events, &match?({:smpp_bind_lost, "alpha", :tcp_closed}, &1))
+
+      scheduled_index =
+        Enum.find_index(events, fn
+          {:telemetry, [:jasmin_ex, :smpp, :reconnect_scheduled], _, _} -> true
+          _other -> false
+        end)
+
+      assert lost_index != nil
+      assert scheduled_index != nil
+      assert lost_index < scheduled_index
+
+      stop(client)
+      stop(smsc)
+    end
+
+    test "reconnect notifies bound again without duplicate spurious events" do
+      {port, smsc} = start_smsc()
+
+      {:ok, client} =
+        start_client(port,
+          connector_id: "alpha",
+          lifecycle_notify: self(),
+          reconnect_base_ms: 5,
+          reconnect_cap_ms: 5
+        )
+
+      assert :ok = await_bound(client)
+      assert_receive {:smpp_bound, "alpha", :initial}, 500
+
+      :ok = FakeSMSC.close_on_command(smsc, :submit_sm)
+      assert {:unknown, :disconnected} = Client.send_submit_sm(client, submit_sm("drop"))
+      assert_receive {:smpp_bind_lost, "alpha", :tcp_closed}, 500
+
+      assert :ok = await_bound(client)
+      assert_receive {:smpp_bound, "alpha", :reconnect}, 500
+      refute_receive {:smpp_bound, _, _}, 30
+      refute_receive {:smpp_bind_lost, _, _}, 30
+
+      stop(client)
+      stop(smsc)
+    end
+
+    test "does not notify sibling connectors" do
+      {port_a, smsc_a} = start_smsc()
+      {port_b, smsc_b} = start_smsc()
+
+      {:ok, client_a} =
+        start_client(port_a, connector_id: "alpha", lifecycle_notify: self())
+
+      {:ok, client_b} =
+        start_client(port_b, connector_id: "beta", lifecycle_notify: self())
+
+      assert :ok = await_bound(client_a)
+      assert :ok = await_bound(client_b)
+      assert_receive {:smpp_bound, "alpha", :initial}, 500
+      assert_receive {:smpp_bound, "beta", :initial}, 500
+
+      :ok = FakeSMSC.close_on_command(smsc_a, :submit_sm)
+      assert {:unknown, :disconnected} = Client.send_submit_sm(client_a, submit_sm("drop"))
+
+      assert_receive {:smpp_bind_lost, "alpha", :tcp_closed}, 500
+      refute_receive {:smpp_bind_lost, "beta", _}, 50
+      assert Client.status(client_b) == :bound
+
+      stop(client_a)
+      stop(client_b)
+      stop(smsc_a)
+      stop(smsc_b)
+    end
+
+    test "bind rejection does not notify bind_lost" do
+      {port, smsc} = start_smsc(script: %{bind_transmitter: {:reply_status, :ESME_RSYSERR}})
+
+      {:ok, client} =
+        start_client(port,
+          lifecycle_notify: self(),
+          reconnect_base_ms: 50,
+          reconnect_cap_ms: 50
+        )
+
+      refute_receive {:smpp_bound, _, _}, 40
+      refute_receive {:smpp_bind_lost, _, _}, 40
+
+      stop(client)
+      stop(smsc)
+    end
+
+    test "voluntary unbind does not notify bind_lost" do
+      {port, smsc} = start_smsc()
+      {:ok, client} = start_client(port, lifecycle_notify: self())
+      assert :ok = await_bound(client)
+      assert_receive {:smpp_bound, "connector-a", :initial}, 500
+
+      monitor = Process.monitor(client)
+      assert :ok = Client.unbind(client)
+      assert_receive {:DOWN, ^monitor, :process, ^client, :normal}, 500
+      refute_receive {:smpp_bind_lost, _, _}, 50
+
+      stop(smsc)
+    end
+
+    test "omitted lifecycle_notify does not send bind messages to the starter" do
+      {port, smsc} = start_smsc()
+      {:ok, client} = start_client(port)
+      assert :ok = await_bound(client)
+
+      refute_receive {:smpp_bound, _, _}, 30
+      refute_receive {:smpp_bind_lost, _, _}, 30
+
+      stop(client)
+      stop(smsc)
+    end
+  end
+
+  defp drain_lifecycle_notify_events(acc \\ []) do
+    receive do
+      {:smpp_bound, _, _} = message ->
+        drain_lifecycle_notify_events([message | acc])
+
+      {:smpp_bind_lost, _, _} = message ->
+        drain_lifecycle_notify_events([message | acc])
+
+      {:telemetry, event, _measurements, _metadata} = message
+      when event in @lifecycle_events ->
+        drain_lifecycle_notify_events([message | acc])
+    after
+      50 -> Enum.reverse(acc)
+    end
+  end
+
   defp pending_count(client) do
     {_state, data} = :sys.get_state(client)
     map_size(data.request_window.pending)
