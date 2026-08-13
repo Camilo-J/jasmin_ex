@@ -25,15 +25,36 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
     assert {:ok, {_flags, []}} = ConnectorSupervisor.init([])
 
     assert {:ok, {_flags, [single]}} = ConnectorSupervisor.init(first)
-    assert single.id == {:smpp_connector, 0}
+    assert single.id == {:smpp_connector, first[:connector_id]}
     assert single.start == {Instance, :start_link, [first]}
     assert single.restart == :transient
 
     assert {:ok, {_flags, [first_child, second_child]}} =
              ConnectorSupervisor.init([first, second])
 
+    assert first_child.id == {:smpp_connector, first[:connector_id]}
+    assert second_child.id == {:smpp_connector, second[:connector_id]}
+    refute first_child.id == second_child.id
     assert first_child.start == {Instance, :start_link, [first]}
     assert second_child.start == {Instance, :start_link, [second]}
+  end
+
+  test "rejects a missing, blank, or non-binary connector_id" do
+    valid = connector_config(1111)
+
+    assert_raise KeyError, ~r/key :connector_id not found/, fn ->
+      ConnectorSupervisor.init(Keyword.delete(valid, :connector_id))
+    end
+
+    message = fn value ->
+      ":connector_id must be a non-empty binary, got: #{inspect(value)}"
+    end
+
+    for value <- ["", :alpha] do
+      assert_raise ArgumentError, message.(value), fn ->
+        ConnectorSupervisor.init(Keyword.put(valid, :connector_id, value))
+      end
+    end
   end
 
   test "rejects invalid top-level and malformed list shapes" do
@@ -50,7 +71,7 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
     {:ok, port, smsc} = FakeSMSC.start_link()
     {:ok, supervisor} = ConnectorSupervisor.start_link(connector_config(port))
 
-    connector = child_pid(supervisor, {:smpp_connector, 0})
+    connector = child_pid(supervisor, {:smpp_connector, "connector-#{port}"})
     first_client = child_pid(connector, :smpp_client)
     assert :ok = wait_until(fn -> Client.status(first_client) == :bound end)
 
@@ -80,7 +101,7 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
     {:ok, supervisor} =
       ConnectorSupervisor.start_link(connector_config(port))
 
-    connector = child_pid(supervisor, {:smpp_connector, 0})
+    connector = child_pid(supervisor, {:smpp_connector, "connector-#{port}"})
     client = child_pid(connector, :smpp_client)
     assert :ok = wait_until(fn -> Client.status(client) == :bound end)
     monitor = Process.monitor(client)
@@ -108,8 +129,8 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
         connector_config(healthy_port)
       ])
 
-    crashing_connector = child_pid(supervisor, {:smpp_connector, 0})
-    healthy_connector = child_pid(supervisor, {:smpp_connector, 1})
+    crashing_connector = child_pid(supervisor, {:smpp_connector, "connector-#{crashing_port}"})
+    healthy_connector = child_pid(supervisor, {:smpp_connector, "connector-#{healthy_port}"})
     crashing_client = child_pid(crashing_connector, :smpp_client)
     healthy_client = child_pid(healthy_connector, :smpp_client)
 
@@ -147,7 +168,10 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
     assert_receive {:DOWN, ^connector_ref, :process, ^crashing_connector, :shutdown}, 500
 
     assert Process.alive?(supervisor)
-    assert healthy_connector == child_pid(supervisor, {:smpp_connector, 1})
+
+    assert healthy_connector ==
+             child_pid(supervisor, {:smpp_connector, "connector-#{healthy_port}"})
+
     assert healthy_client == child_pid(healthy_connector, :smpp_client)
     assert Client.status(healthy_client) == :bound
 
@@ -163,6 +187,46 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
     send(test_pid, {:connector_bound, metadata.client})
   end
 
+  def handle_lifecycle(_event, _measurements, metadata, test_pid) do
+    send(test_pid, {:lifecycle, metadata})
+  end
+
+  test "bound and disconnected telemetry include the stable connector_id" do
+    {:ok, port, smsc} = FakeSMSC.start_link()
+    connector_id = "connector-#{port}"
+    handler_id = {__MODULE__, make_ref()}
+
+    :ok =
+      :telemetry.attach_many(
+        handler_id,
+        [[:jasmin_ex, :smpp, :bound], [:jasmin_ex, :smpp, :disconnected]],
+        &__MODULE__.handle_lifecycle/4,
+        self()
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    {:ok, supervisor} = ConnectorSupervisor.start_link(connector_config(port))
+    connector = child_pid(supervisor, {:smpp_connector, connector_id})
+    client = child_pid(connector, :smpp_client)
+    assert :ok = wait_until(fn -> Client.status(client) == :bound end)
+
+    assert_receive {:lifecycle, %{client: ^client, connector_id: ^connector_id, kind: :initial}},
+                   500
+
+    GenServer.stop(smsc)
+
+    assert_receive {:lifecycle,
+                    %{
+                      client: ^client,
+                      connector_id: ^connector_id,
+                      state: :bound
+                    }},
+                   500
+
+    GenServer.stop(supervisor)
+  end
+
   test "application adds a connector supervisor only when connector config is present" do
     assert [%{id: JasminEx.StateStore.Connection}] = Application.children([])
 
@@ -172,6 +236,7 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
 
   defp connector_config(port) do
     [
+      connector_id: "connector-#{port}",
       host: ~c"localhost",
       port: port,
       system_id: "user",

@@ -21,6 +21,7 @@ defmodule JasminEx.Smpp.ClientTest do
 
   defp start_client(port, opts \\ []) do
     base = [
+      connector_id: "connector-a",
       host: ~c"localhost",
       port: port,
       system_id: "user",

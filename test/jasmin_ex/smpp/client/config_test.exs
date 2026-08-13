@@ -5,6 +5,7 @@ defmodule JasminEx.Smpp.Client.ConfigTest do
   alias JasminEx.Smpp.Client.ReconnectPolicy
 
   @required_opts [
+    connector_id: "connector-a",
     host: ~c"localhost",
     port: 2775,
     system_id: "system-id",
@@ -15,6 +16,7 @@ defmodule JasminEx.Smpp.Client.ConfigTest do
 
   test "normalizes the complete default configuration" do
     assert %Config{
+             connector_id: "connector-a",
              host: ~c"localhost",
              port: 2775,
              system_id: "system-id",
@@ -64,6 +66,8 @@ defmodule JasminEx.Smpp.Client.ConfigTest do
   test "retains first-keyword-wins option semantics" do
     opts =
       [
+        connector_id: "first",
+        connector_id: "second",
         host: ~c"first",
         host: ~c"second",
         heartbeat_ms: 5,
@@ -80,6 +84,7 @@ defmodule JasminEx.Smpp.Client.ConfigTest do
 
     config = Config.new!(opts)
 
+    assert config.connector_id == "first"
     assert config.host == ~c"first"
     assert config.heartbeat_ms == 5
     assert config.response_timeout_ms == 10
@@ -89,9 +94,21 @@ defmodule JasminEx.Smpp.Client.ConfigTest do
   end
 
   test "raises for every missing required key" do
-    for key <- [:host, :port, :system_id, :password, :system_type, :bind_as] do
+    for key <- [:connector_id, :host, :port, :system_id, :password, :system_type, :bind_as] do
       assert_raise KeyError, ~r/key #{inspect(key)} not found/, fn ->
         @required_opts |> Keyword.delete(key) |> Config.new!()
+      end
+    end
+  end
+
+  test "rejects a blank or non-binary connector_id" do
+    message = fn value ->
+      ":connector_id must be a non-empty binary, got: #{inspect(value)}"
+    end
+
+    for value <- ["", :alpha, 1] do
+      assert_raise ArgumentError, message.(value), fn ->
+        Config.new!(Keyword.put(@required_opts, :connector_id, value))
       end
     end
   end
