@@ -1,7 +1,22 @@
 defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
   use ExUnit.Case, async: true
 
+  alias JasminEx.Messaging.{Envelope, StateStoreJournal}
   alias JasminEx.Messaging.RabbitMQ.{Config, Connection, ConnectorWorker}
+
+  defmodule JournalStore do
+    def put(table, key, value, ttl_ms) do
+      true = :ets.insert(table, {key, value, ttl_ms})
+      :ok
+    end
+
+    def fetch(table, key) do
+      case :ets.lookup(table, key) do
+        [{^key, value, _ttl_ms}] -> {:ok, value}
+        [] -> :missing
+      end
+    end
+  end
 
   defmodule Fake do
     def start(fail_at \\ nil) do
@@ -81,16 +96,43 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     def deliver(agent, payload) do
       Agent.get_and_update(agent, fn state ->
         unacked = Map.get(state, :unacked, 0)
+        next_tag = Map.get(state, :next_tag, 1)
 
         case {(state.prefetch || 0) > 0 and unacked < state.prefetch, Map.values(state.consumers)} do
           {true, [{pid, _} | _]} ->
-            send(pid, {:basic_deliver, payload, %{delivery_tag: unacked + 1}})
-            {:ok, Map.put(state, :unacked, unacked + 1)}
+            send(pid, {:basic_deliver, payload, %{delivery_tag: next_tag}})
+            {:ok, Map.merge(state, %{unacked: unacked + 1, next_tag: next_tag + 1})}
 
           _ ->
             {:rejected, state}
         end
       end)
+    end
+
+    def ack(%{agent: agent, channel_id: id}, tag) do
+      track(agent, {:ack, id, tag})
+
+      case Agent.get(agent, & &1.fail_at) do
+        :ack ->
+          {:error, :channel_closed}
+
+        _ ->
+          Agent.update(agent, &%{&1 | unacked: max(Map.get(&1, :unacked, 0) - 1, 0)})
+          :ok
+      end
+    end
+
+    def reject(%{agent: agent, channel_id: id}, tag, opts) do
+      track(agent, {:reject, id, tag, opts})
+
+      case Agent.get(agent, & &1.fail_at) do
+        :reject ->
+          {:error, :channel_closed}
+
+        _ ->
+          Agent.update(agent, &%{&1 | unacked: max(Map.get(&1, :unacked, 0) - 1, 0)})
+          :ok
+      end
     end
 
     defp next_id(agent),
@@ -188,6 +230,121 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     stop(worker, agent)
   end
 
+  test "leaves opaque bodies unsubmitted when a submit stub is injected", %{config: config} do
+    {store, _} = journal_store()
+    test = self()
+    submit = fn env -> send(test, {:submitted, env}) && {:ok, "nope"} end
+    {worker, agent} = start_bound(config, "alpha", store: store, submit: submit)
+    assert :ok = Fake.deliver(agent, "one")
+    assert {:basic_deliver, "one", %{delivery_tag: 1}} = ConnectorWorker.inflight(worker)
+    refute_received {:submitted, _}
+    assert StateStoreJournal.read(store, "gateway-1", 1) == :missing
+    events = Fake.events(agent)
+    refute Enum.any?(events, &match?({:ack, _, _}, &1))
+    refute Enum.any?(events, &match?({:reject, _, _, _}, &1))
+    stop(worker, agent)
+  end
+
+  test "journals a valid v1 envelope before submit and acks known success", %{config: config} do
+    {store, _} = journal_store()
+    test = self()
+
+    submit = fn env ->
+      send(
+        test,
+        {:submit_seen, env.gateway_id, StateStoreJournal.read(store, env.gateway_id, env.attempt)}
+      )
+
+      {:ok, "smsc-ok"}
+    end
+
+    {worker, agent} = start_bound(config, "alpha", store: store, submit: submit)
+    {_envelope, payload} = valid_payload(%{gateway_id: "gw-ok", attempt: 1})
+    assert :ok = Fake.deliver(agent, payload)
+    assert ConnectorWorker.inflight(worker) == nil
+
+    assert_received {:submit_seen, "gw-ok",
+                     {:ok, %{state: :dispatching, gateway_id: "gw-ok", attempt: 1}}}
+
+    assert {:ok, %{state: :dispatching}} = StateStoreJournal.read(store, "gw-ok", 1)
+    assert {:ack, 1, 1} in Fake.events(agent)
+    {_second, payload2} = valid_payload(%{gateway_id: "gw-ok-2", attempt: 1})
+    assert :ok = Fake.deliver(agent, payload2)
+    assert ConnectorWorker.inflight(worker) == nil
+    assert_received {:submit_seen, "gw-ok-2", {:ok, %{state: :dispatching}}}
+    assert {:ack, 1, 2} in Fake.events(agent)
+    stop(worker, agent)
+  end
+
+  test "rejects explicit submit rejection without requeue", %{config: config} do
+    {store, _} = journal_store()
+    submit = fn _env -> {:error, {:submit_rejected, :ESME_RINVDESTADR}} end
+    {worker, agent} = start_bound(config, "alpha", store: store, submit: submit)
+    {_envelope, payload} = valid_payload(%{gateway_id: "gw-rej"})
+    assert :ok = Fake.deliver(agent, payload)
+    assert ConnectorWorker.inflight(worker) == nil
+    events = Fake.events(agent)
+    assert {:reject, 1, 1, [requeue: false]} in events
+    refute Enum.any?(events, &match?({:ack, _, _}, &1))
+    stop(worker, agent)
+  end
+
+  test "settles classified inflight before cancel and close", %{config: config} do
+    for {result, expected} <- [
+          {{:ok, "smsc-td"}, {:ack, 1, 1}},
+          {{:error, {:submit_rejected, :ESME_RINVDESTADR}}, {:reject, 1, 1, [requeue: false]}}
+        ] do
+      {store, _} = journal_store()
+      {worker, agent} = start_bound(config, "alpha", store: store, submit: fn _ -> result end)
+      {_envelope, payload} = valid_payload(%{gateway_id: "gw-td"})
+      assert :ok = Fake.deliver(agent, payload)
+      _ = ConnectorWorker.inflight(worker)
+      send(worker, {:smpp_bind_lost, "alpha", :tcp_closed})
+      assert ConnectorWorker.inflight(worker) == nil
+      events = Fake.events(agent)
+      settle_at = Enum.find_index(events, &(&1 == expected))
+      cancel_at = Enum.find_index(events, &match?({:cancel, 1, _}, &1))
+      close_at = Enum.find_index(events, &match?({:close_channel, 1}, &1))
+      assert is_integer(settle_at)
+      assert is_integer(cancel_at) and settle_at < cancel_at
+      assert is_integer(close_at) and settle_at < close_at
+      stop(worker, agent)
+    end
+  end
+
+  test "does not clear inflight or complete teardown when broker settlement fails", %{
+    config: config
+  } do
+    for {fail_at, result, expected_event, decision} <- [
+          {:ack, {:ok, "smsc-ok"}, {:ack, 1, 1}, :ack},
+          {:reject, {:error, {:submit_rejected, :ESME_RINVDESTADR}},
+           {:reject, 1, 1, [requeue: false]}, :reject}
+        ] do
+      {store, _} = journal_store()
+
+      {worker, agent} =
+        start_bound(config, "alpha", [store: store, submit: fn _ -> result end], fail_at)
+
+      {_envelope, payload} = valid_payload(%{gateway_id: "gw-settle-fail"})
+      assert :ok = Fake.deliver(agent, payload)
+      assert {:classified, ^decision, %{delivery_tag: 1}} = ConnectorWorker.inflight(worker)
+      {_next, payload2} = valid_payload(%{gateway_id: "gw-next"})
+      assert :rejected = Fake.deliver(agent, payload2)
+      events = Fake.events(agent)
+      assert expected_event in events
+      refute {:cancel, 1, "ctag-1"} in events
+      refute {:close_channel, 1} in events
+      send(worker, {:smpp_bind_lost, "alpha", :tcp_closed})
+      assert {:classified, ^decision, %{delivery_tag: 1}} = ConnectorWorker.inflight(worker)
+      events = Fake.events(agent)
+      refute {:cancel, 1, "ctag-1"} in events
+      refute {:close_channel, 1} in events
+      pid = Fake.channel_pid(agent, 1)
+      if is_pid(pid) and Process.alive?(pid), do: Process.exit(pid, :kill)
+      stop(worker, agent)
+    end
+  end
+
   test "closes the opened channel when qos or consume setup fails", %{config: config} do
     for fail_at <- [:qos, :consume] do
       {worker, agent} = start(config, "alpha", fail_at)
@@ -242,6 +399,43 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     agent = Fake.start(fail_at)
     {:ok, worker} = start_one(config, id, Fake.connection(agent))
     {worker, agent}
+  end
+
+  defp start_bound(config, id, extra, fail_at \\ nil) do
+    agent = Fake.start(fail_at)
+    {:ok, worker} = start_one(config, id, Fake.connection(agent), extra)
+    send(worker, {:smpp_bound, id, :initial})
+    _ = ConnectorWorker.inflight(worker)
+    {worker, agent}
+  end
+
+  defp journal_store do
+    table = :ets.new(:pr3d_journal, [:set, :public])
+    {{JournalStore, table}, table}
+  end
+
+  defp valid_payload(overrides) do
+    attributes =
+      Map.merge(
+        %{
+          gateway_id: "gateway-1",
+          connector_id: "alpha",
+          attempt: 1,
+          max_attempts: 3,
+          enqueued_at: "2026-08-01T15:00:00Z",
+          expires_at: "2026-08-02T15:00:00Z",
+          submit_sm: %{
+            source_addr: "+12025550100",
+            destination_addr: "+12025550101",
+            short_message: "hello"
+          }
+        },
+        overrides
+      )
+
+    {:ok, envelope} = Envelope.new(attributes)
+    {:ok, payload} = Envelope.encode(envelope)
+    {envelope, payload}
   end
 
   defp start_pair(config) do
