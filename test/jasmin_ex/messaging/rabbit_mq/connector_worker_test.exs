@@ -4,6 +4,9 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
   alias JasminEx.Messaging.{Envelope, StateStoreJournal}
   alias JasminEx.Messaging.RabbitMQ.{Config, Connection, ConnectorWorker}
 
+  @future "2099-01-01T00:00:00Z"
+  @past "2020-01-01T00:00:00Z"
+
   defmodule JournalStore do
     def put(table, key, value, ttl_ms) do
       true = :ets.insert(table, {key, value, ttl_ms})
@@ -16,6 +19,11 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
         [] -> :missing
       end
     end
+  end
+
+  defmodule FailingStore do
+    def put(_table, _key, _value, _ttl_ms), do: {:error, :unavailable}
+    def fetch(_table, _key), do: :missing
   end
 
   defmodule Fake do
@@ -135,6 +143,8 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
       end
     end
 
+    def record(agent, event), do: track(agent, event)
+
     defp next_id(agent),
       do:
         Agent.get_and_update(agent, fn state -> {state.next, %{state | next: state.next + 1}} end)
@@ -215,18 +225,21 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     stop(worker, agent)
   end
 
-  test "retains at most one opaque delivery without SMPP dispatch", %{config: config} do
+  test "retains at most one unsubmitted valid delivery without store or submit", %{
+    config: config
+  } do
     {worker, agent} = start(config, "alpha")
     send(worker, {:smpp_bound, "alpha", :initial})
     _ = ConnectorWorker.inflight(worker)
-    assert :ok = Fake.deliver(agent, "one")
-    assert {:basic_deliver, "one", %{delivery_tag: 1}} = ConnectorWorker.inflight(worker)
+    {_envelope, payload} = valid_payload(%{gateway_id: "gw-hold"})
+    assert :ok = Fake.deliver(agent, payload)
+    assert {:basic_deliver, ^payload, %{delivery_tag: 1}} = ConnectorWorker.inflight(worker)
     assert :rejected = Fake.deliver(agent, "two")
-    assert {:basic_deliver, "one", %{delivery_tag: 1}} = ConnectorWorker.inflight(worker)
+    assert {:basic_deliver, ^payload, %{delivery_tag: 1}} = ConnectorWorker.inflight(worker)
     refute_received {:submit_sm, _}
     events = Fake.events(agent)
     refute Enum.any?(events, &match?({:ack, _, _}, &1))
-    refute Enum.any?(events, &match?({:reject, _, _}, &1))
+    refute Enum.any?(events, &match?({:reject, _, _, _}, &1))
     stop(worker, agent)
   end
 
@@ -236,12 +249,12 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     submit = fn env -> send(test, {:submitted, env}) && {:ok, "nope"} end
     {worker, agent} = start_bound(config, "alpha", store: store, submit: submit)
     assert :ok = Fake.deliver(agent, "one")
-    assert {:basic_deliver, "one", %{delivery_tag: 1}} = ConnectorWorker.inflight(worker)
+    assert ConnectorWorker.inflight(worker) == nil
     refute_received {:submitted, _}
     assert StateStoreJournal.read(store, "gateway-1", 1) == :missing
     events = Fake.events(agent)
+    assert {:reject, 1, 1, [requeue: false]} in events
     refute Enum.any?(events, &match?({:ack, _, _}, &1))
-    refute Enum.any?(events, &match?({:reject, _, _, _}, &1))
     stop(worker, agent)
   end
 
@@ -366,6 +379,181 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     end
   end
 
+  test "retries proven never-reached work only after confirmed republish", %{config: config} do
+    for {result, republish_result, expect_ack?} <- [
+          {{:error, :disconnected}, :ok, true},
+          {{:error, :unbinding}, {:error, :timeout}, false}
+        ] do
+      {store, _} = journal_store()
+
+      {worker, agent} =
+        start_bound(config, "alpha", fn agent ->
+          [
+            store: store,
+            submit: fn _ -> result end,
+            republish: fn action ->
+              Fake.record(agent, {:republish, action})
+              republish_result
+            end
+          ]
+        end)
+
+      {_envelope, payload} =
+        valid_payload(%{
+          gateway_id: "gw-retry",
+          attempt: 1,
+          max_attempts: 3,
+          expires_at: @future
+        })
+
+      assert :ok = Fake.deliver(agent, payload)
+      _ = ConnectorWorker.inflight(worker)
+      events = Fake.events(agent)
+      assert {:republish, {:retry, next}} = find(events, :republish)
+      assert next.attempt == 2
+      assert next.gateway_id == "gw-retry"
+      assert next.max_attempts == 3
+      assert next.expires_at == @future
+      refute Enum.any?(events, &match?({:republish, {:quarantine, _, _}}, &1))
+
+      if expect_ack? do
+        assert ConnectorWorker.inflight(worker) == nil
+        republish_at = Enum.find_index(events, &match?({:republish, {:retry, _}}, &1))
+        ack_at = Enum.find_index(events, &(&1 == {:ack, 1, 1}))
+        assert is_integer(republish_at) and is_integer(ack_at) and republish_at < ack_at
+        assert {:ok, %{state: :not_sent}} = StateStoreJournal.read(store, "gw-retry", 1)
+      else
+        assert {:basic_deliver, ^payload, %{delivery_tag: 1}} = ConnectorWorker.inflight(worker)
+        refute Enum.any?(events, &match?({:ack, _, _}, &1))
+      end
+
+      stop(worker, agent)
+    end
+  end
+
+  test "does not retry exhausted attempt or expired envelopes", %{config: config} do
+    for {overrides, result} <- [
+          {%{gateway_id: "gw-max", attempt: 3, max_attempts: 3, expires_at: @future},
+           {:error, :disconnected}},
+          {%{gateway_id: "gw-exp", attempt: 1, max_attempts: 3, expires_at: @past},
+           {:error, :unbinding}}
+        ] do
+      {store, _} = journal_store()
+
+      {worker, agent} =
+        start_bound(config, "alpha", fn agent ->
+          [store: store, submit: fn _ -> result end, republish: republish_ok(agent)]
+        end)
+
+      {_envelope, payload} = valid_payload(overrides)
+      assert :ok = Fake.deliver(agent, payload)
+      assert ConnectorWorker.inflight(worker) == nil
+      events = Fake.events(agent)
+      assert {:republish, {:quarantine, env, evidence}} = find(events, :republish)
+      assert env.gateway_id == overrides.gateway_id
+      assert env.connector_id == "alpha"
+      assert evidence.stage == :pre_write
+      assert evidence.gateway_id == env.gateway_id
+      assert evidence.connector_id == env.connector_id
+      assert evidence.source_addr == env.submit_sm.source_addr
+      assert evidence.destination_addr == env.submit_sm.destination_addr
+      refute Enum.any?(events, &match?({:republish, {:retry, _}}, &1))
+      republish_at = Enum.find_index(events, &match?({:republish, {:quarantine, _, _}}, &1))
+      ack_at = Enum.find_index(events, &(&1 == {:ack, 1, 1}))
+      assert is_integer(republish_at) and is_integer(ack_at) and republish_at < ack_at
+      stop(worker, agent)
+    end
+  end
+
+  test "quarantines timeout and uncertain outcomes after confirmed publish", %{config: config} do
+    for {result, reason} <- [
+          {{:unknown, :response_timeout}, :response_timeout},
+          {{:unknown, :disconnected}, :disconnected}
+        ] do
+      {store, _} = journal_store()
+
+      {worker, agent} =
+        start_bound(config, "alpha", fn agent ->
+          [store: store, submit: fn _ -> result end, republish: republish_ok(agent)]
+        end)
+
+      {_envelope, payload} =
+        valid_payload(%{gateway_id: "gw-q", expires_at: @future})
+
+      assert :ok = Fake.deliver(agent, payload)
+      assert ConnectorWorker.inflight(worker) == nil
+      events = Fake.events(agent)
+      assert {:republish, {:quarantine, env, evidence}} = find(events, :republish)
+      assert env.gateway_id == "gw-q"
+      assert evidence.stage == :post_write
+      assert evidence.reason == reason
+      assert evidence.gateway_id == "gw-q"
+      assert evidence.connector_id == "alpha"
+      assert evidence.source_addr == env.submit_sm.source_addr
+      assert evidence.destination_addr == env.submit_sm.destination_addr
+      refute Enum.any?(events, &match?({:republish, {:retry, _}}, &1))
+      republish_at = Enum.find_index(events, &match?({:republish, {:quarantine, _, _}}, &1))
+      ack_at = Enum.find_index(events, &(&1 == {:ack, 1, 1}))
+      assert is_integer(republish_at) and is_integer(ack_at) and republish_at < ack_at
+      assert {:ok, %{state: :sent, evidence: stored}} = StateStoreJournal.read(store, "gw-q", 1)
+      assert stored["stage"] == "post_write"
+      assert stored["reason"] == Atom.to_string(reason)
+      stop(worker, agent)
+    end
+  end
+
+  test "rejects unsupported and malformed envelopes without silent drop", %{config: config} do
+    test = self()
+
+    for payload <- [
+          ~s({"version":2,"connector_id":"alpha"}),
+          "one"
+        ] do
+      {store, _} = journal_store()
+
+      {worker, agent} =
+        start_bound(config, "alpha", fn agent ->
+          [
+            store: store,
+            submit: fn env -> send(test, {:submitted, env}) && {:ok, "nope"} end,
+            republish: republish_ok(agent)
+          ]
+        end)
+
+      assert :ok = Fake.deliver(agent, payload)
+      assert ConnectorWorker.inflight(worker) == nil
+      refute_received {:submitted, _}
+      events = Fake.events(agent)
+      assert {:reject, 1, 1, [requeue: false]} in events
+      refute Enum.any?(events, &match?({:ack, _, _}, &1))
+      refute Enum.any?(events, &match?({:republish, _}, &1))
+      stop(worker, agent)
+    end
+  end
+
+  test "journal write failure stalls without submit or settlement", %{config: config} do
+    test = self()
+
+    {worker, agent} =
+      start_bound(config, "alpha", fn agent ->
+        [
+          store: {FailingStore, :unused},
+          submit: fn env -> send(test, {:submitted, env}) && {:ok, "nope"} end,
+          republish: republish_ok(agent)
+        ]
+      end)
+
+    {_envelope, payload} = valid_payload(%{gateway_id: "gw-stall", expires_at: @future})
+    assert :ok = Fake.deliver(agent, payload)
+    assert {:basic_deliver, ^payload, %{delivery_tag: 1}} = ConnectorWorker.inflight(worker)
+    refute_received {:submitted, _}
+    events = Fake.events(agent)
+    refute Enum.any?(events, &match?({:ack, _, _}, &1))
+    refute Enum.any?(events, &match?({:reject, _, _, _}, &1))
+    refute Enum.any?(events, &match?({:republish, _}, &1))
+    stop(worker, agent)
+  end
+
   test "channel failure of A leaves B and Connection alive", %{config: config} do
     agent = Fake.start()
 
@@ -403,10 +591,18 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
 
   defp start_bound(config, id, extra, fail_at \\ nil) do
     agent = Fake.start(fail_at)
+    extra = if is_function(extra, 1), do: extra.(agent), else: extra
     {:ok, worker} = start_one(config, id, Fake.connection(agent), extra)
     send(worker, {:smpp_bound, id, :initial})
     _ = ConnectorWorker.inflight(worker)
     {worker, agent}
+  end
+
+  defp republish_ok(agent) do
+    fn action ->
+      Fake.record(agent, {:republish, action})
+      :ok
+    end
   end
 
   defp journal_store do

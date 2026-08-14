@@ -23,6 +23,7 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
        connector_id: Keyword.fetch!(opts, :connector_id),
        store: Keyword.get(opts, :store),
        submit: Keyword.get(opts, :submit),
+       republish: Keyword.get(opts, :republish),
        channel: nil,
        mon: nil,
        consumer_tag: nil,
@@ -91,10 +92,16 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
   end
 
   defp dispatch(%{inflight: {:basic_deliver, payload, meta}} = state) do
-    with {:ok, envelope} <- Envelope.decode(payload),
-         true <- dispatchable?(state),
+    case Envelope.decode(payload) do
+      {:ok, envelope} -> dispatch_valid(state, envelope, meta)
+      {:error, _reason} -> finish(state, :reject, meta)
+    end
+  end
+
+  defp dispatch_valid(state, envelope, meta) do
+    with true <- dispatchable?(state),
          :ok <- persist_dispatching(state, envelope) do
-      classify(state, meta, state.submit.(envelope))
+      classify(state, envelope, meta, state.submit.(envelope))
     else
       _ -> state
     end
@@ -111,12 +118,102 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
     StateStoreJournal.write(store, record, config.default_expiry_ms)
   end
 
-  defp classify(state, meta, {:ok, _id}), do: finish(state, :ack, meta)
+  defp classify(state, _envelope, meta, {:ok, _id}), do: finish(state, :ack, meta)
 
-  defp classify(state, meta, {:error, {:submit_rejected, _reason}}),
+  defp classify(state, _envelope, meta, {:error, {:submit_rejected, _reason}}),
     do: finish(state, :reject, meta)
 
-  defp classify(state, _meta, _other), do: state
+  defp classify(state, envelope, meta, {:error, reason})
+       when reason in [:disconnected, :unbinding],
+       do: settle_retry(state, envelope, meta, evidence(envelope, :pre_write, reason))
+
+  defp classify(state, envelope, meta, {:unknown, reason}),
+    do: settle_quarantine(state, envelope, meta, evidence(envelope, :post_write, reason))
+
+  defp classify(state, _envelope, _meta, _other), do: state
+
+  defp settle_retry(state, envelope, meta, evidence) do
+    if retryable?(envelope) do
+      confirm_action(state, envelope, meta, :not_sent, evidence, &retry_envelope/2)
+    else
+      settle_quarantine(state, envelope, meta, evidence)
+    end
+  end
+
+  defp settle_quarantine(state, envelope, meta, evidence) do
+    journal_state = if evidence.stage == :pre_write, do: :not_sent, else: :sent
+    confirm_action(state, envelope, meta, journal_state, evidence, &quarantine_action/2)
+  end
+
+  defp confirm_action(
+         %{republish: republish} = state,
+         envelope,
+         meta,
+         journal_state,
+         evidence,
+         fun
+       )
+       when is_function(republish, 1) do
+    with :ok <- persist_outcome(state, envelope, journal_state, evidence),
+         {:ok, action} <- fun.(envelope, evidence),
+         :ok <- republish.(action) do
+      finish(state, :ack, meta)
+    else
+      _ -> state
+    end
+  end
+
+  defp confirm_action(state, _envelope, _meta, _journal_state, _evidence, _fun), do: state
+
+  defp retry_envelope(envelope, _evidence) do
+    with {:ok, next} <- increment(envelope), do: {:ok, {:retry, next}}
+  end
+
+  defp quarantine_action(envelope, evidence), do: {:ok, {:quarantine, envelope, evidence}}
+
+  defp persist_outcome(%{store: store, config: config}, envelope, journal_state, evidence) do
+    with {:ok, record} <- StateStoreJournal.read(store, envelope.gateway_id, envelope.attempt),
+         {:ok, recorded} <-
+           SettlementJournal.record_outcome(record, {journal_state, evidence}) do
+      StateStoreJournal.write(store, recorded, config.default_expiry_ms)
+    end
+  end
+
+  defp increment(envelope) do
+    Envelope.new(%{
+      gateway_id: envelope.gateway_id,
+      connector_id: envelope.connector_id,
+      attempt: envelope.attempt + 1,
+      max_attempts: envelope.max_attempts,
+      enqueued_at: envelope.enqueued_at,
+      expires_at: envelope.expires_at,
+      submit_sm: envelope.submit_sm
+    })
+  end
+
+  defp retryable?(envelope),
+    do: envelope.attempt < envelope.max_attempts and not expired?(envelope)
+
+  defp expired?(%{expires_at: expires_at}) do
+    case DateTime.from_iso8601(expires_at) do
+      {:ok, datetime, _offset} -> DateTime.compare(datetime, DateTime.utc_now()) != :gt
+      _ -> true
+    end
+  end
+
+  defp evidence(envelope, stage, reason) do
+    %{
+      stage: stage,
+      reason: normalize_reason(reason),
+      gateway_id: envelope.gateway_id,
+      connector_id: envelope.connector_id,
+      source_addr: envelope.submit_sm.source_addr,
+      destination_addr: envelope.submit_sm.destination_addr
+    }
+  end
+
+  defp normalize_reason(reason) when is_atom(reason), do: reason
+  defp normalize_reason(_reason), do: :uncertain
 
   defp finish(state, decision, meta),
     do: settle_classified(%{state | inflight: {:classified, decision, meta}})
