@@ -35,4 +35,8 @@ defmodule JasminEx.Messaging.RabbitMQ.Client do
     do: AMQP.Basic.consume(ch, queue, consumer, opts)
 
   def cancel(%{channel: ch}, consumer_tag), do: AMQP.Basic.cancel(ch, consumer_tag)
+  def ack(%{channel: ch}, delivery_tag), do: AMQP.Basic.ack(ch, delivery_tag)
+
+  def reject(%{channel: ch}, delivery_tag, opts) when is_list(opts),
+    do: AMQP.Basic.reject(ch, delivery_tag, opts)
 end
