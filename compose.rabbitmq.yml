@@ -6,7 +6,7 @@ services:
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_TEST_PASSWORD}
     ports:
       - target: 5672
-        published: "${RABBITMQ_TEST_PORT}"
+        published: "${RABBITMQ_TEST_PORT:-0}"
         host_ip: 127.0.0.1
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]

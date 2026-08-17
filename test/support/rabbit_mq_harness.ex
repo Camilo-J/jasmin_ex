@@ -12,7 +12,7 @@ defmodule JasminEx.RabbitMQHarness do
 
     %{
       project: "jasmin-ex-rabbitmq-#{System.unique_integer([:positive])}",
-      port: available_port!(),
+      port: Keyword.get(opts, :port, 0),
       image: image,
       cmd: Keyword.get(opts, :cmd, &System.cmd/3)
     }
@@ -28,20 +28,34 @@ defmodule JasminEx.RabbitMQHarness do
 
   def stop!(harness), do: run!(harness, ["down", "--volumes", "--remove-orphans"])
 
-  defp safe_stop(harness) do
-    stop!(harness)
-  rescue
-    _cleanup_error -> :ok
+  def restart!(harness) do
+    run!(harness, ["restart"])
+    wait!(harness)
+  end
+
+  def wait!(harness), do: run!(harness, ["up", "--wait"])
+
+  def port(harness) do
+    case harness.port do
+      port when is_integer(port) and port > 0 -> port
+      _ -> discover_port!(harness)
+    end
   end
 
   def compose_environment(harness) do
     [
       {"RABBITMQ_TEST_IMAGE", harness.image},
-      {"RABBITMQ_TEST_PORT", Integer.to_string(harness.port)},
+      {"RABBITMQ_TEST_PORT", Integer.to_string(harness.port || 0)},
       {"RABBITMQ_TEST_USER", System.get_env("RABBITMQ_TEST_USER") || "jasmin"},
       {"RABBITMQ_TEST_PASSWORD",
        System.get_env("RABBITMQ_TEST_PASSWORD") || "jasmin-test-password"}
     ]
+  end
+
+  defp safe_stop(harness) do
+    stop!(harness)
+  rescue
+    _cleanup_error -> :ok
   end
 
   defp validate_image!(@allowed_image), do: :ok
@@ -50,21 +64,31 @@ defmodule JasminEx.RabbitMQHarness do
     raise ArgumentError, "RabbitMQ image is not allowlisted"
   end
 
-  defp available_port! do
-    {:ok, socket} = :gen_tcp.listen(0, [:binary, active: false])
-    {:ok, port} = :inet.port(socket)
-    :ok = :gen_tcp.close(socket)
-    port
+  defp discover_port!(harness) do
+    {output, exit_status} = command(harness, ["port", "rabbitmq", "5672"])
+
+    if exit_status != 0 do
+      raise compose_error(exit_status, output)
+    end
+
+    case Regex.run(~r/:(\d+)\s*$/m, String.trim(output)) do
+      [_, port] -> String.to_integer(port)
+      _ -> raise compose_error(exit_status, output)
+    end
   end
 
   defp run!(harness, args) do
-    {_output, exit_status} = command(harness, args)
+    {output, exit_status} = command(harness, args)
 
     if exit_status == 0 do
       :ok
     else
-      raise "RabbitMQ Compose command failed"
+      raise compose_error(exit_status, output)
     end
+  end
+
+  defp compose_error(exit_status, output) do
+    "RabbitMQ Compose command failed (exit #{exit_status}): #{String.trim(output)}"
   end
 
   defp command(harness, args) do
