@@ -1,0 +1,16 @@
+services:
+  rabbitmq:
+    image: ${RABBITMQ_TEST_IMAGE:-rabbitmq:4.3.4@sha256:4b336f82e93749f1ebf8d6283b4d5a98bf1efac8412ec56015a6ab5aae0f57a2}
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_TEST_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_TEST_PASSWORD}
+    ports:
+      - target: 5672
+        published: "${RABBITMQ_TEST_PORT}"
+        host_ip: 127.0.0.1
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 1s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
