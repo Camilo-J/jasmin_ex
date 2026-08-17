@@ -22,6 +22,7 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
   end
 
   defmodule FailingStore do
+    def put(a, _k, _v, _t) when is_pid(a), do: Agent.get_and_update(a, &List.pop_at(&1, 0))
     def put(_table, _key, _value, _ttl_ms), do: {:error, :unavailable}
     def fetch(_table, _key), do: :missing
   end
@@ -552,6 +553,146 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     refute Enum.any?(events, &match?({:reject, _, _, _}, &1))
     refute Enum.any?(events, &match?({:republish, _}, &1))
     stop(worker, agent)
+  end
+
+  test "preserves stalled inflight on bind-lost instead of silent close", %{config: config} do
+    test = self()
+    unavailable = {:error, :unavailable}
+    {:ok, store} = Agent.start_link(fn -> [unavailable, :ok, :ok, unavailable, unavailable] end)
+
+    {worker, agent} =
+      start_bound(config, "alpha", fn agent ->
+        [
+          store: {FailingStore, store},
+          submit: fn
+            %{gateway_id: "gw-stall-lost"} = env ->
+              send(test, {:submitted, env}) && {:ok, "smsc-ok"}
+
+            _env ->
+              :unsupported
+          end,
+          republish: republish_ok(agent)
+        ]
+      end)
+
+    {_envelope, payload} = valid_payload(%{gateway_id: "gw-stall-lost", expires_at: @future})
+    assert :ok = Fake.deliver(agent, payload)
+    assert {:basic_deliver, ^payload, %{delivery_tag: 1}} = ConnectorWorker.inflight(worker)
+    send(worker, {:smpp_bind_lost, "alpha", :tcp_closed})
+    assert {:basic_deliver, ^payload, %{delivery_tag: 1}} = ConnectorWorker.inflight(worker)
+    refute_received {:submitted, _}
+    events = Fake.events(agent)
+    refute {:cancel, 1, "ctag-1"} in events
+    refute {:close_channel, 1} in events
+    refute Enum.any?(events, &match?({:republish, _}, &1))
+    refute Enum.any?(events, &match?({:ack, _, _}, &1))
+    send(worker, {:smpp_bound, "alpha", :reconnect})
+    assert ConnectorWorker.inflight(worker) == nil
+    assert_received {:submitted, %{gateway_id: "gw-stall-lost"}}
+    events = Fake.events(agent)
+    assert {:ack, 1, 1} in events
+    assert {:cancel, 1, "ctag-1"} in events
+    assert {:close_channel, 1} in events
+    assert Enum.count(events, &match?({:consume, _, "jasmin.work.alpha", ^worker, _}, &1)) == 2
+    {_envelope, risky} = valid_payload(%{gateway_id: "gw-maybe-sent"})
+    assert :ok = Fake.deliver(agent, risky)
+    send(worker, {:smpp_bind_lost, "alpha", :tcp_closed})
+    assert {:basic_deliver, ^risky, %{delivery_tag: 2}} = ConnectorWorker.inflight(worker)
+    events = Fake.events(agent)
+    refute {:ack, 2, 2} in events
+    refute {:cancel, 2, "ctag-2"} in events
+    refute {:close_channel, 2} in events
+    stop(worker, agent)
+  end
+
+  test "quarantines recoverable unclassified inflight then closes only C", %{config: config} do
+    agent = Fake.start()
+    conn = Fake.connection(agent)
+    {store, _} = journal_store()
+    extra = [store: store, submit: fn _ -> :unsupported end, republish: republish_ok(agent)]
+    {:ok, alpha} = start_one(config, "alpha", conn, extra)
+    {:ok, beta} = start_one(config, "beta", conn)
+    bind_both(alpha, beta)
+    {_envelope, payload} = valid_payload(%{gateway_id: "gw-unclassified", expires_at: @future})
+    assert :ok = Fake.deliver(agent, payload)
+    assert {:basic_deliver, ^payload, %{delivery_tag: 1}} = ConnectorWorker.inflight(alpha)
+    send(alpha, {:smpp_bind_lost, "alpha", :tcp_closed})
+    assert ConnectorWorker.inflight(alpha) == nil
+    events = Fake.events(agent)
+    assert {:republish, {:quarantine, env, evidence}} = find(events, :republish)
+    assert env.gateway_id == "gw-unclassified"
+    assert env.connector_id == "alpha"
+    assert evidence.stage == :post_write
+    assert evidence.reason == :bind_lost
+    assert evidence.gateway_id == "gw-unclassified"
+    assert evidence.connector_id == "alpha"
+    republish_at = Enum.find_index(events, &match?({:republish, {:quarantine, _, _}}, &1))
+    ack_at = Enum.find_index(events, &(&1 == {:ack, 1, 1}))
+    cancel_at = Enum.find_index(events, &match?({:cancel, 1, _}, &1))
+    close_at = Enum.find_index(events, &match?({:close_channel, 1}, &1))
+    assert is_integer(republish_at) and is_integer(ack_at) and republish_at < ack_at
+    assert is_integer(cancel_at) and ack_at < cancel_at
+    assert is_integer(close_at) and ack_at < close_at
+    refute {:cancel, 2, "ctag-2"} in events
+    refute {:close_channel, 2} in events
+    assert {:consume, 2, "jasmin.work.beta", ^beta, _} = find(events, :consume, 1)
+    stop_pair(alpha, beta, agent)
+  end
+
+  test "channel down replaces stale classified work and accepts redelivery", %{config: config} do
+    {store, _} = journal_store()
+
+    {worker, agent} =
+      start_bound(config, "alpha", [store: store, submit: fn _ -> {:ok, "smsc-ok"} end], :ack)
+
+    {_envelope, payload} = valid_payload(%{gateway_id: "gw-down-classified"})
+    assert :ok = Fake.deliver(agent, payload)
+    assert {:classified, :ack, %{delivery_tag: 1}} = ConnectorWorker.inflight(worker)
+    pid = Fake.channel_pid(agent, 1)
+    ref = Process.monitor(pid)
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid, _}
+    assert ConnectorWorker.inflight(worker) == nil
+    events = Fake.events(agent)
+    assert Enum.count(events, &match?({:consume, _, "jasmin.work.alpha", ^worker, _}, &1)) == 2
+    refute {:cancel, 1, "ctag-1"} in events
+    send(worker, {:basic_deliver, payload, %{delivery_tag: 2, redelivered: true}})
+
+    assert {:classified, :ack, %{delivery_tag: 2, redelivered: true}} =
+             ConnectorWorker.inflight(worker)
+
+    stop(worker, agent)
+  end
+
+  test "restores exactly one consumer after same-connector down while bound", %{config: config} do
+    agent = Fake.start()
+
+    {:ok, conn} =
+      Connection.start_link(
+        config: config,
+        client: Fake,
+        client_opts: [channel_agent: agent],
+        name: nil
+      )
+
+    {:ok, alpha} = start_one(config, "alpha", nil, connection_server: conn)
+    {:ok, beta} = start_one(config, "beta", nil, connection_server: conn)
+    bind_both(alpha, beta)
+    pid = Fake.channel_pid(agent, 1)
+    ref = Process.monitor(pid)
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid, _}
+    _ = ConnectorWorker.inflight(alpha)
+    assert Process.alive?(beta) and Process.alive?(conn)
+    assert {:ok, _} = Connection.get(conn)
+    events = Fake.events(agent)
+    assert Enum.count(events, &match?({:open_channel, _}, &1)) == 3
+    assert Enum.count(events, &match?({:consume, _, "jasmin.work.alpha", ^alpha, _}, &1)) == 2
+    assert Enum.count(events, &match?({:consume, _, "jasmin.work.beta", ^beta, _}, &1)) == 1
+    refute {:cancel, 2, "ctag-2"} in events
+    refute {:close_channel, 2} in events
+    stop_pair(alpha, beta, agent)
+    GenServer.stop(conn)
   end
 
   test "channel failure of A leaves B and Connection alive", %{config: config} do

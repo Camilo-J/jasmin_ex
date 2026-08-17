@@ -61,30 +61,145 @@ defmodule JasminEx.Smpp.ConnectorSupervisor do
   defp non_empty_keyword?(_value), do: false
 end
 
+defmodule JasminEx.Smpp.ConnectorSupervisor.LifecycleForwarder do
+  @moduledoc false
+  use GenServer
+  def name(id), do: :"jasmin_ex.lifecycle_forwarder.#{id}"
+
+  def locate(id, owner),
+    do: Process.whereis(name(id)) || elem(GenServer.start(__MODULE__, {id, owner}), 1)
+
+  def init({id, owner}) do
+    Process.register(self(), name(id))
+    {:ok, {Process.monitor(owner), nil, []}}
+  end
+
+  def handle_info({:worker, w}, {o, _, b}) do
+    Enum.each(b, &send(w, &1))
+    Process.monitor(w)
+    {:noreply, {o, w, b}}
+  end
+
+  def handle_info({:DOWN, r, :process, _, _}, {r, _, _} = s), do: {:stop, :normal, s}
+  def handle_info({:DOWN, _, :process, w, _}, {o, w, b}), do: {:noreply, {o, nil, b}}
+  def handle_info({:DOWN, _, :process, _, _}, s), do: {:noreply, s}
+
+  def handle_info(m, {o, w, _}) do
+    if is_pid(w), do: send(w, m)
+    bound = if match?({:smpp_bound, _, _}, m), do: [m], else: []
+    {:noreply, {o, w, bound}}
+  end
+end
+
 defmodule JasminEx.Smpp.ConnectorSupervisor.Instance do
   @moduledoc false
 
   use Supervisor
 
+  alias JasminEx.Messaging.RabbitMQ.Config, as: MessagingConfig
+  alias JasminEx.Messaging.RabbitMQ.Connection
+  alias JasminEx.Messaging.RabbitMQ.ConnectorWorker
+  alias JasminEx.Messaging.RabbitMQ.WorkQueue
   alias JasminEx.Smpp.Client
+  alias JasminEx.Smpp.Client.Config
+  alias JasminEx.Smpp.ConnectorSupervisor.LifecycleForwarder
+  alias JasminEx.StateStore.Config, as: StateStoreConfig
+  alias JasminEx.StateStore.Redix, as: StateStoreRedix
 
   @spec start_link(keyword()) :: Supervisor.on_start()
   def start_link(opts), do: Supervisor.start_link(__MODULE__, opts)
 
+  def start_client(opts, id) do
+    Client.start_link(Keyword.put(opts, :lifecycle_notify, LifecycleForwarder.locate(id, self())))
+  end
+
+  def start_worker(opts, id) do
+    supervisor = self()
+
+    dependencies = [
+      store: state_store(),
+      submit: fn envelope ->
+        Client.send_submit_sm(
+          child(supervisor, :smpp_client),
+          struct(JasminEx.Smpp.PDU.Body.SubmitSM, envelope.submit_sm)
+        )
+      end,
+      republish: &WorkQueue.republish/1
+    ]
+
+    {:ok, worker} = ok = ConnectorWorker.start_link(Keyword.merge(opts, dependencies))
+    send(LifecycleForwarder.locate(id, self()), {:worker, worker})
+    ok
+  end
+
   @impl true
   def init(opts) do
-    child = %{
-      id: :smpp_client,
-      start: {Client, :start_link, [opts]},
-      restart: :transient,
-      type: :worker,
-      modules: [Client]
-    }
+    {messaging, client_opts} = Keyword.pop(opts, :messaging, messaging_config())
 
-    Supervisor.init([child],
+    Supervisor.init(
+      [client_child(client_opts, messaging) | worker_children(messaging, client_opts)],
       strategy: :one_for_one,
       max_restarts: 3,
       max_seconds: 5
     )
+  end
+
+  defp client_child(opts, messaging) do
+    start =
+      if is_list(messaging) and Keyword.get(messaging, :enabled, false) do
+        {__MODULE__, :start_client, [opts, Config.new!(opts).connector_id]}
+      else
+        {Client, :start_link, [opts]}
+      end
+
+    %{
+      id: :smpp_client,
+      start: start,
+      restart: :transient,
+      type: :worker,
+      modules: [Client]
+    }
+  end
+
+  defp worker_children(messaging, opts) when is_list(messaging) do
+    if Keyword.get(messaging, :enabled, false) do
+      [worker_child(messaging, opts)]
+    else
+      []
+    end
+  end
+
+  defp worker_children(_messaging, _opts), do: []
+
+  defp worker_child(messaging, opts) do
+    %{
+      id: :connector_worker,
+      start:
+        {__MODULE__, :start_worker,
+         [
+           [
+             config: MessagingConfig.new!(messaging),
+             connector_id: Config.new!(opts).connector_id,
+             connection_server: Connection,
+             name: nil
+           ],
+           Config.new!(opts).connector_id
+         ]},
+      restart: :transient,
+      type: :worker,
+      modules: [ConnectorWorker]
+    }
+  end
+
+  defp messaging_config, do: Application.get_env(:jasmin_ex, :messaging, [])
+
+  defp state_store do
+    config = StateStoreConfig.new!(Application.get_env(:jasmin_ex, :state_store, []))
+    {StateStoreRedix, StateStoreRedix.context(config)}
+  end
+
+  defp child(supervisor, id) do
+    {^id, pid, _, _} = Enum.find(Supervisor.which_children(supervisor), &(elem(&1, 0) == id))
+    pid
   end
 end
