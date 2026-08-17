@@ -24,6 +24,8 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
        store: Keyword.get(opts, :store),
        submit: Keyword.get(opts, :submit),
        republish: Keyword.get(opts, :republish),
+       bound: false,
+       phase: :idle,
        channel: nil,
        mon: nil,
        consumer_tag: nil,
@@ -36,21 +38,21 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
 
   @impl true
   def handle_info({:smpp_bound, id, _kind}, %{connector_id: id} = state),
-    do: {:noreply, consume(state)}
+    do: {:noreply, resume(%{state | bound: true})}
 
   def handle_info({:smpp_bind_lost, id, _reason}, %{connector_id: id} = state),
-    do: {:noreply, teardown(state)}
+    do: {:noreply, teardown(%{state | bound: false})}
 
   def handle_info({:DOWN, ref, :process, _, _}, %{mon: ref} = state),
-    do: {:noreply, reset(state)}
+    do: {:noreply, recover_down(state)}
 
   def handle_info({:basic_deliver, _payload, _meta} = delivery, %{inflight: nil} = state),
-    do: {:noreply, dispatch(%{state | inflight: delivery})}
+    do: {:noreply, dispatch(%{state | inflight: delivery, phase: :pre_submit})}
 
   def handle_info(_, state), do: {:noreply, state}
 
   @impl true
-  def terminate(_, state), do: teardown(state)
+  def terminate(_, state), do: state |> settle_before_close() |> close_if_open()
 
   defp consume(%{channel: ch} = state) when not is_nil(ch), do: state
 
@@ -76,19 +78,55 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
 
   defp teardown(%{channel: nil} = state), do: state
 
-  defp teardown(%{client: client, channel: ch, mon: mon, consumer_tag: tag} = state) do
-    state = settle_classified(state)
+  defp teardown(state) do
+    state = settle_before_close(state)
 
     case state.inflight do
-      {:classified, _, _} ->
-        state
+      nil -> close_if_open(state)
+      _ -> state
+    end
+  end
+
+  defp resume(%{phase: :pre_submit} = state) do
+    state = dispatch(state)
+    if is_nil(state.inflight), do: state |> close_if_open() |> consume(), else: state
+  end
+
+  defp resume(state), do: consume(state)
+
+  defp settle_before_close(%{phase: :pre_submit} = state), do: state
+
+  defp settle_before_close(%{inflight: {:basic_deliver, payload, meta}} = state) do
+    case Envelope.decode(payload) do
+      {:ok, envelope} -> recover_unclassified(state, envelope, meta)
+      {:error, _} -> finish(state, :reject, meta)
+    end
+  end
+
+  defp settle_before_close(state), do: settle_classified(state)
+
+  defp recover_unclassified(state, envelope, meta) do
+    case persist_dispatching(state, envelope) do
+      :ok ->
+        settle_quarantine(state, envelope, meta, evidence(envelope, :post_write, :bind_lost))
 
       _ ->
-        if is_reference(mon), do: Process.demonitor(mon, [:flush])
-        if is_binary(tag), do: client.cancel(ch, tag)
-        _ = client.close_channel(ch)
-        reset(state)
+        state
     end
+  end
+
+  defp recover_down(state) do
+    state = %{state | channel: nil, mon: nil, consumer_tag: nil, inflight: nil, phase: :idle}
+    if state.bound, do: consume(state), else: state
+  end
+
+  defp close_if_open(%{channel: nil} = state), do: state
+
+  defp close_if_open(%{client: client, channel: ch, mon: mon, consumer_tag: tag} = state) do
+    if is_reference(mon), do: Process.demonitor(mon, [:flush])
+    if is_binary(tag), do: client.cancel(ch, tag)
+    _ = client.close_channel(ch)
+    %{state | channel: nil, mon: nil, consumer_tag: nil}
   end
 
   defp dispatch(%{inflight: {:basic_deliver, payload, meta}} = state) do
@@ -101,6 +139,7 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
   defp dispatch_valid(state, envelope, meta) do
     with true <- dispatchable?(state),
          :ok <- persist_dispatching(state, envelope) do
+      state = %{state | phase: :submit_attempted}
       classify(state, envelope, meta, state.submit.(envelope))
     else
       _ -> state
@@ -113,10 +152,13 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
 
   defp dispatchable?(_state), do: false
 
-  defp persist_dispatching(%{store: store, config: config}, envelope) do
+  defp persist_dispatching(%{store: {module, _} = store, config: config}, envelope)
+       when is_atom(module) do
     record = SettlementJournal.dispatching(envelope.gateway_id, envelope.attempt)
     StateStoreJournal.write(store, record, config.default_expiry_ms)
   end
+
+  defp persist_dispatching(_state, _envelope), do: {:error, :unavailable}
 
   defp classify(state, _envelope, meta, {:ok, _id}), do: finish(state, :ack, meta)
 
@@ -220,20 +262,20 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
 
   defp settle_classified(%{inflight: {:classified, decision, meta}} = state) do
     case apply_settle(state, decision, meta) do
-      :ok -> %{state | inflight: nil}
+      :ok -> %{state | inflight: nil, phase: :idle}
       _ -> state
     end
   end
 
   defp settle_classified(state), do: state
 
+  defp apply_settle(%{channel: nil}, _decision, _meta), do: {:error, :channel_closed}
+
   defp apply_settle(%{client: client, channel: ch}, :ack, %{delivery_tag: tag}),
     do: client.ack(ch, tag)
 
   defp apply_settle(%{client: client, channel: ch}, :reject, %{delivery_tag: tag}),
     do: client.reject(ch, tag, requeue: false)
-
-  defp reset(state), do: %{state | channel: nil, mon: nil, consumer_tag: nil, inflight: nil}
 
   defp queue(state), do: state.config.queue_prefix <> "." <> state.connector_id
 

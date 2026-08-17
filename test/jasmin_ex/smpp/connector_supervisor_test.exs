@@ -3,11 +3,14 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
   use ExUnit.Case, async: false
 
   alias JasminEx.Application
+  alias JasminEx.Messaging.RabbitMQ.Config, as: MessagingConfig
+  alias JasminEx.Messaging.RabbitMQ.Connection
   alias JasminEx.Smpp.Client
   alias JasminEx.Smpp.ConnectorSupervisor
   alias JasminEx.Smpp.ConnectorSupervisor.Instance
   alias JasminEx.Smpp.FakeSMSC
   alias JasminEx.Smpp.PDU.Body
+  alias JasminEx.StateStore.Redix, as: StateStoreRedix
 
   @invalid_connectors_message "invalid SMPP connector configuration: expected [], one non-empty keyword connector configuration, or a list of non-empty keyword connector configurations"
 
@@ -16,6 +19,52 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
     assert %{intensity: 3, period: 5, strategy: :one_for_one} = flags
     assert child.restart == :transient
     assert child.start == {Client, :start_link, [connector_config(1111)]}
+  end
+
+  test "starts a connector worker after the client when messaging is enabled" do
+    opts = Keyword.put(connector_config(1111), :messaging, enabled_messaging())
+    assert {:ok, {_flags, [client, worker]}} = Instance.init(opts)
+    assert client.id == :smpp_client
+    assert {Instance, :start_client, [client_opts, "connector-1111"]} = client.start
+    assert client_opts == connector_config(1111)
+    assert worker.id == :connector_worker
+    assert {Instance, :start_worker, [worker_opts, "connector-1111"]} = worker.start
+    assert worker_opts[:connection_server] == Connection
+
+    assert %MessagingConfig{host: "broker.example", queue_prefix: "jasmin.work"} =
+             worker_opts[:config]
+  end
+
+  test "omits the connector worker when messaging is disabled" do
+    opts = Keyword.put(connector_config(1111), :messaging, enabled: false)
+    assert {:ok, {_flags, [client]}} = Instance.init(opts)
+    assert client.id == :smpp_client
+    assert client.start == {Client, :start_link, [connector_config(1111)]}
+  end
+
+  test "a real client bind notification drives the supervised worker bound" do
+    {:ok, conn} = __MODULE__.StubConnection.start()
+    {:ok, port, smsc} = FakeSMSC.start_link()
+
+    {:ok, inst} =
+      Instance.start_link(Keyword.put(connector_config(port), :messaging, enabled_messaging()))
+
+    assert :ok = wait_until(fn -> live_bound?(inst) end)
+    client = child_pid(inst, :smpp_client)
+    worker = child_pid(inst, :connector_worker)
+    worker_state = :sys.get_state(worker)
+    assert {StateStoreRedix, %{connection: JasminEx.StateStore.Connection}} = worker_state.store
+    assert is_function(worker_state.submit, 1) and is_function(worker_state.republish, 1)
+    Process.exit(worker, :kill)
+
+    assert :ok =
+             wait_until(fn ->
+               child_pid(inst, :connector_worker) != worker and live_bound?(inst)
+             end)
+
+    assert child_pid(inst, :smpp_client) == client
+    assert __MODULE__.StubConnection.gets() == 2
+    Enum.each([inst, conn, smsc], &GenServer.stop/1)
   end
 
   test "normalizes zero, one, and multiple connector configurations" do
@@ -234,6 +283,25 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
              Application.children(smpp_connectors: [[]])
   end
 
+  defmodule StubConnection do
+    use GenServer
+    def start, do: GenServer.start(__MODULE__, 0, name: Connection)
+    def gets, do: GenServer.call(Connection, :gets)
+    def init(calls), do: {:ok, calls}
+    def handle_call(:get, _, calls), do: {:reply, {:error, :disconnected}, calls + 1}
+    def handle_call(:gets, _, calls), do: {:reply, calls, calls}
+  end
+
+  defp enabled_messaging do
+    [
+      enabled: true,
+      host: "broker.example",
+      username: "app",
+      password: "secret",
+      queue_prefix: "jasmin.work"
+    ]
+  end
+
   defp connector_config(port) do
     [
       connector_id: "connector-#{port}",
@@ -249,6 +317,11 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
       reconnect_cap_ms: 5,
       reconnect_jitter: false
     ]
+  end
+
+  defp live_bound?(inst) do
+    Client.status(child_pid(inst, :smpp_client)) == :bound and
+      :sys.get_state(child_pid(inst, :connector_worker)).bound
   end
 
   defp child_pid(supervisor, id) do
