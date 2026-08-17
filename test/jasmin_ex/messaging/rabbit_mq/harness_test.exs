@@ -124,4 +124,92 @@ defmodule JasminEx.Messaging.RabbitMQ.HarnessTest do
     assert helper =~ ~s[Code.require_file("test/support/rabbit_mq_harness.ex")]
     assert helper =~ "exclude: [:compatibility, :integration]"
   end
+
+  test "does not reserve an ephemeral listen port before compose start" do
+    harness = RabbitMQHarness.new()
+    assert harness.port == 0
+  end
+
+  test "discovers the published port from compose after start" do
+    parent = self()
+
+    cmd = fn _executable, args, _opts ->
+      send(parent, {:cmd, args})
+
+      if "port" in args do
+        {"127.0.0.1:45123\n", 0}
+      else
+        {"", 0}
+      end
+    end
+
+    harness = RabbitMQHarness.new(cmd: cmd)
+    assert :ok = RabbitMQHarness.start!(harness)
+    assert RabbitMQHarness.port(harness) == 45_123
+
+    assert_received {:cmd, up_args}
+    assert "up" in up_args
+    assert_received {:cmd, port_args}
+
+    assert port_args == [
+             "compose",
+             "--project-name",
+             harness.project,
+             "--file",
+             "compose.rabbitmq.yml",
+             "port",
+             "rabbitmq",
+             "5672"
+           ]
+  end
+
+  test "includes compose output and exit status when a command fails" do
+    cmd = fn _executable, args, _opts ->
+      if "up" in args do
+        {"bind failed on published port", 17}
+      else
+        {"", 0}
+      end
+    end
+
+    harness = RabbitMQHarness.new(cmd: cmd)
+
+    error =
+      assert_raise RuntimeError, fn ->
+        RabbitMQHarness.start!(harness)
+      end
+
+    assert error.message =~ "exit 17"
+    assert error.message =~ "bind failed on published port"
+  end
+
+  test "restarts the broker and waits until it is healthy" do
+    parent = self()
+
+    cmd = fn _executable, args, _opts ->
+      send(parent, {:cmd, args})
+      {"", 0}
+    end
+
+    harness = RabbitMQHarness.new(cmd: cmd)
+    assert :ok = RabbitMQHarness.restart!(harness)
+    assert :ok = RabbitMQHarness.wait!(harness)
+
+    assert_received {:cmd, restart_args}
+    assert "restart" in restart_args
+    assert_received {:cmd, wait_args}
+
+    assert wait_args == [
+             "compose",
+             "--project-name",
+             harness.project,
+             "--file",
+             "compose.rabbitmq.yml",
+             "up",
+             "--wait"
+           ]
+
+    assert_received {:cmd, second_wait_args}
+    assert second_wait_args == wait_args
+  end
 end
