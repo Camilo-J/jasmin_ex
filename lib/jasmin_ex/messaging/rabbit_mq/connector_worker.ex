@@ -137,12 +137,34 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
   end
 
   defp dispatch_valid(state, envelope, meta) do
-    with true <- dispatchable?(state),
-         :ok <- persist_dispatching(state, envelope) do
-      state = %{state | phase: :submit_attempted}
-      classify(state, envelope, meta, state.submit.(envelope))
+    if dispatchable?(state) do
+      case StateStoreJournal.read(state.store, envelope.gateway_id, envelope.attempt) do
+        :missing -> submit_fresh(state, envelope, meta)
+        {:ok, record} -> settle_recorded(state, envelope, meta, record)
+        _ -> state
+      end
     else
-      _ -> state
+      state
+    end
+  end
+
+  defp submit_fresh(state, envelope, meta) do
+    case persist_dispatching(state, envelope) do
+      :ok ->
+        classify(%{state | phase: :submit_attempted}, envelope, meta, state.submit.(envelope))
+
+      _ ->
+        state
+    end
+  end
+
+  defp settle_recorded(state, envelope, meta, record) do
+    case SettlementJournal.redelivery_directive(record) do
+      {:retry, evidence} ->
+        settle_retry(state, envelope, meta, evidence_from(evidence, envelope))
+
+      {:quarantine, evidence} ->
+        settle_quarantine(state, envelope, meta, evidence_from(evidence, envelope))
     end
   end
 
@@ -215,9 +237,16 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
 
   defp persist_outcome(%{store: store, config: config}, envelope, journal_state, evidence) do
     with {:ok, record} <- StateStoreJournal.read(store, envelope.gateway_id, envelope.attempt),
-         {:ok, recorded} <-
-           SettlementJournal.record_outcome(record, {journal_state, evidence}) do
+         {:ok, recorded} <- keep_or_record(record, {journal_state, evidence}) do
       StateStoreJournal.write(store, recorded, config.default_expiry_ms)
+    end
+  end
+
+  defp keep_or_record(record, outcome) do
+    case SettlementJournal.record_outcome(record, outcome) do
+      {:ok, recorded} -> {:ok, recorded}
+      {:error, :outcome_already_recorded} -> {:ok, record}
+      other -> other
     end
   end
 
@@ -244,9 +273,13 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
   end
 
   defp evidence(envelope, stage, reason) do
+    evidence_from(%{stage: stage, reason: reason}, envelope)
+  end
+
+  defp evidence_from(evidence, envelope) when is_map(evidence) do
     %{
-      stage: stage,
-      reason: normalize_reason(reason),
+      stage: normalize_stage(evidence[:stage] || evidence["stage"]),
+      reason: normalize_reason(evidence[:reason] || evidence["reason"]),
       gateway_id: envelope.gateway_id,
       connector_id: envelope.connector_id,
       source_addr: envelope.submit_sm.source_addr,
@@ -254,7 +287,21 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
     }
   end
 
+  defp normalize_stage(stage) when stage in [:pre_write, "pre_write"], do: :pre_write
+  defp normalize_stage(_stage), do: :post_write
+
+  @reasons %{
+    "bind_lost" => :bind_lost,
+    "disconnected" => :disconnected,
+    "outcome_already_recorded" => :outcome_already_recorded,
+    "response_timeout" => :response_timeout,
+    "unbinding" => :unbinding,
+    "uncertain" => :uncertain,
+    "unresolved_dispatch" => :unresolved_dispatch
+  }
+
   defp normalize_reason(reason) when is_atom(reason), do: reason
+  defp normalize_reason(reason) when is_binary(reason), do: Map.get(@reasons, reason, :uncertain)
   defp normalize_reason(_reason), do: :uncertain
 
   defp finish(state, decision, meta),
