@@ -639,15 +639,30 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     stop_pair(alpha, beta, agent)
   end
 
-  test "channel down replaces stale classified work and accepts redelivery", %{config: config} do
+  test "channel down replaces stale classified work and quarantines unresolved redelivery", %{
+    config: config
+  } do
     {store, _} = journal_store()
+    test = self()
 
     {worker, agent} =
-      start_bound(config, "alpha", [store: store, submit: fn _ -> {:ok, "smsc-ok"} end], :ack)
+      start_bound(
+        config,
+        "alpha",
+        fn agent ->
+          [
+            store: store,
+            submit: fn env -> send(test, {:submitted, env}) && {:ok, "smsc-ok"} end,
+            republish: republish_ok(agent)
+          ]
+        end,
+        :ack
+      )
 
     {_envelope, payload} = valid_payload(%{gateway_id: "gw-down-classified"})
     assert :ok = Fake.deliver(agent, payload)
     assert {:classified, :ack, %{delivery_tag: 1}} = ConnectorWorker.inflight(worker)
+    assert_received {:submitted, %{gateway_id: "gw-down-classified"}}
     pid = Fake.channel_pid(agent, 1)
     ref = Process.monitor(pid)
     Process.exit(pid, :kill)
@@ -661,6 +676,11 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     assert {:classified, :ack, %{delivery_tag: 2, redelivered: true}} =
              ConnectorWorker.inflight(worker)
 
+    refute_received {:submitted, _}
+    events = Fake.events(agent)
+    assert {:republish, {:quarantine, env, evidence}} = find(events, :republish)
+    assert env.gateway_id == "gw-down-classified"
+    assert evidence.reason == :unresolved_dispatch
     stop(worker, agent)
   end
 
