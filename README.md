@@ -96,6 +96,7 @@ Operations owns disposition. Retain with no TTL, replay, or automatic purge.
 |---|---|---|
 | Fake / unit | `mix test` | Contract and adapter logic. Ordinary tests are not broker proof. |
 | Integration | `mix test --include integration test/jasmin_ex/messaging/rabbit_mq/integration_test.exs` | Pinned RabbitMQ durable/restart path. |
+| CI | GitHub job `rabbitmq-4-3-4` | Pinned durable/restart evidence in a separate job; must not start Valkey, Redis, or Dragonfly. Not an environment fitness claim. |
 
 Required baseline metrics: connector count, rate, payload, backlog, latency,
 CPU, memory, alarms, confirms, redeliveries, and recovery. The measurement
