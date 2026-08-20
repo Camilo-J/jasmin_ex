@@ -51,4 +51,53 @@ These pinned Redis and Dragonfly runs evidence only the tested portable binary
 fetch, expiring put, delete, authentication, outage/reconnect, and TTL
 scenarios. They do not claim universal compatibility. TLS integration remains
 deferred. This change does not add pools, Cluster, Sentinel, provider adapters,
-DLR/schema/workflow changes, or non-expiring writes.
+DLR/schema/workflow changes, or non-expiring writes. RabbitMQ messaging uses a
+separate compose file and must not start Valkey, Redis, or Dragonfly.
+
+## RabbitMQ messaging operator runbook
+
+Messaging defaults to disabled. Do not claim environment fitness until the
+pinned durable/restart harness retains a complete metric baseline.
+
+### Quick path
+
+1. Leave `:messaging` at `enabled: false` until the baseline is complete.
+2. Run the pinned RabbitMQ durable/restart harness.
+3. Confirm every required metric was retained with that run. A missing metric
+   is incomplete validation — never invent t2.micro fitness or thresholds.
+
+### Enable / disable
+
+| Setting | Effect |
+|---|---|
+| `enabled: false` (default) | No publisher or consumer starts. |
+| `enabled: true` plus validated AMQP options | Supervises the shared connection and publisher. |
+
+### Topology names
+
+| Queue | Name |
+|---|---|
+| Work | `jasmin.work.<connector_id>` |
+| Quarantine | `jasmin.work.<connector_id>.quarantine` |
+
+### Quarantine ownership
+
+Operations owns disposition. Retain with no TTL, replay, or automatic purge.
+
+### Rollback
+
+1. Disable publish and consume (`enabled: false`).
+2. Drain or quarantine in-flight work.
+3. Keep queues and the evidence journal.
+
+### Evidence
+
+| Kind | Command | What it proves |
+|---|---|---|
+| Fake / unit | `mix test` | Contract and adapter logic. Ordinary tests are not broker proof. |
+| Integration | `mix test --include integration test/jasmin_ex/messaging/rabbit_mq/integration_test.exs` | Pinned RabbitMQ durable/restart path. |
+
+Required baseline metrics: connector count, rate, payload, backlog, latency,
+CPU, memory, alarms, confirms, redeliveries, and recovery. The measurement
+helper records those values with the run. Missing metrics remain incomplete
+validation and forbid any fitness claim.

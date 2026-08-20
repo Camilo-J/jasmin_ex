@@ -37,6 +37,21 @@ defmodule JasminEx.Messaging.RabbitMQ.IntegrationTest do
     assert {:ok, _} = Client.consume(ch, queue, collector, no_ack: false)
     assert {:basic_deliver, ^payload, meta} = await_deliver(collector)
     assert meta.persistent == true
+
+    recorded =
+      RabbitMQHarness.record_durable_restart(harness, %{
+        confirm: :ok,
+        payload: byte_size(payload),
+        recovery: :passed,
+        connector_count: 1
+      })
+
+    assert recorded.measurement.run.image == harness.image
+    assert recorded.measurement.run.project == harness.project
+    assert recorded.measurement.baseline.payload == byte_size(payload)
+    assert recorded.measurement.validation == :incomplete
+    assert recorded.measurement.fitness_claim == false
+
     _ = Client.close_connection(conn)
   end
 

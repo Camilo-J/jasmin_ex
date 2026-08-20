@@ -33,6 +33,21 @@ defmodule JasminEx.RabbitMQHarness do
     wait!(harness)
   end
 
+  def record_durable_restart(harness, observations) when is_map(observations) do
+    report =
+      JasminEx.RabbitMQMeasurements.record(
+        %{
+          path: :durable_restart,
+          broker: :pinned,
+          image: harness.image,
+          project: harness.project
+        },
+        observations
+      )
+
+    Map.put(harness, :measurement, report)
+  end
+
   def wait!(harness), do: run!(harness, ["up", "--wait"])
 
   def port(harness) do
