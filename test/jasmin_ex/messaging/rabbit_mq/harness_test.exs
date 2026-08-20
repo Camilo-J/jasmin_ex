@@ -212,4 +212,50 @@ defmodule JasminEx.Messaging.RabbitMQ.HarnessTest do
     assert_received {:cmd, second_wait_args}
     assert second_wait_args == wait_args
   end
+
+  test "records durable restart measurements with the harness run identity" do
+    cmd = fn _executable, _args, _opts -> {"", 0} end
+    harness = RabbitMQHarness.new(cmd: cmd)
+
+    observations = %{
+      confirm: :ok,
+      payload: 18,
+      recovery: :passed,
+      connector_count: 1
+    }
+
+    recorded = RabbitMQHarness.record_durable_restart(harness, observations)
+
+    assert recorded.measurement.run == %{
+             path: :durable_restart,
+             broker: :pinned,
+             image: harness.image,
+             project: harness.project
+           }
+
+    assert recorded.measurement.baseline == observations
+    assert recorded.measurement.validation == :incomplete
+    assert recorded.measurement.fitness_claim == false
+    assert recorded.image == harness.image
+    assert recorded.project == harness.project
+    refute inspect(recorded.measurement) =~ "t2.micro"
+  end
+
+  test "durable restart recording omits unobserved metrics and forbids fitness" do
+    cmd = fn _executable, _args, _opts -> {"", 0} end
+    harness = RabbitMQHarness.new(cmd: cmd)
+    recorded = RabbitMQHarness.record_durable_restart(harness, %{confirm: :ok})
+
+    assert recorded.measurement.validation == :incomplete
+    assert recorded.measurement.fitness_claim == false
+    assert :confirm not in recorded.measurement.missing
+    assert :cpu in recorded.measurement.missing
+    assert :recovery in recorded.measurement.missing
+  end
+
+  test "integration durable restart path records measurements from the run" do
+    source = File.read!("test/jasmin_ex/messaging/rabbit_mq/integration_test.exs")
+    assert source =~ "record_durable_restart"
+    refute source =~ "complete_baseline"
+  end
 end
