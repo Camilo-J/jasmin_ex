@@ -3,7 +3,7 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
   use GenServer
 
   alias JasminEx.Messaging.{Envelope, SettlementJournal, StateStoreJournal}
-  alias JasminEx.Messaging.RabbitMQ.Connection
+  alias JasminEx.Messaging.RabbitMQ.{Connection, Telemetry}
 
   def start_link(opts),
     do: GenServer.start_link(__MODULE__, opts, name_opts(Keyword.get(opts, :name, __MODULE__)))
@@ -46,8 +46,13 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
   def handle_info({:DOWN, ref, :process, _, _}, %{mon: ref} = state),
     do: {:noreply, recover_down(state)}
 
-  def handle_info({:basic_deliver, _payload, _meta} = delivery, %{inflight: nil} = state),
-    do: {:noreply, dispatch(%{state | inflight: delivery, phase: :pre_submit})}
+  def handle_info({:basic_deliver, _payload, meta} = delivery, %{inflight: nil} = state) do
+    if meta[:redelivered] do
+      Telemetry.emit([:redelivery], %{}, %{connector_id: state.connector_id, redelivered: true})
+    end
+
+    {:noreply, dispatch(%{state | inflight: delivery, phase: :pre_submit})}
+  end
 
   def handle_info(_, state), do: {:noreply, state}
 
@@ -68,6 +73,8 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
   defp consume_opened(state, ch) do
     with :ok <- state.client.qos(ch, prefetch_count: 1),
          {:ok, tag} <- state.client.consume(ch, queue(state), self(), no_ack: false) do
+      Telemetry.emit([:channel, :up], %{}, %{role: :consumer, connector_id: state.connector_id})
+      Telemetry.emit([:consumer, :started], %{}, %{connector_id: state.connector_id})
       %{state | channel: ch, mon: Process.monitor(ch.pid), consumer_tag: tag}
     else
       _ ->
@@ -123,6 +130,11 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
   defp close_if_open(%{channel: nil} = state), do: state
 
   defp close_if_open(%{client: client, channel: ch, mon: mon, consumer_tag: tag} = state) do
+    if is_binary(tag) do
+      Telemetry.emit([:consumer, :stopped], %{}, %{connector_id: state.connector_id})
+      Telemetry.emit([:channel, :down], %{}, %{role: :consumer, connector_id: state.connector_id})
+    end
+
     if is_reference(mon), do: Process.demonitor(mon, [:flush])
     if is_binary(tag), do: client.cancel(ch, tag)
     _ = client.close_channel(ch)
@@ -182,10 +194,10 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
 
   defp persist_dispatching(_state, _envelope), do: {:error, :unavailable}
 
-  defp classify(state, _envelope, meta, {:ok, _id}), do: finish(state, :ack, meta)
+  defp classify(state, envelope, meta, {:ok, _id}), do: finish(state, :ack, meta, envelope)
 
-  defp classify(state, _envelope, meta, {:error, {:submit_rejected, _reason}}),
-    do: finish(state, :reject, meta)
+  defp classify(state, envelope, meta, {:error, {:submit_rejected, _reason}}),
+    do: finish(state, :reject, meta, envelope)
 
   defp classify(state, envelope, meta, {:error, reason})
        when reason in [:disconnected, :unbinding],
@@ -221,7 +233,8 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
     with :ok <- persist_outcome(state, envelope, journal_state, evidence),
          {:ok, action} <- fun.(envelope, evidence),
          :ok <- republish.(action) do
-      finish(state, :ack, meta)
+      emit_action(state, action, envelope)
+      finish(state, :ack, meta, envelope)
     else
       _ -> state
     end
@@ -304,8 +317,37 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
   defp normalize_reason(reason) when is_binary(reason), do: Map.get(@reasons, reason, :uncertain)
   defp normalize_reason(_reason), do: :uncertain
 
-  defp finish(state, decision, meta),
-    do: settle_classified(%{state | inflight: {:classified, decision, meta}})
+  defp emit_action(state, {:retry, _next}, envelope) do
+    Telemetry.emit([:retry], %{}, %{
+      connector_id: state.connector_id,
+      gateway_id: envelope.gateway_id,
+      attempt: envelope.attempt
+    })
+  end
+
+  defp emit_action(state, {:quarantine, _envelope, _evidence}, envelope) do
+    age_ms = Telemetry.age_ms(envelope)
+    depth = observed_depth(state)
+    ids = %{connector_id: state.connector_id, gateway_id: envelope.gateway_id}
+    meta = Telemetry.quarantine_meta(state.config, depth, age_ms, ids)
+    Telemetry.emit([:quarantine], %{depth: depth, age_ms: age_ms}, meta)
+  end
+
+  defp observed_depth(%{channel: nil}), do: 0
+
+  defp observed_depth(state) do
+    case state.client.declare_queue(state.channel, queue(state) <> ".quarantine", durable: true) do
+      {:ok, %{message_count: n}} when is_integer(n) -> n
+      _ -> 0
+    end
+  end
+
+  defp finish(state, decision, meta, envelope \\ nil) do
+    extras = %{decision: decision, connector_id: state.connector_id}
+    extras = if envelope, do: Map.put(extras, :gateway_id, envelope.gateway_id), else: extras
+    Telemetry.emit([:settlement], %{}, extras)
+    settle_classified(%{state | inflight: {:classified, decision, meta}})
+  end
 
   defp settle_classified(%{inflight: {:classified, decision, meta}} = state) do
     case apply_settle(state, decision, meta) do

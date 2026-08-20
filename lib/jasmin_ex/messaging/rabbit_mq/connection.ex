@@ -2,7 +2,7 @@ defmodule JasminEx.Messaging.RabbitMQ.Connection do
   @moduledoc false
   use GenServer
 
-  alias JasminEx.Messaging.RabbitMQ.Config
+  alias JasminEx.Messaging.RabbitMQ.{Config, Telemetry}
 
   def start_link(opts),
     do: GenServer.start_link(__MODULE__, opts, name_opts(Keyword.get(opts, :name, __MODULE__)))
@@ -18,7 +18,8 @@ defmodule JasminEx.Messaging.RabbitMQ.Connection do
       client_opts: Keyword.get(opts, :client_opts, []),
       backoff_ms: Keyword.get(opts, :reconnect_backoff_ms, 250),
       connection: nil,
-      monitor: nil
+      monitor: nil,
+      recovering: false
     }
 
     {:ok, connect(state)}
@@ -35,8 +36,9 @@ defmodule JasminEx.Messaging.RabbitMQ.Connection do
 
   @impl true
   def handle_info({:DOWN, ref, :process, _, _}, %{monitor: ref} = state) do
+    Telemetry.emit([:connection, :down], %{}, Telemetry.connection_meta(state.config))
     Process.send_after(self(), :reconnect, state.backoff_ms)
-    {:noreply, %{state | connection: nil, monitor: nil}}
+    {:noreply, %{state | connection: nil, monitor: nil, recovering: true}}
   end
 
   def handle_info(:reconnect, %{connection: nil} = state), do: {:noreply, connect(state)}
@@ -52,7 +54,11 @@ defmodule JasminEx.Messaging.RabbitMQ.Connection do
 
     case state.client.open_connection(opts) do
       {:ok, conn} ->
-        %{state | connection: conn, monitor: Process.monitor(state.client.connection_pid(conn))}
+        meta = Telemetry.connection_meta(state.config)
+        if state.recovering, do: Telemetry.emit([:recovery], %{}, meta)
+        Telemetry.emit([:connection, :up], %{}, meta)
+        mon = Process.monitor(state.client.connection_pid(conn))
+        %{state | connection: conn, monitor: mon, recovering: false}
 
       {:error, _} ->
         Process.send_after(self(), :reconnect, state.backoff_ms)
