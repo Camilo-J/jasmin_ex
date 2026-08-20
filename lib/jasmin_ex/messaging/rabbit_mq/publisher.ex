@@ -2,7 +2,7 @@ defmodule JasminEx.Messaging.RabbitMQ.Publisher do
   @moduledoc false
   use GenServer
 
-  alias JasminEx.Messaging.RabbitMQ.Connection
+  alias JasminEx.Messaging.RabbitMQ.{Connection, Telemetry}
 
   def start_link(opts),
     do: GenServer.start_link(__MODULE__, opts, name_opts(Keyword.get(opts, :name, __MODULE__)))
@@ -54,7 +54,14 @@ defmodule JasminEx.Messaging.RabbitMQ.Publisher do
 
     with {:ok, _} <- client.declare_queue(ch, queue, durable: true),
          :ok <- client.publish(ch, "", queue, payload, persistent: true) do
-      case client.wait_for_confirms(ch, state.config.confirm_timeout_ms) do
+      started = System.monotonic_time(:millisecond)
+      confirm = client.wait_for_confirms(ch, state.config.confirm_timeout_ms)
+      latency_ms = max(System.monotonic_time(:millisecond) - started, 0)
+      result = Telemetry.confirm_result(confirm)
+      meta = %{result: result, connector_id: connector_id}
+      Telemetry.emit([:confirm], %{latency_ms: latency_ms}, meta)
+
+      case confirm do
         true -> {:ok, state}
         false -> {{:error, :nack}, state}
         :timeout -> {{:error, :timeout}, state}
@@ -76,6 +83,7 @@ defmodule JasminEx.Messaging.RabbitMQ.Publisher do
          {:ok, ch} <- state.client.open_channel(conn) do
       case state.client.select_confirms(ch) do
         :ok ->
+          Telemetry.emit([:channel, :up], %{}, %{role: :publisher})
           %{state | channel: ch, mon: Process.monitor(ch.pid)}
 
         _ ->

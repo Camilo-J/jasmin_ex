@@ -69,6 +69,8 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
       :ok
     end
 
+    def declare_queue(_, name, _), do: {:ok, %{queue: name, message_count: 0}}
+
     def qos(%{agent: agent, channel_id: id}, opts) do
       track(agent, {:qos, id, opts})
 
