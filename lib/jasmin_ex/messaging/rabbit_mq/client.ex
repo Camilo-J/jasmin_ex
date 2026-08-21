@@ -21,6 +21,10 @@ defmodule JasminEx.Messaging.RabbitMQ.Client do
   def close_channel(%{channel: ch}), do: AMQP.Channel.close(ch)
   def select_confirms(%{channel: ch}), do: AMQP.Confirm.select(ch)
 
+  @classic_queue_arguments [{"x-queue-type", :longstr, "classic"}]
+
+  def queue_declare_opts, do: [durable: true, arguments: @classic_queue_arguments]
+
   def declare_queue(%{channel: ch}, name, opts), do: AMQP.Queue.declare(ch, name, opts)
 
   def publish(%{channel: ch}, exchange, key, payload, opts),

@@ -73,11 +73,25 @@ defmodule JasminEx.Messaging.RabbitMQ.PublisherTest do
 
     events = Fake.events(agent)
     assert {:declare_queue, "jasmin.work.connector-a", opts} = find(events, :declare_queue)
-    assert opts[:durable] == true
+    assert_classic_queue(opts)
     assert {:publish, "", "jasmin.work.connector-a", "payload-1", popts} = find(events, :publish)
     assert popts[:persistent] == true
     assert find(events, :select_confirms)
     assert {:wait_for_confirms, 50} = find(events, :wait_for_confirms)
+    stop(pub, agent)
+  end
+
+  test "quarantine publication declares a durable classic queue", %{config: config} do
+    agent = Fake.start(%{wait_for_confirms: true})
+    {:ok, pub} = start(config, agent)
+    assert :ok = Publisher.publish(pub, "connector-a.quarantine", "payload-q")
+
+    events = Fake.events(agent)
+
+    assert {:declare_queue, "jasmin.work.connector-a.quarantine", opts} =
+             find(events, :declare_queue)
+
+    assert_classic_queue(opts)
     stop(pub, agent)
   end
 
@@ -109,6 +123,11 @@ defmodule JasminEx.Messaging.RabbitMQ.PublisherTest do
       connection: Fake.connection(agent),
       name: nil
     )
+  end
+
+  defp assert_classic_queue(opts) do
+    assert opts[:durable] == true
+    assert {"x-queue-type", :longstr, "classic"} in Keyword.get(opts, :arguments, [])
   end
 
   defp find(events, kind),

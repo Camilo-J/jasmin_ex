@@ -2,7 +2,7 @@ defmodule JasminEx.Messaging.RabbitMQ.Publisher do
   @moduledoc false
   use GenServer
 
-  alias JasminEx.Messaging.RabbitMQ.{Connection, Telemetry}
+  alias JasminEx.Messaging.RabbitMQ.{Client, Connection, Telemetry}
 
   def start_link(opts),
     do: GenServer.start_link(__MODULE__, opts, name_opts(Keyword.get(opts, :name, __MODULE__)))
@@ -52,7 +52,7 @@ defmodule JasminEx.Messaging.RabbitMQ.Publisher do
     ch = state.channel
     client = state.client
 
-    with {:ok, _} <- client.declare_queue(ch, queue, durable: true),
+    with {:ok, _} <- client.declare_queue(ch, queue, Client.queue_declare_opts()),
          :ok <- client.publish(ch, "", queue, payload, persistent: true) do
       started = System.monotonic_time(:millisecond)
       confirm = client.wait_for_confirms(ch, state.config.confirm_timeout_ms)

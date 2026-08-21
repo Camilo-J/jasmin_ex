@@ -69,7 +69,10 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
       :ok
     end
 
-    def declare_queue(_, name, _), do: {:ok, %{queue: name, message_count: 0}}
+    def declare_queue(%{agent: agent}, name, opts) do
+      track(agent, {:declare_queue, name, opts})
+      {:ok, %{queue: name, message_count: 0}}
+    end
 
     def qos(%{agent: agent, channel_id: id}, opts) do
       track(agent, {:qos, id, opts})
@@ -487,6 +490,12 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
       assert ConnectorWorker.inflight(worker) == nil
       events = Fake.events(agent)
       assert {:republish, {:quarantine, env, evidence}} = find(events, :republish)
+
+      assert {:declare_queue, "jasmin.work.alpha.quarantine", qopts} =
+               find(events, :declare_queue)
+
+      assert qopts[:durable] == true
+      assert {"x-queue-type", :longstr, "classic"} in Keyword.get(qopts, :arguments, [])
       assert env.gateway_id == "gw-q"
       assert evidence.stage == :post_write
       assert evidence.reason == reason
