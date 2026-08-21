@@ -3,7 +3,7 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
   use GenServer
 
   alias JasminEx.Messaging.{Envelope, SettlementJournal, StateStoreJournal}
-  alias JasminEx.Messaging.RabbitMQ.{Connection, Telemetry}
+  alias JasminEx.Messaging.RabbitMQ.{Client, Connection, Telemetry}
 
   def start_link(opts),
     do: GenServer.start_link(__MODULE__, opts, name_opts(Keyword.get(opts, :name, __MODULE__)))
@@ -336,7 +336,11 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
   defp observed_depth(%{channel: nil}), do: 0
 
   defp observed_depth(state) do
-    case state.client.declare_queue(state.channel, queue(state) <> ".quarantine", durable: true) do
+    case state.client.declare_queue(
+           state.channel,
+           queue(state) <> ".quarantine",
+           Client.queue_declare_opts()
+         ) do
       {:ok, %{message_count: n}} when is_integer(n) -> n
       _ -> 0
     end
