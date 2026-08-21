@@ -64,14 +64,32 @@ end
 defmodule JasminEx.Smpp.ConnectorSupervisor.LifecycleForwarder do
   @moduledoc false
   use GenServer
-  def name(id), do: :"jasmin_ex.lifecycle_forwarder.#{id}"
 
-  def locate(id, owner),
-    do: Process.whereis(name(id)) || elem(GenServer.start(__MODULE__, {id, owner}), 1)
+  def name(id), do: :"jasmin_ex.lifecycle_forwarder.#{id}"
+  def worker_name(id), do: :"jasmin_ex.connector_worker.#{id}"
+
+  def start_link(id, owner),
+    do: GenServer.start_link(__MODULE__, {id, owner}, name: name(id))
+
+  def locate(id, _owner) do
+    case Process.whereis(name(id)) do
+      pid when is_pid(pid) -> {:ok, pid}
+      nil -> {:error, :not_started}
+    end
+  end
 
   def init({id, owner}) do
-    Process.register(self(), name(id))
-    {:ok, {Process.monitor(owner), nil, []}}
+    worker =
+      case Process.whereis(worker_name(id)) do
+        pid when is_pid(pid) ->
+          Process.monitor(pid)
+          pid
+
+        nil ->
+          nil
+      end
+
+    {:ok, {Process.monitor(owner), worker, []}}
   end
 
   def handle_info({:worker, w}, {o, _, b}) do
@@ -110,7 +128,7 @@ defmodule JasminEx.Smpp.ConnectorSupervisor.Instance do
   def start_link(opts), do: Supervisor.start_link(__MODULE__, opts)
 
   def start_client(opts, id) do
-    Client.start_link(Keyword.put(opts, :lifecycle_notify, LifecycleForwarder.locate(id, self())))
+    Client.start_link(Keyword.put(opts, :lifecycle_notify, LifecycleForwarder.name(id)))
   end
 
   def start_worker(opts, id) do
@@ -127,9 +145,21 @@ defmodule JasminEx.Smpp.ConnectorSupervisor.Instance do
       republish: &WorkQueue.republish/1
     ]
 
-    {:ok, worker} = ok = ConnectorWorker.start_link(Keyword.merge(opts, dependencies))
-    send(LifecycleForwarder.locate(id, self()), {:worker, worker})
-    ok
+    case ConnectorWorker.start_link(Keyword.merge(opts, dependencies)) do
+      {:ok, worker} = ok ->
+        case LifecycleForwarder.locate(id, supervisor) do
+          {:ok, forwarder} ->
+            send(forwarder, {:worker, worker})
+            ok
+
+          {:error, reason} ->
+            GenServer.stop(worker)
+            {:error, reason}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
   @impl true
@@ -137,12 +167,31 @@ defmodule JasminEx.Smpp.ConnectorSupervisor.Instance do
     {messaging, client_opts} = Keyword.pop(opts, :messaging, messaging_config())
 
     Supervisor.init(
-      [client_child(client_opts, messaging) | worker_children(messaging, client_opts)],
+      forwarder_children(messaging, client_opts) ++
+        [client_child(client_opts, messaging) | worker_children(messaging, client_opts)],
       strategy: :one_for_one,
       max_restarts: 3,
       max_seconds: 5
     )
   end
+
+  defp forwarder_children(messaging, opts) when is_list(messaging) do
+    if Keyword.get(messaging, :enabled, false) do
+      [
+        %{
+          id: :lifecycle_forwarder,
+          start: {LifecycleForwarder, :start_link, [Config.new!(opts).connector_id, self()]},
+          restart: :permanent,
+          type: :worker,
+          modules: [LifecycleForwarder]
+        }
+      ]
+    else
+      []
+    end
+  end
+
+  defp forwarder_children(_messaging, _opts), do: []
 
   defp client_child(opts, messaging) do
     start =
@@ -172,6 +221,8 @@ defmodule JasminEx.Smpp.ConnectorSupervisor.Instance do
   defp worker_children(_messaging, _opts), do: []
 
   defp worker_child(messaging, opts) do
+    connector_id = Config.new!(opts).connector_id
+
     %{
       id: :connector_worker,
       start:
@@ -179,11 +230,11 @@ defmodule JasminEx.Smpp.ConnectorSupervisor.Instance do
          [
            [
              config: MessagingConfig.new!(messaging),
-             connector_id: Config.new!(opts).connector_id,
+             connector_id: connector_id,
              connection_server: Connection,
-             name: nil
+             name: LifecycleForwarder.worker_name(connector_id)
            ],
-           Config.new!(opts).connector_id
+           connector_id
          ]},
       restart: :transient,
       type: :worker,

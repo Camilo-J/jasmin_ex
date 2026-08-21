@@ -8,6 +8,7 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
   alias JasminEx.Smpp.Client
   alias JasminEx.Smpp.ConnectorSupervisor
   alias JasminEx.Smpp.ConnectorSupervisor.Instance
+  alias JasminEx.Smpp.ConnectorSupervisor.LifecycleForwarder
   alias JasminEx.Smpp.FakeSMSC
   alias JasminEx.Smpp.PDU.Body
   alias JasminEx.StateStore.Redix, as: StateStoreRedix
@@ -23,16 +24,118 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
 
   test "starts a connector worker after the client when messaging is enabled" do
     opts = Keyword.put(connector_config(1111), :messaging, enabled_messaging())
-    assert {:ok, {_flags, [client, worker]}} = Instance.init(opts)
+    assert {:ok, {_flags, [forwarder, client, worker]}} = Instance.init(opts)
+    assert forwarder.id == :lifecycle_forwarder
+    assert {LifecycleForwarder, :start_link, ["connector-1111", owner]} = forwarder.start
+    assert is_pid(owner)
+    assert forwarder.restart == :permanent
     assert client.id == :smpp_client
     assert {Instance, :start_client, [client_opts, "connector-1111"]} = client.start
     assert client_opts == connector_config(1111)
     assert worker.id == :connector_worker
     assert {Instance, :start_worker, [worker_opts, "connector-1111"]} = worker.start
+    assert worker_opts[:name] == LifecycleForwarder.worker_name("connector-1111")
     assert worker_opts[:connection_server] == Connection
 
     assert %MessagingConfig{host: "broker.example", queue_prefix: "jasmin.work"} =
              worker_opts[:config]
+  end
+
+  test "locate does not unsupervised-start or treat a start error as a pid" do
+    id = "missing-#{System.unique_integer([:positive])}"
+    name = LifecycleForwarder.name(id)
+
+    on_exit(fn ->
+      if pid = Process.whereis(name) do
+        Process.exit(pid, :kill)
+      end
+    end)
+
+    assert {:error, :not_started} = LifecycleForwarder.locate(id, self())
+    assert Process.whereis(name) == nil
+  end
+
+  test "locate returns the start_link pid when the forwarder is already running" do
+    id = "running-#{System.unique_integer([:positive])}"
+    assert {:ok, pid} = LifecycleForwarder.start_link(id, self())
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+    end)
+
+    assert {:ok, ^pid} = LifecycleForwarder.locate(id, self())
+    assert Process.whereis(LifecycleForwarder.name(id)) == pid
+  end
+
+  test "locate does not unsupervised-start or elem a start tuple" do
+    source = File.read!("lib/jasmin_ex/smpp/connector_supervisor.ex")
+    refute source =~ ~r/elem\(GenServer\.start/
+    refute source =~ ~r/GenServer\.start\(/
+
+    [forwarder_init | _] =
+      Regex.split(~r/defmodule JasminEx.Smpp.ConnectorSupervisor.Instance/, source)
+
+    refute forwarder_init =~ "Supervisor.which_children"
+  end
+
+  test "init reacquires a live named worker without a worker message" do
+    id = "rebind-#{System.unique_integer([:positive])}"
+    parent = self()
+
+    worker =
+      spawn(fn ->
+        Process.register(self(), LifecycleForwarder.worker_name(id))
+        send(parent, :registered)
+
+        receive do
+          message -> send(parent, {:got, message})
+        end
+      end)
+
+    on_exit(fn ->
+      if Process.alive?(worker), do: Process.exit(worker, :kill)
+    end)
+
+    assert_receive :registered, 100
+    assert {:ok, forwarder} = LifecycleForwarder.start_link(id, self())
+
+    on_exit(fn ->
+      if Process.alive?(forwarder), do: GenServer.stop(forwarder)
+    end)
+
+    send(forwarder, {:smpp_bind_lost, id, :tcp_closed})
+    assert_receive {:got, {:smpp_bind_lost, ^id, :tcp_closed}}, 100
+  end
+
+  test "init without a named worker still accepts a later worker message" do
+    id = "late-worker-#{System.unique_integer([:positive])}"
+    assert {:ok, forwarder} = LifecycleForwarder.start_link(id, self())
+
+    on_exit(fn ->
+      if Process.alive?(forwarder), do: GenServer.stop(forwarder)
+    end)
+
+    parent = self()
+
+    worker =
+      spawn(fn ->
+        send(parent, :ready)
+
+        receive do
+          message -> send(parent, {:got, message})
+        end
+      end)
+
+    on_exit(fn ->
+      if Process.alive?(worker), do: Process.exit(worker, :kill)
+    end)
+
+    assert_receive :ready, 100
+    send(forwarder, {:smpp_bind_lost, id, :tcp_closed})
+    refute_receive {:got, _}, 30
+    send(forwarder, {:worker, worker})
+    send(forwarder, {:smpp_bound, id, :initial})
+    assert_receive {:got, {:smpp_bound, ^id, :initial}}, 100
   end
 
   test "omits the connector worker when messaging is disabled" do
@@ -65,6 +168,54 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
     assert child_pid(inst, :smpp_client) == client
     assert __MODULE__.StubConnection.gets() == 2
     Enum.each([inst, conn, smsc], &GenServer.stop/1)
+  end
+
+  test "a surviving client keeps a repaired supervised forwarder" do
+    {:ok, conn} = __MODULE__.StubConnection.start()
+    {:ok, port, smsc} = FakeSMSC.start_link()
+    connector_id = "connector-#{port}"
+
+    {:ok, inst} =
+      Instance.start_link(Keyword.put(connector_config(port), :messaging, enabled_messaging()))
+
+    assert :ok = wait_until(fn -> live_bound?(inst) end)
+    client = child_pid(inst, :smpp_client)
+    worker = child_pid(inst, :connector_worker)
+    forwarder = child_pid(inst, :lifecycle_forwarder)
+    name = LifecycleForwarder.name(connector_id)
+    assert Process.whereis(name) == forwarder
+
+    Process.exit(forwarder, :kill)
+
+    assert :ok =
+             wait_until(fn ->
+               repaired = child_pid(inst, :lifecycle_forwarder)
+
+               is_pid(repaired) and repaired != forwarder and Process.whereis(name) == repaired
+             end)
+
+    assert child_pid(inst, :smpp_client) == client
+    assert Client.status(client) == :bound
+    assert {:ok, repaired} = LifecycleForwarder.locate(connector_id, inst)
+    assert repaired != forwarder
+    assert Process.whereis(name) == repaired
+
+    {_state, %{config: %{lifecycle_notify: ^name}}} = :sys.get_state(client)
+    assert child_pid(inst, :connector_worker) == worker
+    assert :sys.get_state(worker).bound
+
+    GenServer.stop(smsc)
+
+    assert :ok =
+             wait_until(fn ->
+               Process.alive?(client) and Process.alive?(worker) and
+                 child_pid(inst, :connector_worker) == worker and
+                 not :sys.get_state(worker).bound
+             end)
+
+    assert Process.alive?(client)
+    assert child_pid(inst, :smpp_client) == client
+    Enum.each([inst, conn], &GenServer.stop/1)
   end
 
   test "normalizes zero, one, and multiple connector configurations" do
