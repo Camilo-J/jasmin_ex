@@ -11,9 +11,9 @@ defmodule JasminEx.Smpp.Client do
       response lifecycle. Acceptance by the SMSC does not mean handset delivery.
     * `unbind/1` closes the session deliberately after an SMPP unbind exchange.
 
-  Optional `lifecycle_notify` is a pid that receives ordered session hooks
-  after a successful bind and after a later bind loss. Failed startup and
-  voluntary unbind do not emit these messages.
+  Optional `lifecycle_notify` is a pid or registered atom name that receives
+  ordered session hooks after a successful bind and after a later bind loss.
+  Failed startup and voluntary unbind do not emit these messages.
 
   ## Lifecycle states
 
@@ -55,11 +55,11 @@ defmodule JasminEx.Smpp.Client do
   and `:submit_send_failed`; raw socket and exception terms are never included.
   Initial state and voluntary unbind emit neither disconnect nor retry events.
 
-  When `lifecycle_notify` is a pid, a successful bind sends
-  `{:smpp_bound, connector_id, kind}` with `kind` `:initial` or `:reconnect`.
-  Involuntary loss of a bound session first replies to any in-flight submit,
-  then sends `{:smpp_bind_lost, connector_id, reason}` before reconnect
-  scheduling.
+  When `lifecycle_notify` is a pid or registered atom name, a successful bind
+  sends `{:smpp_bound, connector_id, kind}` with `kind` `:initial` or
+  `:reconnect`. Involuntary loss of a bound session first replies to any
+  in-flight submit, then sends `{:smpp_bind_lost, connector_id, reason}`
+  before reconnect scheduling.
   """
 
   require Logger
@@ -692,6 +692,14 @@ defmodule JasminEx.Smpp.Client do
 
   defp notify_lifecycle(%{config: %{lifecycle_notify: pid}}, message) when is_pid(pid),
     do: send(pid, message)
+
+  defp notify_lifecycle(%{config: %{lifecycle_notify: name}}, message)
+       when is_atom(name) and not is_nil(name) do
+    case Process.whereis(name) do
+      pid when is_pid(pid) -> send(pid, message)
+      nil -> :ok
+    end
+  end
 
   defp notify_lifecycle(_data, _message), do: :ok
 

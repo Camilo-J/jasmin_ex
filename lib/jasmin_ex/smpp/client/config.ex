@@ -36,7 +36,7 @@ defmodule JasminEx.Smpp.Client.Config do
           unbind_drain_timeout_ms: non_neg_integer(),
           reconnect: ReconnectPolicy.t(),
           deliver_handler: {module() | nil, term()},
-          lifecycle_notify: pid() | nil
+          lifecycle_notify: pid() | atom() | nil
         }
 
   @spec new!(keyword()) :: t()
@@ -65,10 +65,10 @@ defmodule JasminEx.Smpp.Client.Config do
     }
   end
 
-  defp lifecycle_notify!(notify) when is_pid(notify) or is_nil(notify), do: notify
+  defp lifecycle_notify!(notify) when is_pid(notify) or is_atom(notify), do: notify
 
   defp lifecycle_notify!(notify) do
-    raise ArgumentError, ":lifecycle_notify must be a pid or nil, got: #{inspect(notify)}"
+    raise ArgumentError, ":lifecycle_notify must be a pid, atom, or nil, got: #{inspect(notify)}"
   end
 
   defp connector_id!(opts) do

@@ -44,6 +44,13 @@ defmodule JasminEx.Smpp.Client.ConfigTest do
              Config.new!(Keyword.put(@required_opts, :lifecycle_notify, listener))
   end
 
+  test "accepts an atom lifecycle_notify name" do
+    assert %Config{lifecycle_notify: :jasmin_ex_lifecycle_forwarder} =
+             Config.new!(
+               Keyword.put(@required_opts, :lifecycle_notify, :jasmin_ex_lifecycle_forwarder)
+             )
+  end
+
   test "normalizes explicit values and deliver handler context" do
     opts =
       Keyword.merge(@required_opts,
@@ -141,21 +148,39 @@ defmodule JasminEx.Smpp.Client.ConfigTest do
                  fn -> Config.new!(unbind_drain_timeout_ms: -1) end
   end
 
-  test "rejects a non-pid lifecycle_notify" do
+  test "rejects a non-pid non-atom lifecycle_notify" do
     message = fn value ->
-      ":lifecycle_notify must be a pid or nil, got: #{inspect(value)}"
+      ":lifecycle_notify must be a pid, atom, or nil, got: #{inspect(value)}"
     end
 
-    for value <- ["listener", :self, 1] do
+    for value <- ["listener", 1] do
       assert_raise ArgumentError, message.(value), fn ->
         Config.new!(Keyword.put(@required_opts, :lifecycle_notify, value))
       end
     end
   end
 
+  test "Client docs do not describe lifecycle_notify as pid-only" do
+    refute client_moduledoc() =~ "is a pid that receives"
+  end
+
+  test "Client docs document atom lifecycle_notify names" do
+    docs = client_moduledoc()
+
+    refute docs =~ "When `lifecycle_notify` is a pid,"
+    assert docs =~ "pid or registered atom name"
+  end
+
   test "preserves malformed deliver handler failure behavior" do
     assert_raise FunctionClauseError, fn ->
       Config.new!(Keyword.put(@required_opts, :deliver_handler, __MODULE__))
     end
+  end
+
+  defp client_moduledoc do
+    source = File.read!("lib/jasmin_ex/smpp/client.ex")
+    [_prefix, rest] = String.split(source, ~s(@moduledoc """), parts: 2)
+    [moduledoc, _code] = String.split(rest, ~s("""), parts: 2)
+    moduledoc
   end
 end
