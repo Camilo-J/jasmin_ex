@@ -3,9 +3,12 @@ defmodule JasminEx.Routing do
   Public context for MT routing identity, eligibility, and resolution.
   """
 
+  alias JasminEx.Routing.ConnectorRef
   alias JasminEx.Routing.Credential
   alias JasminEx.Routing.Group
+  alias JasminEx.Routing.Routable
   alias JasminEx.Routing.Router
+  alias JasminEx.Routing.RouteTable
   alias JasminEx.Routing.State
   alias JasminEx.Routing.User
 
@@ -37,6 +40,16 @@ defmodule JasminEx.Routing do
       not group_enabled?(state, user.gid) -> {:error, :group_disabled}
       true -> {:ok, user}
     end
+  end
+
+  @spec resolve(GenServer.server(), Routable.t()) :: {:ok, ConnectorRef.t()} | {:error, :no_route}
+  def resolve(server, %Routable{} = routable) do
+    resolve_snapshot(Router.snapshot(server), routable)
+  end
+
+  @spec resolve_snapshot(State.t(), Routable.t()) :: {:ok, ConnectorRef.t()} | {:error, :no_route}
+  def resolve_snapshot(%State{routes: table}, %Routable{} = routable) do
+    RouteTable.resolve(table, routable)
   end
 
   defp group_enabled?(%{groups: groups}, gid), do: match?(%Group{enabled: true}, groups[gid])
