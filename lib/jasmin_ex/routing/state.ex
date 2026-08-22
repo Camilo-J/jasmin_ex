@@ -29,7 +29,7 @@ defmodule JasminEx.Routing.State do
       not Map.has_key?(state.groups, gid) ->
         {:error, :unknown_group}
 
-      username_taken?(state.users, username) ->
+      username_taken?(state.users, uid, username) ->
         {:error, :duplicate_username}
 
       true ->
@@ -58,6 +58,9 @@ defmodule JasminEx.Routing.State do
     {:ok, %{state | groups: groups, users: users}}
   end
 
-  defp username_taken?(users, username),
-    do: Enum.any?(users, fn {_uid, user} -> user.username == username end)
+  defp username_taken?(users, uid, username) do
+    Enum.any?(users, fn {existing_uid, user} ->
+      existing_uid != uid and user.username == username
+    end)
+  end
 end

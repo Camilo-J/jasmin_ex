@@ -78,6 +78,48 @@ defmodule JasminEx.Routing.RouterTest do
     assert Routing.snapshot(router) == before
   end
 
+  test "authenticates eligible users and returns typed failures without secrets" do
+    router = start_router()
+    assert {:ok, group} = Routing.put_group(router, gid: "ops")
+
+    assert {:ok, user} =
+             Routing.put_user(router,
+               uid: "u1",
+               username: "alice",
+               secret: "s3cret",
+               group: group
+             )
+
+    assert {:ok, ^user} = Routing.authenticate(router, "alice", "s3cret")
+    assert {:error, :invalid_credentials} = Routing.authenticate(router, "alice", "wrong")
+    assert {:error, :invalid_credentials} = Routing.authenticate(router, "nobody", "s3cret")
+
+    assert {:ok, _} =
+             Routing.put_user(router,
+               uid: "u1",
+               username: "alice",
+               secret: "s3cret",
+               group: group,
+               enabled: false
+             )
+
+    assert {:error, :user_disabled} = Routing.authenticate(router, "alice", "s3cret")
+
+    assert {:ok, _} =
+             Routing.put_user(router,
+               uid: "u1",
+               username: "alice",
+               secret: "s3cret",
+               group: group,
+               enabled: true
+             )
+
+    assert {:ok, _} = Routing.put_group(router, gid: "ops", enabled: false)
+    assert {:error, :group_disabled} = result = Routing.authenticate(router, "alice", "s3cret")
+    refute inspect(result) =~ "s3cret"
+    refute inspect(Routing.snapshot(router)) =~ "s3cret"
+  end
+
   defp start_router do
     start_supervised!({Routing.Router, name: nil})
   end
