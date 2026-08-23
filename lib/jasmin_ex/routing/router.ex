@@ -7,6 +7,7 @@ defmodule JasminEx.Routing.Router do
   alias JasminEx.Routing.Route
   alias JasminEx.Routing.Snapshot
   alias JasminEx.Routing.State
+  alias JasminEx.Routing.Telemetry
   alias JasminEx.Routing.User
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -36,8 +37,13 @@ defmodule JasminEx.Routing.Router do
     Process.put({__MODULE__, :config}, config)
 
     case Snapshot.restore(config) do
-      {:ok, state} -> {:ok, state}
-      {:error, reason} -> {:stop, reason}
+      {:ok, state} ->
+        Telemetry.emit([:snapshot], %{}, %{outcome: :ok})
+        {:ok, state}
+
+      {:error, reason} ->
+        Telemetry.emit([:snapshot], %{}, %{outcome: :restore_failed})
+        {:stop, reason}
     end
   end
 
@@ -76,16 +82,31 @@ defmodule JasminEx.Routing.Router do
 
   defp mutate(state, fun) do
     case fun.() do
-      {:ok, next, value} -> commit(state, publish(next), value)
-      {:error, reason} -> {:reply, {:error, reason}, state}
+      {:ok, next, value} ->
+        commit(state, publish(next), value)
+
+      {:error, reason} ->
+        emit_mutation(:error, reason, state.revision)
+        {:reply, {:error, reason}, state}
     end
   end
 
   defp commit(state, published, value) do
     case Snapshot.write(published, Process.get({__MODULE__, :config})) do
-      :ok -> {:reply, {:ok, value}, published}
-      {:error, _reason} -> {:reply, {:error, :snapshot_failed}, state}
+      :ok ->
+        emit_mutation(:ok, nil, published.revision)
+        Telemetry.emit([:snapshot], %{}, %{outcome: :ok})
+        {:reply, {:ok, value}, published}
+
+      {:error, _reason} ->
+        emit_mutation(:error, :snapshot_failed, state.revision)
+        Telemetry.emit([:snapshot], %{}, %{outcome: :snapshot_failed})
+        {:reply, {:error, :snapshot_failed}, state}
     end
+  end
+
+  defp emit_mutation(outcome, reason, revision) do
+    Telemetry.emit([:mutation], %{}, %{outcome: outcome, reason: reason, revision: revision})
   end
 
   defp publish(state), do: %{state | revision: state.revision + 1}

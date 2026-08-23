@@ -44,6 +44,15 @@ defmodule JasminEx.Routing.ApplicationTest do
     refute Process.whereis(probe)
   end
 
+  test "does not implement excluded adjacent modules" do
+    refute Code.ensure_loaded?(JasminEx.Routing.Dispatch)
+    refute Code.ensure_loaded?(JasminEx.Billing)
+    refute Code.ensure_loaded?(JasminEx.MO)
+    refute Code.ensure_loaded?(JasminEx.HTTP)
+    refute Code.ensure_loaded?(JasminEx.DLR)
+    refute Code.ensure_loaded?(JasminEx.Routing.Filter.EvalPyFilter)
+  end
+
   defp enabled_children do
     Application.children(
       routing: [snapshot_path: "var/jasmin_ex/routing-v1.json"],

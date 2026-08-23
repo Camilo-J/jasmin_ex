@@ -27,10 +27,15 @@ defmodule JasminEx.Routing.RouteTable do
 
   @spec resolve(t(), Routable.t()) :: {:ok, ConnectorRef.t()} | {:error, :no_route}
   def resolve(%__MODULE__{} = table, %Routable{} = routable) do
-    case first_static_match(table, routable) || default_route(table) do
+    case winning_route(table, routable) do
       %Route{connector: connector} -> {:ok, connector}
       nil -> {:error, :no_route}
     end
+  end
+
+  @spec winning_route(t(), Routable.t()) :: Route.t() | nil
+  def winning_route(%__MODULE__{} = table, %Routable{} = routable) do
+    first_static_match(table, routable) || default_route(table)
   end
 
   defp first_static_match(table, routable) do

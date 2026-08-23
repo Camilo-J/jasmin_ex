@@ -9,7 +9,15 @@ defmodule JasminEx.Messaging.ApplicationTest do
     children = Application.children(smpp_connectors: [%{name: :connector}])
 
     refute Enum.any?(children, &messaging_child?/1)
-    assert match?([%{id: Connection}, {JasminEx.Routing.Router, _}, {JasminEx.Smpp.ConnectorSupervisor, _}], children)
+
+    assert match?(
+             [
+               %{id: Connection},
+               {JasminEx.Routing.Router, _},
+               {JasminEx.Smpp.ConnectorSupervisor, _}
+             ],
+             children
+           )
   end
 
   test "omits messaging supervision when messaging is explicitly disabled" do

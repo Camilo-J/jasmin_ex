@@ -7,9 +7,11 @@ defmodule JasminEx.Routing do
   alias JasminEx.Routing.Credential
   alias JasminEx.Routing.Group
   alias JasminEx.Routing.Routable
+  alias JasminEx.Routing.Route
   alias JasminEx.Routing.Router
   alias JasminEx.Routing.RouteTable
   alias JasminEx.Routing.State
+  alias JasminEx.Routing.Telemetry
   alias JasminEx.Routing.User
 
   defdelegate snapshot(server), to: Router
@@ -27,10 +29,14 @@ defmodule JasminEx.Routing do
   @spec authenticate_snapshot(State.t(), String.t(), term()) ::
           {:ok, User.t()} | {:error, :invalid_credentials | :user_disabled | :group_disabled}
   def authenticate_snapshot(%State{} = state, username, secret) do
-    case find_user(state.users, username) do
-      nil -> {:error, :invalid_credentials}
-      user -> eligibility(state, user, secret)
-    end
+    result =
+      case find_user(state.users, username) do
+        nil -> {:error, :invalid_credentials}
+        user -> eligibility(state, user, secret)
+      end
+
+    Telemetry.emit([:auth], %{}, %{result: class(result)})
+    result
   end
 
   defp eligibility(state, user, secret) do
@@ -49,8 +55,24 @@ defmodule JasminEx.Routing do
 
   @spec resolve_snapshot(State.t(), Routable.t()) :: {:ok, ConnectorRef.t()} | {:error, :no_route}
   def resolve_snapshot(%State{routes: table}, %Routable{} = routable) do
-    RouteTable.resolve(table, routable)
+    started = System.monotonic_time()
+
+    {result, order} =
+      case RouteTable.winning_route(table, routable) do
+        %Route{connector: connector, order: order} -> {{:ok, connector}, order}
+        nil -> {{:error, :no_route}, nil}
+      end
+
+    Telemetry.emit([:resolve], %{duration: System.monotonic_time() - started}, %{
+      result: class(result),
+      order: order
+    })
+
+    result
   end
+
+  defp class({:ok, _value}), do: :ok
+  defp class({:error, reason}), do: reason
 
   defp group_enabled?(%{groups: groups}, gid), do: match?(%Group{enabled: true}, groups[gid])
 
