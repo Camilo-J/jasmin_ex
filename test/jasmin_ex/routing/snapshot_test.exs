@@ -1,3 +1,17 @@
+defmodule JasminEx.Routing.SnapshotTest.InjectedOps do
+  @moduledoc false
+  alias JasminEx.Routing.FileOps
+  def mkdir_p(path), do: FileOps.mkdir_p(path)
+  def write(path, data), do: maybe(:write, path, fn -> FileOps.write(path, data) end)
+  def fsync(path), do: maybe(:fsync, path, fn -> FileOps.fsync(path) end)
+  def rename(from, to), do: maybe(:rename, to, fn -> FileOps.rename(from, to) end)
+  def chmod(path, mode), do: FileOps.chmod(path, mode)
+  def read(path), do: FileOps.read(path)
+
+  defp maybe(op, path, fun),
+    do: if(String.contains?(path, "fail-#{op}"), do: {:error, :eio}, else: fun.())
+end
+
 defmodule JasminEx.Routing.SnapshotTest do
   use ExUnit.Case, async: true
 
@@ -97,18 +111,4 @@ defmodule JasminEx.Routing.SnapshotTest do
     dir = Path.join(System.tmp_dir!(), "jr-#{label}-#{System.unique_integer([:positive])}")
     Config.new(snapshot_path: Path.join(dir, "routing-v1.json"), file_ops: file_ops)
   end
-end
-
-defmodule JasminEx.Routing.SnapshotTest.InjectedOps do
-  @moduledoc false
-  alias JasminEx.Routing.FileOps
-  def mkdir_p(path), do: FileOps.mkdir_p(path)
-  def write(path, data), do: maybe(:write, path, fn -> FileOps.write(path, data) end)
-  def fsync(path), do: maybe(:fsync, path, fn -> FileOps.fsync(path) end)
-  def rename(from, to), do: maybe(:rename, to, fn -> FileOps.rename(from, to) end)
-  def chmod(path, mode), do: FileOps.chmod(path, mode)
-  def read(path), do: FileOps.read(path)
-
-  defp maybe(op, path, fun),
-    do: if(String.contains?(path, "fail-#{op}"), do: {:error, :eio}, else: fun.())
 end
