@@ -2,8 +2,10 @@ defmodule JasminEx.Routing.Router do
   @moduledoc false
   use GenServer
 
+  alias JasminEx.Routing.Config
   alias JasminEx.Routing.Group
   alias JasminEx.Routing.Route
+  alias JasminEx.Routing.Snapshot
   alias JasminEx.Routing.State
   alias JasminEx.Routing.User
 
@@ -28,7 +30,16 @@ defmodule JasminEx.Routing.Router do
   def delete_group(server, gid), do: GenServer.call(server, {:delete_group, gid})
 
   @impl true
-  def init(_opts), do: {:ok, State.new()}
+  def init(opts) do
+    config = Keyword.get(opts, :config) || Config.new()
+
+    Process.put({__MODULE__, :config}, config)
+
+    case Snapshot.restore(config) do
+      {:ok, state} -> {:ok, state}
+      {:error, reason} -> {:stop, reason}
+    end
+  end
 
   @impl true
   def handle_call(:snapshot, _from, state), do: {:reply, state, state}
@@ -65,8 +76,15 @@ defmodule JasminEx.Routing.Router do
 
   defp mutate(state, fun) do
     case fun.() do
-      {:ok, next, value} -> {:reply, {:ok, value}, publish(next)}
+      {:ok, next, value} -> commit(state, publish(next), value)
       {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  defp commit(state, published, value) do
+    case Snapshot.write(published, Process.get({__MODULE__, :config})) do
+      :ok -> {:reply, {:ok, value}, published}
+      {:error, _reason} -> {:reply, {:error, :snapshot_failed}, state}
     end
   end
 

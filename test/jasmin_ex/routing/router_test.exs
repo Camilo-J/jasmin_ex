@@ -2,6 +2,7 @@ defmodule JasminEx.Routing.RouterTest do
   use ExUnit.Case, async: true
 
   alias JasminEx.Routing
+  alias JasminEx.Routing.Config
   alias JasminEx.Routing.ConnectorRef
   alias JasminEx.Routing.Group
   alias JasminEx.Routing.Route
@@ -121,6 +122,8 @@ defmodule JasminEx.Routing.RouterTest do
   end
 
   defp start_router do
-    start_supervised!({Routing.Router, name: nil})
+    dir = Path.join(System.tmp_dir!(), "jr-#{System.unique_integer([:positive])}")
+    config = Config.new(snapshot_path: Path.join(dir, "routing-v1.json"))
+    start_supervised!({Routing.Router, name: nil, config: config})
   end
 end
