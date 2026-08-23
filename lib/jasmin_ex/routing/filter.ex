@@ -70,6 +70,18 @@ defmodule JasminEx.Routing.Filter do
 
   @type t :: User.t() | Group.t() | Source.t() | Destination.t() | Content.t() | TagsAll.t()
 
+  @spec valid?(term()) :: boolean()
+  def valid?(%User{uid: uid}), do: ok?(User.new(uid: uid))
+  def valid?(%Group{gid: gid}), do: ok?(Group.new(gid: gid))
+  def valid?(%Source{address: address}), do: ok?(Source.new(address: address))
+  def valid?(%Destination{address: address}), do: ok?(Destination.new(address: address))
+  def valid?(%Content{body: body}), do: ok?(Content.new(body: body))
+  def valid?(%TagsAll{tags: tags}), do: ok?(TagsAll.new(tags: tags))
+  def valid?(_filter), do: false
+
+  defp ok?({:ok, _value}), do: true
+  defp ok?(_error), do: false
+
   @spec match?([term()], Routable.t()) :: boolean()
   def match?(filters, %Routable{} = routable) when is_list(filters) do
     Enum.all?(filters, &matches_one?(&1, routable))

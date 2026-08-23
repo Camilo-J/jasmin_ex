@@ -47,6 +47,41 @@ defmodule JasminEx.Routing.RouteTableTest do
     assert {:error, :invalid_order} = RouteTable.put(RouteTable.new(), invalid)
   end
 
+  test "rejects a default route published outside order 0", ctx do
+    assert {:ok, default_ten} =
+             Route.new(kind: :default, order: 10, connector: ctx.smpp_default, filters: [])
+
+    assert {:error, :invalid_order} = RouteTable.put(RouteTable.new(), default_ten)
+
+    negative = %Route{kind: :default, order: -1, connector: ctx.smpp_default, filters: []}
+    assert {:error, :invalid_order} = RouteTable.put(RouteTable.new(), negative)
+  end
+
+  test "rejects a connector whose id fails the ConnectorRef contract" do
+    malformed = %ConnectorRef{type: :smpp_client, id: ""}
+
+    assert {:error, :invalid_connector} =
+             Route.new(kind: :static, order: 10, connector: malformed, filters: [])
+
+    assert {:error, :invalid_connector} =
+             Route.new(
+               kind: :static,
+               order: 10,
+               connector: %ConnectorRef{type: :smpp_client, id: 123},
+               filters: []
+             )
+  end
+
+  test "rejects an unknown filter struct term" do
+    {:ok, connector} = ConnectorRef.new("smpp-a")
+    script = %{__struct__: JasminEx.Routing.Filter.EvalPyFilter, script: "True"}
+
+    assert {:error, :invalid_filter} = static_route(10, connector, [script])
+
+    assert {:error, :invalid_filter} =
+             static_route(10, connector, [%Filter.User{uid: :not_a_binary}])
+  end
+
   test "resolves the first matching static route in descending order", ctx do
     assert {:ok, high} = static_route(20, ctx.smpp_a, [ctx.dest])
     assert {:ok, low} = static_route(10, ctx.smpp_b, [ctx.dest])

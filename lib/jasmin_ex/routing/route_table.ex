@@ -19,6 +19,9 @@ defmodule JasminEx.Routing.RouteTable do
   @spec put(t(), Route.t()) :: {:ok, t()} | {:error, :invalid_order}
   def put(%__MODULE__{}, %Route{kind: :static, order: 0}), do: {:error, :invalid_order}
 
+  def put(%__MODULE__{}, %Route{kind: :default, order: order}) when order != 0,
+    do: {:error, :invalid_order}
+
   def put(%__MODULE__{} = table, %Route{order: order} = route)
       when is_integer(order) and order >= 0 do
     routes = Map.put(table.routes, order, route)

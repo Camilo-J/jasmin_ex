@@ -79,6 +79,37 @@ defmodule JasminEx.Routing.RouterTest do
     assert Routing.snapshot(router) == before
   end
 
+  test "returns a typed error for a malformed route and keeps Router alive" do
+    router = start_router()
+    malformed = %ConnectorRef{type: :smpp_client, id: ""}
+    script = %{__struct__: JasminEx.Routing.Filter.EvalPyFilter, script: "True"}
+
+    assert {:error, reason} =
+             Routing.put_route(router,
+               kind: :static,
+               order: 10,
+               connector: malformed,
+               filters: [script]
+             )
+
+    assert reason in [:invalid_connector, :invalid_filter]
+    assert Process.alive?(router)
+    assert %Routing.State{} = Routing.snapshot(router)
+
+    {:ok, connector} = ConnectorRef.new("smpp-t")
+
+    assert {:error, :invalid_filter} =
+             Routing.put_route(router,
+               kind: :static,
+               order: 10,
+               connector: connector,
+               filters: [script]
+             )
+
+    assert Process.alive?(router)
+    assert %Routing.State{} = Routing.snapshot(router)
+  end
+
   test "authenticates eligible users and returns typed failures without secrets" do
     router = start_router()
     assert {:ok, group} = Routing.put_group(router, gid: "ops")
