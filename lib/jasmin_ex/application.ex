@@ -7,6 +7,8 @@ defmodule JasminEx.Application do
 
   alias JasminEx.Messaging.RabbitMQ.Config, as: MessagingConfig
   alias JasminEx.Messaging.RabbitMQ.Supervisor, as: MessagingSupervisor
+  alias JasminEx.Routing.Config, as: RoutingConfig
+  alias JasminEx.Routing.Router
   alias JasminEx.Smpp.ConnectorSupervisor
   alias JasminEx.StateStore.Config
 
@@ -15,6 +17,7 @@ defmodule JasminEx.Application do
   @spec children(keyword()) :: list()
   def children(config) do
     [state_store_child(Keyword.get(config, :state_store, []))] ++
+      [routing_child(Keyword.get(config, :routing, []))] ++
       messaging_children(Keyword.get(config, :messaging, [])) ++
       smpp_children(config)
   end
@@ -24,6 +27,7 @@ defmodule JasminEx.Application do
     children =
       children(
         state_store: Application.get_env(:jasmin_ex, :state_store, []),
+        routing: Application.get_env(:jasmin_ex, :routing, []),
         messaging: Application.get_env(:jasmin_ex, :messaging, []),
         smpp_connectors: Application.get_env(:jasmin_ex, :smpp_connectors, [])
       )
@@ -59,6 +63,10 @@ defmodule JasminEx.Application do
       health_check_interval: config.health_check_timeout_ms,
       ssl: config.tls
     ]
+  end
+
+  defp routing_child(options) when is_list(options) do
+    {Router, [config: RoutingConfig.new(options), name: Keyword.get(options, :name, Router)]}
   end
 
   defp messaging_children(options) when is_list(options) do

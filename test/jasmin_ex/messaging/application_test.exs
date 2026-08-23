@@ -9,7 +9,7 @@ defmodule JasminEx.Messaging.ApplicationTest do
     children = Application.children(smpp_connectors: [%{name: :connector}])
 
     refute Enum.any?(children, &messaging_child?/1)
-    assert match?([%{id: Connection}, {JasminEx.Smpp.ConnectorSupervisor, _}], children)
+    assert match?([%{id: Connection}, {JasminEx.Routing.Router, _}, {JasminEx.Smpp.ConnectorSupervisor, _}], children)
   end
 
   test "omits messaging supervision when messaging is explicitly disabled" do
@@ -20,7 +20,7 @@ defmodule JasminEx.Messaging.ApplicationTest do
       )
 
     refute Enum.any?(children, &messaging_child?/1)
-    assert length(children) == 2
+    assert length(children) == 3
   end
 
   test "places messaging supervisor after state store and before SMPP when enabled" do
@@ -36,8 +36,9 @@ defmodule JasminEx.Messaging.ApplicationTest do
         smpp_connectors: [%{name: :connector}]
       )
 
-    assert [state_store, messaging, smpp] = children
+    assert [state_store, router, messaging, smpp] = children
     assert state_store.id == Connection
+    assert {JasminEx.Routing.Router, _} = router
     assert {MessagingSupervisor, opts} = messaging
     assert opts[:config].host == "broker.example"
     assert opts[:config].username == "app"
@@ -49,7 +50,7 @@ defmodule JasminEx.Messaging.ApplicationTest do
   test "defaults messaging to disabled when only empty messaging keyword list is provided" do
     children = Application.children(messaging: [], smpp_connectors: [])
 
-    assert [%{id: Connection}] = children
+    assert [%{id: Connection}, {JasminEx.Routing.Router, _}] = children
     refute Enum.any?(children, &messaging_child?/1)
   end
 
