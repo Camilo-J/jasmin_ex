@@ -1,6 +1,8 @@
 defmodule JasminEx.Routing.TelemetryTest do
   use ExUnit.Case, async: false
 
+  @moduletag :tmp_dir
+
   alias JasminEx.Routing
   alias JasminEx.Routing.{Config, ConnectorRef, Filter, Routable, Telemetry}
 
@@ -63,8 +65,8 @@ defmodule JasminEx.Routing.TelemetryTest do
     refute_forbidden(meta)
   end
 
-  test "records mutation, auth, and resolve outcomes without PII" do
-    router = start_router()
+  test "records mutation, auth, and resolve outcomes without PII", %{tmp_dir: tmp_dir} do
+    router = start_router(tmp_dir)
     assert {:ok, group} = Routing.put_group(router, gid: "ops")
     {%{}, mutation} = event([:mutation])
     assert mutation.outcome == :ok and is_integer(mutation.revision)
@@ -109,9 +111,10 @@ defmodule JasminEx.Routing.TelemetryTest do
     refute_forbidden(missed)
   end
 
-  test "snapshot write failure emits outcome without path or payload" do
-    dir = Path.join(System.tmp_dir!(), "jr-fail-write-#{System.unique_integer([:positive])}")
-    config = Config.new(snapshot_path: Path.join(dir, "routing-v1.json"), file_ops: InjectedOps)
+  test "snapshot write failure emits outcome without path or payload", %{tmp_dir: tmp_dir} do
+    config =
+      Config.new(snapshot_path: Path.join(tmp_dir, "routing-v1.json"), file_ops: InjectedOps)
+
     router = start_supervised!({Routing.Router, [config: config]})
     flush_events()
     assert {:error, :snapshot_failed} = Routing.put_group(router, gid: "ops")
@@ -155,9 +158,8 @@ defmodule JasminEx.Routing.TelemetryTest do
     routable
   end
 
-  defp start_router do
-    dir = Path.join(System.tmp_dir!(), "jr-tel-#{System.unique_integer([:positive])}")
-    path = Path.join(dir, "routing-v1.json")
+  defp start_router(tmp_dir) do
+    path = Path.join(tmp_dir, "routing-v1.json")
     router = start_supervised!({Routing.Router, config: Config.new(snapshot_path: path)})
     flush_events()
     router
