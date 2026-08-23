@@ -47,6 +47,16 @@ defmodule JasminEx.Routing.RouteTableTest do
     assert {:error, :invalid_order} = RouteTable.put(RouteTable.new(), invalid)
   end
 
+  test "rejects a default route published outside order 0", ctx do
+    assert {:ok, default_ten} =
+             Route.new(kind: :default, order: 10, connector: ctx.smpp_default, filters: [])
+
+    assert {:error, :invalid_order} = RouteTable.put(RouteTable.new(), default_ten)
+
+    negative = %Route{kind: :default, order: -1, connector: ctx.smpp_default, filters: []}
+    assert {:error, :invalid_order} = RouteTable.put(RouteTable.new(), negative)
+  end
+
   test "rejects a connector whose id fails the ConnectorRef contract" do
     malformed = %ConnectorRef{type: :smpp_client, id: ""}
 
