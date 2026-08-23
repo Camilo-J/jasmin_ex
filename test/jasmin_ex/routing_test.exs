@@ -7,7 +7,10 @@ defmodule JasminEx.RoutingTest do
   alias JasminEx.Routing.Routable
 
   test "resolve returns only a connector ref or inert :no_route" do
-    router = start_supervised!({Routing.Router, name: nil})
+    dir = Path.join(System.tmp_dir!(), "jr-#{System.unique_integer([:positive])}")
+    path = Path.join(dir, "routing-v1.json")
+    router = start_supervised!({Routing.Router, config: %Routing.Config{snapshot_path: path}})
+
     assert {:ok, group} = Routing.put_group(router, gid: "ops")
 
     assert {:ok, user} =
