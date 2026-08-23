@@ -428,10 +428,14 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
   end
 
   test "application adds a connector supervisor only when connector config is present" do
-    assert [%{id: JasminEx.StateStore.Connection}] = Application.children([])
+    assert [%{id: JasminEx.StateStore.Connection}, {JasminEx.Routing.Router, _}] =
+             Application.children([])
 
-    assert [%{id: JasminEx.StateStore.Connection}, {ConnectorSupervisor, [[]]}] =
-             Application.children(smpp_connectors: [[]])
+    assert [
+             %{id: JasminEx.StateStore.Connection},
+             {JasminEx.Routing.Router, _},
+             {ConnectorSupervisor, [[]]}
+           ] = Application.children(smpp_connectors: [[]])
   end
 
   defmodule StubConnection do

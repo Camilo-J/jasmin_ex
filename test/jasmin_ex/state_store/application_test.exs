@@ -5,7 +5,7 @@ defmodule JasminEx.StateStore.ApplicationTest do
   alias JasminEx.StateStore.Connection
 
   test "places one named availability-tolerant Redix child before SMPP supervision" do
-    [state_store, smpp] = Application.children(smpp_connectors: [%{name: :connector}])
+    [state_store, _router, smpp] = Application.children(smpp_connectors: [%{name: :connector}])
 
     assert state_store.id == Connection
 
@@ -32,7 +32,7 @@ defmodule JasminEx.StateStore.ApplicationTest do
   end
 
   test "passes configured authentication, TLS, and finite health checks to the connection child" do
-    [state_store] =
+    [state_store, _router] =
       Application.children(
         state_store: [
           endpoint: "rediss://cache.example:6380",
