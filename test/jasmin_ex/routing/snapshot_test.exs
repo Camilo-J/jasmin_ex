@@ -15,6 +15,8 @@ end
 defmodule JasminEx.Routing.SnapshotTest do
   use ExUnit.Case, async: true
 
+  @moduletag :tmp_dir
+
   alias JasminEx.Routing
 
   alias JasminEx.Routing.{
@@ -29,8 +31,8 @@ defmodule JasminEx.Routing.SnapshotTest do
     User
   }
 
-  test "restart restores equivalent state and corrupt restore fails closed" do
-    config = tmp_config("restart")
+  test "restart restores equivalent state and corrupt restore fails closed", %{tmp_dir: tmp_dir} do
+    config = tmp_config(tmp_dir, "restart")
     state = persisted_state()
     assert :ok = Snapshot.write(state, config)
     assert {:ok, restored} = Snapshot.restore(config)
@@ -61,9 +63,11 @@ defmodule JasminEx.Routing.SnapshotTest do
     assert {:error, {:restore_failed, :invalid_state}} = Snapshot.restore(config)
   end
 
-  test "router writes before publish, injected I/O fails closed, missing file is empty" do
+  test "router writes before publish, injected I/O fails closed, missing file is empty", %{
+    tmp_dir: tmp_dir
+  } do
     Enum.each([:write, :fsync, :rename], fn op ->
-      config = tmp_config("fail-#{op}", __MODULE__.InjectedOps)
+      config = tmp_config(tmp_dir, "fail-#{op}", __MODULE__.InjectedOps)
       router = start_supervised!({Routing.Router, [config: config]}, id: {:fail, op})
       before = Routing.snapshot(router)
       assert {:error, :snapshot_failed} = Routing.put_group(router, gid: "ops")
@@ -71,12 +75,14 @@ defmodule JasminEx.Routing.SnapshotTest do
       refute File.exists?(config.snapshot_path)
     end)
 
-    router = start_supervised!({Routing.Router, [config: tmp_config("invalid")]}, id: :invalid)
+    router =
+      start_supervised!({Routing.Router, [config: tmp_config(tmp_dir, "invalid")]}, id: :invalid)
+
     before = Routing.snapshot(router)
     assert {:error, :invalid_gid} = Routing.put_group(router, gid: "bad!")
     assert Routing.snapshot(router) == before
 
-    missing = tmp_config("missing")
+    missing = tmp_config(tmp_dir, "missing")
     assert {:ok, %State{groups: %{}} = empty} = Snapshot.restore(missing)
     assert empty == State.new()
     router = start_supervised!({Routing.Router, [config: missing]}, id: :missing)
@@ -87,12 +93,34 @@ defmodule JasminEx.Routing.SnapshotTest do
     assert File.exists?(missing.snapshot_path)
     restarted = start_supervised!({Routing.Router, [config: missing]}, id: :restarted)
     assert Routing.snapshot(restarted).groups["ops"] == group
-    corrupt = tmp_config("startup-corrupt")
+    corrupt = tmp_config(tmp_dir, "startup-corrupt")
     File.mkdir_p!(Path.dirname(corrupt.snapshot_path))
     File.write!(corrupt.snapshot_path, "not-json")
 
     assert {:error, {{:restore_failed, :invalid_json}, _}} =
              start_supervised({Routing.Router, [config: corrupt]}, id: :corrupt)
+  end
+
+  test "missing restore stays empty when leftover /tmp/jr-missing snapshot exists", %{
+    tmp_dir: tmp_dir
+  } do
+    leftover_path = plant_leftover_snapshot("jr-missing-1")
+    config = tmp_config(tmp_dir, "missing")
+    refute config.snapshot_path == leftover_path
+    assert isolated_snapshot_path?(config.snapshot_path, tmp_dir)
+    assert {:ok, empty} = Snapshot.restore(config)
+    assert empty == State.new()
+  end
+
+  test "router start on isolated missing path ignores leftover /tmp/jr snapshot", %{
+    tmp_dir: tmp_dir
+  } do
+    leftover_path = plant_leftover_snapshot("jr-router-missing-leftover")
+    config = tmp_config(tmp_dir, "router-missing")
+    refute config.snapshot_path == leftover_path
+    assert isolated_snapshot_path?(config.snapshot_path, tmp_dir)
+    router = start_supervised!({Routing.Router, [config: config]})
+    assert Routing.snapshot(router) == State.new()
   end
 
   defp persisted_state do
@@ -107,8 +135,30 @@ defmodule JasminEx.Routing.SnapshotTest do
     %{state | revision: 3}
   end
 
-  defp tmp_config(label, file_ops \\ nil) do
-    dir = Path.join(System.tmp_dir!(), "jr-#{label}-#{System.unique_integer([:positive])}")
-    Config.new(snapshot_path: Path.join(dir, "routing-v1.json"), file_ops: file_ops)
+  defp plant_leftover_snapshot(name) do
+    leftover_dir = Path.join(System.tmp_dir!(), name)
+    leftover_path = Path.join(leftover_dir, "routing-v1.json")
+    created_leftover_dir? = not File.dir?(leftover_dir)
+    File.mkdir_p!(leftover_dir)
+    on_exit(fn -> cleanup_leftover(leftover_dir, leftover_path, created_leftover_dir?) end)
+    assert :ok = Snapshot.write(persisted_state(), Config.new(snapshot_path: leftover_path))
+    leftover_path
+  end
+
+  defp cleanup_leftover(dir, path, created_dir?) do
+    if created_dir?, do: File.rm_rf(dir), else: File.rm(path)
+  end
+
+  defp tmp_config(tmp_dir, label, file_ops \\ nil) do
+    Config.new(
+      snapshot_path: Path.join([tmp_dir, label, "routing-v1.json"]),
+      file_ops: file_ops
+    )
+  end
+
+  defp isolated_snapshot_path?(path, tmp_dir) do
+    expanded = Path.expand(path)
+    base = Path.expand(tmp_dir)
+    String.starts_with?(expanded, base <> "/") or Path.dirname(expanded) == base
   end
 end

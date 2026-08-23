@@ -1,14 +1,15 @@
 defmodule JasminEx.RoutingTest do
   use ExUnit.Case, async: true
 
+  @moduletag :tmp_dir
+
   alias JasminEx.Routing
   alias JasminEx.Routing.ConnectorRef
   alias JasminEx.Routing.Filter
   alias JasminEx.Routing.Routable
 
-  test "resolve returns only a connector ref or inert :no_route" do
-    dir = Path.join(System.tmp_dir!(), "jr-#{System.unique_integer([:positive])}")
-    path = Path.join(dir, "routing-v1.json")
+  test "resolve returns only a connector ref or inert :no_route", %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "routing-v1.json")
     router = start_supervised!({Routing.Router, config: %Routing.Config{snapshot_path: path}})
 
     assert {:ok, group} = Routing.put_group(router, gid: "ops")

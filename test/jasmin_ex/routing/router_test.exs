@@ -1,6 +1,8 @@
 defmodule JasminEx.Routing.RouterTest do
   use ExUnit.Case, async: true
 
+  @moduletag :tmp_dir
+
   alias JasminEx.Routing
   alias JasminEx.Routing.Config
   alias JasminEx.Routing.ConnectorRef
@@ -8,8 +10,8 @@ defmodule JasminEx.Routing.RouterTest do
   alias JasminEx.Routing.Route
   alias JasminEx.Routing.User
 
-  test "creates user u1/alice in group ops" do
-    router = start_router()
+  test "creates user u1/alice in group ops", %{tmp_dir: tmp_dir} do
+    router = start_router(tmp_dir)
 
     assert {:ok, %Group{gid: "ops", enabled: true} = group} =
              Routing.put_group(router, gid: "ops")
@@ -27,8 +29,8 @@ defmodule JasminEx.Routing.RouterTest do
     assert snap.users["u1"] == user
   end
 
-  test "cascade-deletes users and leaves routes T unchanged" do
-    router = start_router()
+  test "cascade-deletes users and leaves routes T unchanged", %{tmp_dir: tmp_dir} do
+    router = start_router(tmp_dir)
     assert {:ok, group} = Routing.put_group(router, gid: "ops")
 
     assert {:ok, _user} =
@@ -58,8 +60,8 @@ defmodule JasminEx.Routing.RouterTest do
     assert snap.routes == routes
   end
 
-  test "does not publish invalid writes" do
-    router = start_router()
+  test "does not publish invalid writes", %{tmp_dir: tmp_dir} do
+    router = start_router(tmp_dir)
     assert {:ok, _group} = Routing.put_group(router, gid: "ops")
     before = Routing.snapshot(router)
     assert {:error, :invalid_gid} = Routing.put_group(router, gid: "bad!")
@@ -79,8 +81,8 @@ defmodule JasminEx.Routing.RouterTest do
     assert Routing.snapshot(router) == before
   end
 
-  test "returns a typed error for a malformed route and keeps Router alive" do
-    router = start_router()
+  test "returns a typed error for a malformed route and keeps Router alive", %{tmp_dir: tmp_dir} do
+    router = start_router(tmp_dir)
     malformed = %ConnectorRef{type: :smpp_client, id: ""}
     script = %{__struct__: JasminEx.Routing.Filter.EvalPyFilter, script: "True"}
 
@@ -110,8 +112,10 @@ defmodule JasminEx.Routing.RouterTest do
     assert %Routing.State{} = Routing.snapshot(router)
   end
 
-  test "authenticates eligible users and returns typed failures without secrets" do
-    router = start_router()
+  test "authenticates eligible users and returns typed failures without secrets", %{
+    tmp_dir: tmp_dir
+  } do
+    router = start_router(tmp_dir)
     assert {:ok, group} = Routing.put_group(router, gid: "ops")
 
     assert {:ok, user} =
@@ -152,9 +156,8 @@ defmodule JasminEx.Routing.RouterTest do
     refute inspect(Routing.snapshot(router)) =~ "s3cret"
   end
 
-  defp start_router do
-    dir = Path.join(System.tmp_dir!(), "jr-#{System.unique_integer([:positive])}")
-    config = Config.new(snapshot_path: Path.join(dir, "routing-v1.json"))
+  defp start_router(tmp_dir) do
+    config = Config.new(snapshot_path: Path.join(tmp_dir, "routing-v1.json"))
     start_supervised!({Routing.Router, name: nil, config: config})
   end
 end
