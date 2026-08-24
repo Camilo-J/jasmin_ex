@@ -1,18 +1,29 @@
 defmodule JasminEx.Routing.State do
   @moduledoc false
 
+  alias JasminEx.Billing.Admission
+  alias JasminEx.Billing.Bill
+  alias JasminEx.Billing.Clock
+  alias JasminEx.Billing.Reservation
   alias JasminEx.Routing.Group
   alias JasminEx.Routing.Route
   alias JasminEx.Routing.RouteTable
   alias JasminEx.Routing.User
 
-  defstruct groups: %{}, users: %{}, routes: %RouteTable{}, revision: 0
+  defstruct groups: %{},
+            users: %{},
+            routes: %RouteTable{},
+            revision: 0,
+            reservations: %{},
+            tombstones: %{}
 
   @type t :: %__MODULE__{
           groups: %{optional(String.t()) => Group.t()},
           users: %{optional(String.t()) => User.t()},
           routes: RouteTable.t(),
-          revision: non_neg_integer()
+          revision: non_neg_integer(),
+          reservations: %{optional(binary()) => Reservation.t()},
+          tombstones: map()
         }
 
   @spec new() :: t()
@@ -51,6 +62,26 @@ defmodule JasminEx.Routing.State do
 
   def delete_group(%__MODULE__{}, _gid), do: {:error, :unknown_group}
 
+  @spec admit(t(), term(), Clock.clock()) :: {:ok, t()} | {:error, atom()}
+  def admit(%__MODULE__{} = state, %Admission{bill: %Bill{} = bill} = admission, clock) do
+    with {:ok, user} <- fetch_user(state, bill.uid),
+         {:ok, _route} <- fetch_route(state, bill.route_order),
+         {:ok, balance_minor} <- debit_balance(user.balance_minor, bill.rate_minor),
+         {:ok, submit_quota} <- debit_quota(user.submit_quota, bill.quota_debit),
+         {:ok, reservation} <- Reservation.open(admission, clock) do
+      user = %{user | balance_minor: balance_minor, submit_quota: submit_quota}
+
+      {:ok,
+       %{
+         state
+         | users: Map.put(state.users, user.uid, user),
+           reservations: Map.put(state.reservations, bill.bill_id, reservation)
+       }}
+    end
+  end
+
+  def admit(%__MODULE__{}, _admission, _clock), do: {:error, :invalid_bill_id}
+
   defp drop_group(_state, {nil, _groups}), do: {:error, :unknown_group}
 
   defp drop_group(state, {%Group{gid: gid}, groups}) do
@@ -63,4 +94,33 @@ defmodule JasminEx.Routing.State do
       existing_uid != uid and user.username == username
     end)
   end
+
+  defp fetch_user(state, uid) do
+    case Map.fetch(state.users, uid) do
+      {:ok, user} -> {:ok, user}
+      :error -> {:error, :unknown_user}
+    end
+  end
+
+  defp fetch_route(state, order) do
+    case Map.fetch(state.routes.routes, order) do
+      {:ok, route} -> {:ok, route}
+      :error -> {:error, :unknown_route}
+    end
+  end
+
+  defp debit_balance(nil, _rate), do: {:ok, nil}
+
+  defp debit_balance(balance, rate)
+       when is_integer(balance) and is_integer(rate) and balance >= rate,
+       do: {:ok, balance - rate}
+
+  defp debit_balance(_balance, _rate), do: {:error, :insufficient_balance}
+
+  defp debit_quota(nil, _debit), do: {:ok, nil}
+
+  defp debit_quota(quota, debit) when is_integer(quota) and is_integer(debit) and quota >= debit,
+    do: {:ok, quota - debit}
+
+  defp debit_quota(_quota, _debit), do: {:error, :insufficient_quota}
 end

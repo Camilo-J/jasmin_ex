@@ -8,15 +8,19 @@ defmodule JasminEx.Routing.User do
   @username_pattern ~r/^[A-Za-z0-9_-]{1,15}$/
 
   @enforce_keys [:uid, :gid, :username, :credential, :enabled]
-  defstruct @enforce_keys
+  defstruct [:uid, :gid, :username, :credential, :enabled, balance_minor: nil, submit_quota: nil]
 
   @type t :: %__MODULE__{
           uid: String.t(),
           gid: String.t(),
           username: String.t(),
           credential: Credential.t(),
-          enabled: boolean()
+          enabled: boolean(),
+          balance_minor: non_neg_integer() | nil,
+          submit_quota: non_neg_integer() | nil
         }
+
+  @max_int64 9_223_372_036_854_775_807
 
   @spec new(keyword()) ::
           {:ok, t()}
@@ -25,20 +29,26 @@ defmodule JasminEx.Routing.User do
              | :invalid_uid
              | :invalid_username
              | :invalid_secret
-             | :invalid_enabled}
+             | :invalid_enabled
+             | :invalid_amount
+             | :amount_overflow}
   def new(attrs) when is_list(attrs) do
     with {:ok, group} <- require_group(Keyword.get(attrs, :group)),
          {:ok, uid} <- validate_uid(Keyword.get(attrs, :uid)),
          {:ok, username} <- validate_username(Keyword.get(attrs, :username)),
          {:ok, enabled} <- validate_enabled(Keyword.get(attrs, :enabled, true)),
-         {:ok, credential} <- Credential.hash(Keyword.get(attrs, :secret)) do
+         {:ok, credential} <- Credential.hash(Keyword.get(attrs, :secret)),
+         {:ok, balance_minor} <- validate_optional_amount(Keyword.get(attrs, :balance_minor)),
+         {:ok, submit_quota} <- validate_optional_amount(Keyword.get(attrs, :submit_quota)) do
       {:ok,
        %__MODULE__{
          uid: uid,
          gid: group.gid,
          username: username,
          credential: credential,
-         enabled: enabled
+         enabled: enabled,
+         balance_minor: balance_minor,
+         submit_quota: submit_quota
        }}
     end
   end
@@ -64,4 +74,15 @@ defmodule JasminEx.Routing.User do
 
   defp validate_enabled(enabled) when is_boolean(enabled), do: {:ok, enabled}
   defp validate_enabled(_enabled), do: {:error, :invalid_enabled}
+
+  defp validate_optional_amount(nil), do: {:ok, nil}
+
+  defp validate_optional_amount(amount) when is_integer(amount) and amount < 0,
+    do: {:error, :invalid_amount}
+
+  defp validate_optional_amount(amount) when is_integer(amount) and amount > @max_int64,
+    do: {:error, :amount_overflow}
+
+  defp validate_optional_amount(amount) when is_integer(amount), do: {:ok, amount}
+  defp validate_optional_amount(_amount), do: {:error, :invalid_amount}
 end
