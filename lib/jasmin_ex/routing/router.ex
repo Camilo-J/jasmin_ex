@@ -2,6 +2,10 @@ defmodule JasminEx.Routing.Router do
   @moduledoc false
   use GenServer
 
+  alias JasminEx.Billing.Admission
+  alias JasminEx.Billing.Bill
+  alias JasminEx.Billing.Fingerprint
+  alias JasminEx.Billing.Reservation
   alias JasminEx.Routing.Config
   alias JasminEx.Routing.Group
   alias JasminEx.Routing.Route
@@ -29,6 +33,12 @@ defmodule JasminEx.Routing.Router do
 
   @spec delete_group(GenServer.server(), String.t()) :: {:ok, String.t()} | {:error, atom()}
   def delete_group(server, gid), do: GenServer.call(server, {:delete_group, gid})
+
+  @spec admit(GenServer.server(), term()) ::
+          {:ok, Reservation.t()}
+          | {:ok, :duplicate, Bill.t(), Fingerprint.t()}
+          | {:error, atom()}
+  def admit(server, admission), do: GenServer.call(server, {:admit, admission})
 
   @impl true
   def init(opts) do
@@ -80,15 +90,59 @@ defmodule JasminEx.Routing.Router do
     end)
   end
 
+  def handle_call({:admit, admission}, _from, state) do
+    mutate(state, fn -> admit_change(state, admission) end)
+  end
+
+  defp admit_change(state, %Admission{bill: %Bill{bill_id: bill_id}} = admission) do
+    case Map.get(state.reservations, bill_id) do
+      nil ->
+        admit_new(state, admission, bill_id)
+
+      reservation ->
+        case Reservation.classify(reservation, admission) do
+          {:ok, :duplicate, bill, fingerprint} ->
+            {:unchanged, {:ok, :duplicate, bill, fingerprint}}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+    end
+  end
+
+  defp admit_change(state, admission), do: State.admit(state, admission, clock())
+
+  defp admit_new(state, admission, bill_id) do
+    with {:ok, next} <- State.admit(state, admission, clock()),
+         {:ok, reservation} <- fetch_admitted_reservation(next, bill_id) do
+      {:ok, next, reservation}
+    end
+  end
+
+  defp fetch_admitted_reservation(next, bill_id) do
+    case Map.fetch(next.reservations, bill_id) do
+      {:ok, reservation} -> {:ok, reservation}
+      :error -> {:error, :inconsistent_admission}
+    end
+  end
+
   defp mutate(state, fun) do
     case fun.() do
       {:ok, next, value} ->
         commit(state, publish(next), value)
 
+      {:unchanged, reply} ->
+        {:reply, reply, state}
+
       {:error, reason} ->
         emit_mutation(:error, reason, state.revision)
         {:reply, {:error, reason}, state}
     end
+  end
+
+  defp clock do
+    %Config{clock: clock} = Process.get({__MODULE__, :config})
+    clock
   end
 
   defp commit(state, published, value) do
