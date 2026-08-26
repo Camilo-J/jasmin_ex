@@ -1,5 +1,23 @@
 Code.require_file(Path.expand("../../support/fake_clock.ex", __DIR__))
 
+defmodule JasminEx.Routing.BillingTest.InjectedOps do
+  @moduledoc false
+  alias JasminEx.Routing.FileOps
+
+  def fail_dir!(dir), do: :persistent_term.put({__MODULE__, dir}, true)
+  def mkdir_p(path), do: FileOps.mkdir_p(path)
+  def chmod(path, mode), do: FileOps.chmod(path, mode)
+  def read(path), do: FileOps.read(path)
+  def fsync(path), do: FileOps.fsync(path)
+  def rename(from, to), do: FileOps.rename(from, to)
+
+  def write(path, data) do
+    if :persistent_term.get({__MODULE__, Path.dirname(path)}, false),
+      do: {:error, :eio},
+      else: FileOps.write(path, data)
+  end
+end
+
 defmodule JasminEx.Routing.BillingTest do
   use ExUnit.Case, async: true
 
@@ -8,9 +26,15 @@ defmodule JasminEx.Routing.BillingTest do
   alias JasminEx.Billing.Admission
   alias JasminEx.Billing.Bill
   alias JasminEx.Billing.FakeClock
+  alias JasminEx.Billing.Fingerprint
+  alias JasminEx.Billing.Reservation
+  alias JasminEx.Routing
+  alias JasminEx.Routing.Config
   alias JasminEx.Routing.ConnectorRef
   alias JasminEx.Routing.Group
   alias JasminEx.Routing.Route
+  alias JasminEx.Routing.Router
+  alias JasminEx.Routing.Snapshot
   alias JasminEx.Routing.State
   alias JasminEx.Routing.User
 
@@ -111,6 +135,142 @@ defmodule JasminEx.Routing.BillingTest do
     assert state.revision == 0
   end
 
+  describe "router admission" do
+    @describetag :router_admit
+    @describetag :tmp_dir
+
+    test "persist-before-publish admits a finite bill and persists the next revision", %{
+      tmp_dir: tmp_dir
+    } do
+      {router, config, admission} = start_admitting_router(tmp_dir)
+      before = Routing.snapshot(router)
+
+      assert {:ok, %Reservation{} = reservation} = Routing.admit(router, admission)
+      assert reservation.state == :open
+      assert reservation.captured_minor == 10
+      assert reservation.reserved_minor == 90
+      assert reservation.wall_deadline_ms == 2_000
+      assert reservation.monotonic_deadline_ms == 1_010
+
+      published = Routing.snapshot(router)
+      assert published.revision == before.revision + 1
+      assert published.users["u1"].balance_minor == 400
+      assert published.users["u1"].submit_quota == 2
+      assert published.reservations["bill-1"] == reservation
+      assert File.exists?(config.snapshot_path)
+      assert {:ok, restored} = Snapshot.restore(config)
+      assert restored.revision == published.revision
+      assert Process.alive?(router)
+    end
+
+    test "concurrent_same_id_admission serializes one mutation and a duplicate no-op", %{
+      tmp_dir: tmp_dir
+    } do
+      {router, _config, admission} = start_admitting_router(tmp_dir)
+      before = Routing.snapshot(router)
+
+      results =
+        1..2
+        |> Enum.map(fn _ -> Task.async(fn -> Routing.admit(router, admission) end) end)
+        |> Task.await_many()
+
+      assert Enum.count(results, &match?({:ok, %Reservation{state: :open}}, &1)) == 1
+
+      assert Enum.count(results, &match?({:ok, :duplicate, %Bill{}, %Fingerprint{}}, &1)) ==
+               1
+
+      published = Routing.snapshot(router)
+      assert published.revision == before.revision + 1
+      assert published.users["u1"].balance_minor == 400
+      assert published.users["u1"].submit_quota == 2
+      assert map_size(published.reservations) == 1
+      assert Process.alive?(router)
+    end
+
+    test "malformed_bill_call_is_contained", %{tmp_dir: tmp_dir} do
+      {router, config, admission} = start_admitting_router(tmp_dir)
+      before = Routing.snapshot(router)
+      payload = File.read!(config.snapshot_path)
+
+      assert {:error, :invalid_bill_id} = Routing.admit(router, admission.bill)
+      assert Process.alive?(router)
+      assert Routing.snapshot(router) == before
+      assert File.read!(config.snapshot_path) == payload
+    end
+
+    test "malformed_admission_call_is_contained", %{tmp_dir: tmp_dir} do
+      {router, config, _admission} = start_admitting_router(tmp_dir)
+      before = Routing.snapshot(router)
+      payload = File.read!(config.snapshot_path)
+
+      assert {:error, :invalid_bill_id} = Routing.admit(router, :not_an_admission)
+      assert {:error, :invalid_bill_id} = Routing.admit(router, %{bill_id: "bill-1"})
+      assert Process.alive?(router)
+      assert Routing.snapshot(router) == before
+      assert File.read!(config.snapshot_path) == payload
+    end
+
+    test "injected_snapshot_write_failure leaves published state and revision unchanged", %{
+      tmp_dir: tmp_dir
+    } do
+      {router, config, admission} =
+        start_admitting_router(tmp_dir, file_ops: __MODULE__.InjectedOps)
+
+      before = Routing.snapshot(router)
+      payload = File.read!(config.snapshot_path)
+      __MODULE__.InjectedOps.fail_dir!(Path.dirname(config.snapshot_path))
+
+      on_exit(fn ->
+        :persistent_term.erase({__MODULE__.InjectedOps, Path.dirname(config.snapshot_path)})
+      end)
+
+      assert {:error, :snapshot_failed} = Routing.admit(router, admission)
+      assert_router_unchanged(router, config, before, payload)
+      assert Routing.snapshot(router).reservations == %{}
+    end
+
+    test "same bill_id with a different economic fingerprint is a live billing conflict", %{
+      tmp_dir: tmp_dir
+    } do
+      {router, config, admission} = start_admitting_router(tmp_dir)
+      assert {:ok, %Reservation{}} = Routing.admit(router, admission)
+      before = Routing.snapshot(router)
+      payload = File.read!(config.snapshot_path)
+
+      assert {:error, :billing_conflict} =
+               Routing.admit(router, admission(rate_minor: 200))
+
+      assert_router_unchanged(router, config, before, payload)
+    end
+
+    test "unknown_user is contained without mutating Router state", %{tmp_dir: tmp_dir} do
+      assert_router_typed_error(tmp_dir, :unknown_user, admission(uid: "missing"))
+    end
+
+    test "unknown_route is contained without mutating Router state", %{tmp_dir: tmp_dir} do
+      assert_router_typed_error(tmp_dir, :unknown_route, admission(route_order: 99))
+    end
+
+    test "insufficient_balance is contained without mutating Router state", %{tmp_dir: tmp_dir} do
+      assert_router_typed_error(tmp_dir, :insufficient_balance, admission(rate_minor: 501))
+    end
+
+    test "Routing.admit/2 publishes a public admission contract" do
+      {:docs_v1, _, :elixir, _, _, _, docs} = Code.fetch_docs(Routing)
+
+      doc =
+        Enum.find_value(docs, fn
+          {{:function, :admit, 2}, _, _, %{"en" => text}, _} -> text
+          _ -> nil
+        end)
+
+      assert is_binary(doc)
+      assert doc =~ "persists"
+      assert doc =~ "no-op"
+      assert doc =~ "billing_conflict"
+    end
+  end
+
   test "rejects invalid user balance, quota, and route rate fields unchanged" do
     {:ok, group} = Group.new(gid: "ops")
     {:ok, connector} = ConnectorRef.new("smpp-t")
@@ -163,6 +323,58 @@ defmodule JasminEx.Routing.BillingTest do
   end
 
   defp clock, do: {FakeClock, FakeClock.new(wall_ms: 1_000, monotonic_ms: 10)}
+
+  defp start_admitting_router(tmp_dir, opts \\ []) do
+    config =
+      Config.new(
+        snapshot_path: Path.join(tmp_dir, "routing-v1.json"),
+        file_ops: Keyword.get(opts, :file_ops),
+        clock: clock()
+      )
+
+    router = start_supervised!({Router, name: nil, config: config})
+    {:ok, group} = Routing.put_group(router, gid: "ops")
+
+    {:ok, _} =
+      Routing.put_user(router,
+        uid: "u1",
+        username: "alice",
+        secret: "s3cret",
+        group: group,
+        balance_minor: 500,
+        submit_quota: 3
+      )
+
+    {:ok, connector} = ConnectorRef.new("smpp-t")
+
+    {:ok, _} =
+      Routing.put_route(router,
+        kind: :static,
+        order: 10,
+        connector: connector,
+        filters: [],
+        rate_minor: 100,
+        precharge_percent: 10
+      )
+
+    {router, config, admission([])}
+  end
+
+  defp assert_router_typed_error(tmp_dir, reason, admission) do
+    {router, config, _seed} = start_admitting_router(tmp_dir)
+    before = Routing.snapshot(router)
+    payload = File.read!(config.snapshot_path)
+
+    assert {:error, ^reason} = Routing.admit(router, admission)
+    assert_router_unchanged(router, config, before, payload)
+  end
+
+  defp assert_router_unchanged(router, config, before, payload) do
+    assert Process.alive?(router)
+    assert Routing.snapshot(router) == before
+    assert Routing.snapshot(router).revision == before.revision
+    assert File.read!(config.snapshot_path) == payload
+  end
 
   defp admission(opts) do
     {:ok, bill} =

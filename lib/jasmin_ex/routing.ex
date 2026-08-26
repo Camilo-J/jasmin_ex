@@ -20,6 +20,19 @@ defmodule JasminEx.Routing do
   defdelegate put_route(server, attrs), to: Router
   defdelegate delete_group(server, gid), to: Router
 
+  @doc """
+  Admit one bill through the live Router.
+
+  The first admission persists the reservation before publication. An exact
+  duplicate is a no-op. The same `bill_id` with a different economic
+  fingerprint returns `{:error, :billing_conflict}` and leaves state unchanged.
+  """
+  @spec admit(GenServer.server(), term()) ::
+          {:ok, JasminEx.Billing.Reservation.t()}
+          | {:ok, :duplicate, JasminEx.Billing.Bill.t(), JasminEx.Billing.Fingerprint.t()}
+          | {:error, atom()}
+  defdelegate admit(server, admission), to: Router
+
   @spec authenticate(GenServer.server(), String.t(), term()) ::
           {:ok, User.t()} | {:error, :invalid_credentials | :user_disabled | :group_disabled}
   def authenticate(server, username, secret) do
