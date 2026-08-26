@@ -6,6 +6,8 @@ defmodule JasminEx.Routing.Router do
   alias JasminEx.Billing.Bill
   alias JasminEx.Billing.Fingerprint
   alias JasminEx.Billing.Reservation
+  alias JasminEx.Billing.Settlement
+  alias JasminEx.Billing.Tombstone
   alias JasminEx.Routing.Config
   alias JasminEx.Routing.Group
   alias JasminEx.Routing.Route
@@ -39,6 +41,13 @@ defmodule JasminEx.Routing.Router do
           | {:ok, :duplicate, Bill.t(), Fingerprint.t()}
           | {:error, atom()}
   def admit(server, admission), do: GenServer.call(server, {:admit, admission})
+
+  @spec settle(GenServer.server(), term()) ::
+          {:ok, Tombstone.t()} | {:ok, :duplicate | :late_ignored} | {:error, atom()}
+  def settle(server, settlement), do: GenServer.call(server, {:settle, settlement})
+
+  @spec expire_due(GenServer.server()) :: {:ok, non_neg_integer()} | {:error, atom()}
+  def expire_due(server), do: GenServer.call(server, :expire_due)
 
   @impl true
   def init(opts) do
@@ -94,19 +103,24 @@ defmodule JasminEx.Routing.Router do
     mutate(state, fn -> admit_change(state, admission) end)
   end
 
+  def handle_call({:settle, settlement}, _from, state) do
+    mutate(state, fn -> settle_change(state, settlement) end)
+  end
+
+  def handle_call(:expire_due, _from, state) do
+    mutate(state, fn -> expire_change(state) end)
+  end
+
   defp admit_change(state, %Admission{bill: %Bill{bill_id: bill_id}} = admission) do
-    case Map.get(state.reservations, bill_id) do
-      nil ->
+    case {Map.get(state.tombstones, bill_id), Map.get(state.reservations, bill_id)} do
+      {%Tombstone{} = stone, _} ->
+        duplicate_admission(Tombstone.classify(stone, admission))
+
+      {_, %Reservation{} = reservation} ->
+        duplicate_admission(Reservation.classify(reservation, admission))
+
+      {nil, nil} ->
         admit_new(state, admission, bill_id)
-
-      reservation ->
-        case Reservation.classify(reservation, admission) do
-          {:ok, :duplicate, bill, fingerprint} ->
-            {:unchanged, {:ok, :duplicate, bill, fingerprint}}
-
-          {:error, reason} ->
-            {:error, reason}
-        end
     end
   end
 
@@ -123,6 +137,37 @@ defmodule JasminEx.Routing.Router do
     case Map.fetch(next.reservations, bill_id) do
       {:ok, reservation} -> {:ok, reservation}
       :error -> {:error, :inconsistent_admission}
+    end
+  end
+
+  defp duplicate_admission({:ok, :duplicate, bill, fingerprint}) do
+    {:unchanged, {:ok, :duplicate, bill, fingerprint}}
+  end
+
+  defp duplicate_admission({:error, reason}), do: {:error, reason}
+
+  defp settle_change(state, %Settlement{bill_id: bill_id} = settlement) do
+    case State.settle(state, settlement) do
+      {:ok, :duplicate} -> {:unchanged, {:ok, :duplicate}}
+      {:ok, :late_ignored} -> {:unchanged, {:ok, :late_ignored}}
+      {:ok, next} -> fetch_settled_tombstone(next, bill_id)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp settle_change(_state, _settlement), do: {:error, :invalid_bill_id}
+
+  defp fetch_settled_tombstone(next, bill_id) do
+    case Map.fetch(next.tombstones, bill_id) do
+      {:ok, stone} -> {:ok, next, stone}
+      :error -> {:error, :inconsistent_settlement}
+    end
+  end
+
+  defp expire_change(state) do
+    case State.expire_due(state, clock()) do
+      {:ok, _state, 0} -> {:unchanged, {:ok, 0}}
+      {:ok, next, count} -> {:ok, next, count}
     end
   end
 

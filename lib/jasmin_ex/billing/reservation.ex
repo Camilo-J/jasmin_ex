@@ -10,6 +10,7 @@ defmodule JasminEx.Billing.Reservation do
   @min_int64 -9_223_372_036_854_775_808
   @enforce_keys [
     :bill_id,
+    :uid,
     :fingerprint,
     :state,
     :captured_minor,
@@ -31,6 +32,7 @@ defmodule JasminEx.Billing.Reservation do
       {:ok,
        %__MODULE__{
          bill_id: bill.bill_id,
+         uid: bill.uid,
          fingerprint: fingerprint,
          state: :open,
          captured_minor: bill.precharge_minor,
