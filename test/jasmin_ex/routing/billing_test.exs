@@ -28,6 +28,8 @@ defmodule JasminEx.Routing.BillingTest do
   alias JasminEx.Billing.FakeClock
   alias JasminEx.Billing.Fingerprint
   alias JasminEx.Billing.Reservation
+  alias JasminEx.Billing.Settlement
+  alias JasminEx.Billing.Tombstone
   alias JasminEx.Routing
   alias JasminEx.Routing.Config
   alias JasminEx.Routing.ConnectorRef
@@ -271,6 +273,207 @@ defmodule JasminEx.Routing.BillingTest do
     end
   end
 
+  describe "settlement" do
+    @describetag :settle
+
+    test "success ACK captures remainder into a settled_ok tombstone" do
+      {state, admission} = fixture()
+      assert {:ok, open} = State.admit(state, admission, clock())
+      fingerprint = open.reservations["bill-1"].fingerprint
+      assert {:ok, next} = State.settle(open, settle_cmd(admission, :ok))
+      assert next.users["u1"].balance_minor == 400
+      assert next.users["u1"].submit_quota == 2
+      assert next.reservations == %{}
+
+      assert next.tombstones["bill-1"] == %Tombstone{
+               bill_id: "bill-1",
+               fingerprint: fingerprint,
+               state: :settled_ok
+             }
+
+      {full_state, full} = fixture(bill_id: "bill-full", rate_minor: 250, precharge_percent: 100)
+      assert {:ok, full_open} = State.admit(full_state, full, clock())
+      assert {:ok, full_next} = State.settle(full_open, settle_cmd(full, :ok))
+      assert full_next.users["u1"].balance_minor == 250
+      assert full_next.tombstones["bill-full"].state == :settled_ok
+    end
+
+    test "non-OK ACK keeps pre-charge and releases remainder" do
+      {state, admission} = fixture()
+      assert {:ok, open} = State.admit(state, admission, clock())
+      assert {:ok, next} = State.settle(open, settle_cmd(admission, :non_ok))
+      assert next.users["u1"].balance_minor == 490
+      assert next.users["u1"].submit_quota == 2
+      assert next.reservations == %{}
+      assert next.tombstones["bill-1"].state == :settled_non_ok
+
+      {zero_state, zero} = fixture(bill_id: "bill-z", rate_minor: 250, precharge_percent: 0)
+      assert {:ok, zero_open} = State.admit(zero_state, zero, clock())
+      assert {:ok, zero_next} = State.settle(zero_open, settle_cmd(zero, :non_ok))
+      assert zero_next.users["u1"].balance_minor == 500
+
+      {nil_state, unlimited} = fixture(bill_id: "bill-u", balance_minor: nil, submit_quota: nil)
+      assert {:ok, nil_open} = State.admit(nil_state, unlimited, clock())
+      assert {:ok, nil_next} = State.settle(nil_open, settle_cmd(unlimited, :non_ok))
+      assert nil_next.users["u1"].balance_minor == nil
+    end
+
+    test "expiry releases remainder and empty sweep is a no-op" do
+      {state, waiting} = fixture()
+      assert {:ok, open} = State.admit(state, waiting, clock())
+      before = open
+      assert {:ok, ^before, 0} = State.expire_due(open, clock())
+
+      {state, due} = fixture(ttl_ms: 0)
+      assert {:ok, open} = State.admit(state, due, clock())
+      other = admission(bill_id: "bill-2")
+      assert {:ok, open} = State.admit(open, other, clock())
+      assert {:ok, next, 1} = State.expire_due(open, clock())
+      assert next.users["u1"].balance_minor == 390
+      assert next.users["u1"].submit_quota == 1
+      assert next.tombstones["bill-1"].state == :expired
+      assert next.reservations["bill-2"].state == :open
+      assert {:ok, ^next, 0} = State.expire_due(next, clock())
+
+      later = {FakeClock, FakeClock.new(wall_ms: 3_000, monotonic_ms: 2_000)}
+      assert {:ok, expired, 1} = State.expire_due(next, later)
+      assert expired.users["u1"].balance_minor == 480
+      assert expired.reservations == %{}
+      assert expired.tombstones["bill-2"].state == :expired
+    end
+
+    test "late ACK, duplicates, and conflicting identity leave ledger unchanged" do
+      {state, admission} = fixture(ttl_ms: 0)
+      assert {:ok, open} = State.admit(state, admission, clock())
+      assert {:ok, expired, 1} = State.expire_due(open, clock())
+      before = expired
+      assert {:ok, :late_ignored} = State.settle(expired, settle_cmd(admission, :ok))
+      assert {:ok, :late_ignored} = State.settle(expired, settle_cmd(admission, :non_ok))
+      assert expired == before
+
+      {state, admission} = fixture()
+      assert {:ok, open} = State.admit(state, admission, clock())
+      assert {:ok, settled} = State.settle(open, settle_cmd(admission, :ok))
+      before = settled
+      assert {:ok, :duplicate} = State.settle(settled, settle_cmd(admission, :ok))
+
+      assert {:error, :conflicting_settlement} =
+               State.settle(settled, settle_cmd(admission, :non_ok))
+
+      assert {:error, :billing_conflict} =
+               State.settle(settled, settle_cmd(admission(rate_minor: 200), :ok))
+
+      assert {:error, :unknown_bill} = State.settle(state, settle_cmd(admission, :ok))
+      assert {:error, :invalid_bill_id} = State.settle(settled, :not_a_settlement)
+      assert settled == before
+    end
+
+    test "malformed settlement outcome leaves ledger unchanged" do
+      {state, admission} = fixture()
+      assert {:ok, open} = State.admit(state, admission, clock())
+      before = open
+      malformed = %{settle_cmd(admission, :ok) | outcome: :malformed}
+      assert {:error, :invalid_bill_id} = State.settle(open, malformed)
+      assert {:error, :invalid_bill_id} = State.settle(open, %{malformed | outcome: :expired})
+      assert open == before
+      assert open.users["u1"].balance_minor == 400
+      assert open.reservations["bill-1"].state == :open
+      assert open.tombstones == %{}
+    end
+
+    test "retry after expiry uses a new bill_id and never prunes tombstones" do
+      {state, admission} = fixture(ttl_ms: 0, submit_quota: 2)
+      assert {:ok, open} = State.admit(state, admission, clock())
+      assert {:ok, expired, 1} = State.expire_due(open, clock())
+      stone = expired.tombstones["bill-1"]
+      retry = admission(bill_id: "bill-2")
+      assert {:ok, next} = State.admit(expired, retry, clock())
+      assert next.tombstones["bill-1"] == stone
+      assert next.reservations["bill-2"].state == :open
+      assert {:ok, settled} = State.settle(next, settle_cmd(retry, :ok))
+      assert settled.tombstones["bill-1"] == stone
+      assert settled.tombstones["bill-2"].state == :settled_ok
+      assert map_size(settled.tombstones) == 2
+    end
+  end
+
+  describe "router settlement" do
+    @describetag :settle
+    @describetag :tmp_dir
+
+    test "persist-before-publish settlement and expiry", %{tmp_dir: tmp_dir} do
+      {router, config, admission} = start_admitting_router(tmp_dir)
+      assert {:ok, _} = Routing.admit(router, admission)
+      after_admit = Routing.snapshot(router)
+
+      assert {:ok, %Tombstone{state: :settled_ok}} =
+               Routing.settle(router, settle_cmd(admission, :ok))
+
+      published = Routing.snapshot(router)
+      assert published.revision == after_admit.revision + 1
+      assert published.reservations == %{}
+      assert published.tombstones["bill-1"].state == :settled_ok
+      assert published.users["u1"].balance_minor == 400
+      assert {:ok, restored} = Snapshot.restore(config)
+      assert restored.revision == published.revision
+
+      due = admission(bill_id: "bill-due", ttl_ms: 0)
+      assert {:ok, _} = Routing.admit(router, due)
+      after_due = Routing.snapshot(router)
+      assert {:ok, 1} = Routing.expire_due(router)
+      expired = Routing.snapshot(router)
+      assert expired.revision == after_due.revision + 1
+      assert expired.tombstones["bill-due"].state == :expired
+      assert expired.users["u1"].balance_minor == 390
+      assert Process.alive?(router)
+    end
+
+    test "malformed_settlement_call_is_contained", %{tmp_dir: tmp_dir} do
+      {router, config, admission} = start_admitting_router(tmp_dir)
+      assert {:ok, _} = Routing.admit(router, admission)
+      before = Routing.snapshot(router)
+      payload = File.read!(config.snapshot_path)
+      assert {:error, :invalid_bill_id} = Routing.settle(router, :not_a_settlement)
+      assert {:error, :invalid_bill_id} = Routing.settle(router, admission)
+
+      malformed = %{settle_cmd(admission, :ok) | outcome: :malformed}
+      assert {:error, :invalid_bill_id} = Routing.settle(router, malformed)
+      assert_router_unchanged(router, config, before, payload)
+    end
+
+    test "duplicates, late ACK, empty sweep, and errors do not write", %{tmp_dir: tmp_dir} do
+      {router, config, admission} = start_admitting_router(tmp_dir)
+      assert {:ok, _} = Routing.admit(router, admission)
+      before = Routing.snapshot(router)
+      payload = File.read!(config.snapshot_path)
+      assert {:ok, 0} = Routing.expire_due(router)
+      assert_router_unchanged(router, config, before, payload)
+
+      assert {:ok, %Tombstone{}} = Routing.settle(router, settle_cmd(admission, :ok))
+      after_settle = Routing.snapshot(router)
+      payload = File.read!(config.snapshot_path)
+      assert {:ok, :duplicate} = Routing.settle(router, settle_cmd(admission, :ok))
+
+      assert {:error, :conflicting_settlement} =
+               Routing.settle(router, settle_cmd(admission, :non_ok))
+
+      assert {:ok, :duplicate, %Bill{}, %Fingerprint{}} = Routing.admit(router, admission)
+      assert_router_unchanged(router, config, after_settle, payload)
+
+      due = admission(bill_id: "bill-due", ttl_ms: 0)
+      assert {:ok, _} = Routing.admit(router, due)
+      assert {:ok, 1} = Routing.expire_due(router)
+      after_exp = Routing.snapshot(router)
+      payload = File.read!(config.snapshot_path)
+      assert {:ok, :late_ignored} = Routing.settle(router, settle_cmd(due, :ok))
+
+      assert {:error, :unknown_bill} =
+               Routing.settle(router, settle_cmd(admission(bill_id: "missing"), :ok))
+
+      assert_router_unchanged(router, config, after_exp, payload)
+    end
+  end
+
   test "rejects invalid user balance, quota, and route rate fields unchanged" do
     {:ok, group} = Group.new(gid: "ops")
     {:ok, connector} = ConnectorRef.new("smpp-t")
@@ -374,6 +577,19 @@ defmodule JasminEx.Routing.BillingTest do
     assert Routing.snapshot(router) == before
     assert Routing.snapshot(router).revision == before.revision
     assert File.read!(config.snapshot_path) == payload
+  end
+
+  defp settle_cmd(admission, outcome) do
+    {:ok, fingerprint} = Fingerprint.compute(admission.bill)
+
+    {:ok, settlement} =
+      Settlement.new(
+        bill_id: admission.bill.bill_id,
+        fingerprint: fingerprint,
+        outcome: outcome
+      )
+
+    settlement
   end
 
   defp admission(opts) do

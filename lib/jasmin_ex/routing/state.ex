@@ -5,6 +5,8 @@ defmodule JasminEx.Routing.State do
   alias JasminEx.Billing.Bill
   alias JasminEx.Billing.Clock
   alias JasminEx.Billing.Reservation
+  alias JasminEx.Billing.Settlement
+  alias JasminEx.Billing.Tombstone
   alias JasminEx.Routing.Group
   alias JasminEx.Routing.Route
   alias JasminEx.Routing.RouteTable
@@ -23,7 +25,7 @@ defmodule JasminEx.Routing.State do
           routes: RouteTable.t(),
           revision: non_neg_integer(),
           reservations: %{optional(binary()) => Reservation.t()},
-          tombstones: map()
+          tombstones: %{optional(binary()) => Tombstone.t()}
         }
 
   @spec new() :: t()
@@ -82,6 +84,30 @@ defmodule JasminEx.Routing.State do
 
   def admit(%__MODULE__{}, _admission, _clock), do: {:error, :invalid_bill_id}
 
+  @spec settle(t(), term()) ::
+          {:ok, t()} | {:ok, :duplicate} | {:ok, :late_ignored} | {:error, atom()}
+  def settle(%__MODULE__{} = state, %Settlement{bill_id: bill_id} = settlement) do
+    case {Map.get(state.tombstones, bill_id), Map.get(state.reservations, bill_id)} do
+      {%Tombstone{} = stone, _} -> Tombstone.classify(stone, settlement)
+      {_, %Reservation{} = reservation} -> open_settle(state, reservation, settlement)
+      {nil, nil} -> {:error, :unknown_bill}
+    end
+  end
+
+  def settle(%__MODULE__{}, _settlement), do: {:error, :invalid_bill_id}
+
+  @spec expire_due(t(), Clock.clock()) :: {:ok, t(), non_neg_integer()}
+  def expire_due(%__MODULE__{} = state, clock) do
+    now = Clock.monotonic_ms(clock)
+
+    due =
+      Enum.filter(state.reservations, fn {_id, reservation} ->
+        reservation.monotonic_deadline_ms <= now
+      end)
+
+    {:ok, Enum.reduce(due, state, &expire_one/2), length(due)}
+  end
+
   defp drop_group(_state, {nil, _groups}), do: {:error, :unknown_group}
 
   defp drop_group(state, {%Group{gid: gid}, groups}) do
@@ -123,4 +149,47 @@ defmodule JasminEx.Routing.State do
     do: {:ok, quota - debit}
 
   defp debit_quota(_quota, _debit), do: {:error, :insufficient_quota}
+
+  defp open_settle(state, reservation, %Settlement{fingerprint: fingerprint, outcome: outcome}) do
+    cond do
+      reservation.fingerprint != fingerprint ->
+        {:error, :billing_conflict}
+
+      outcome == :ok ->
+        close(state, reservation, :settled_ok, 0)
+
+      outcome == :non_ok ->
+        close(state, reservation, :settled_non_ok, reservation.refundable_minor)
+
+      true ->
+        {:error, :invalid_bill_id}
+    end
+  end
+
+  defp expire_one({_bill_id, reservation}, state) do
+    {:ok, next} = close(state, reservation, :expired, reservation.refundable_minor)
+    next
+  end
+
+  defp close(state, reservation, tombstone_state, credit) do
+    with {:ok, user} <- fetch_user(state, reservation.uid),
+         {:ok, balance_minor} <- credit_balance(user.balance_minor, credit),
+         {:ok, stone} <- Tombstone.seal(reservation, tombstone_state) do
+      user = %{user | balance_minor: balance_minor}
+
+      {:ok,
+       %{
+         state
+         | users: Map.put(state.users, user.uid, user),
+           reservations: Map.delete(state.reservations, reservation.bill_id),
+           tombstones: Map.put(state.tombstones, reservation.bill_id, stone)
+       }}
+    end
+  end
+
+  defp credit_balance(nil, _amount), do: {:ok, nil}
+
+  defp credit_balance(balance, amount)
+       when is_integer(balance) and is_integer(amount) and amount >= 0,
+       do: {:ok, balance + amount}
 end

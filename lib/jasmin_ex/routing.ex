@@ -33,6 +33,15 @@ defmodule JasminEx.Routing do
           | {:error, atom()}
   defdelegate admit(server, admission), to: Router
 
+  @spec settle(GenServer.server(), term()) ::
+          {:ok, JasminEx.Billing.Tombstone.t()}
+          | {:ok, :duplicate | :late_ignored}
+          | {:error, atom()}
+  defdelegate settle(server, settlement), to: Router
+
+  @spec expire_due(GenServer.server()) :: {:ok, non_neg_integer()} | {:error, atom()}
+  defdelegate expire_due(server), to: Router
+
   @spec authenticate(GenServer.server(), String.t(), term()) ::
           {:ok, User.t()} | {:error, :invalid_credentials | :user_disabled | :group_disabled}
   def authenticate(server, username, secret) do
