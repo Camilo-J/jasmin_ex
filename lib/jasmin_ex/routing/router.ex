@@ -49,6 +49,15 @@ defmodule JasminEx.Routing.Router do
   @spec expire_due(GenServer.server()) :: {:ok, non_neg_integer()} | {:error, atom()}
   def expire_due(server), do: GenServer.call(server, :expire_due)
 
+  @spec set_balance(GenServer.server(), term(), term()) :: {:ok, User.t()} | {:error, atom()}
+  def set_balance(server, uid, amount), do: GenServer.call(server, {:set_balance, uid, amount})
+
+  @spec set_quota(GenServer.server(), term(), term()) :: {:ok, User.t()} | {:error, atom()}
+  def set_quota(server, uid, amount), do: GenServer.call(server, {:set_quota, uid, amount})
+
+  @spec set_rate(GenServer.server(), term(), term()) :: {:ok, Route.t()} | {:error, atom()}
+  def set_rate(server, order, rate), do: GenServer.call(server, {:set_rate, order, rate})
+
   @impl true
   def init(opts) do
     config = Keyword.get(opts, :config) || Config.new()
@@ -111,6 +120,23 @@ defmodule JasminEx.Routing.Router do
     mutate(state, fn -> expire_change(state) end)
   end
 
+  def handle_call({:set_balance, uid, amount}, _from, state) do
+    mutate_billing(state, fn -> wrap_admin(State.set_balance(state, uid, amount)) end)
+  end
+
+  def handle_call({:set_quota, uid, amount}, _from, state) do
+    mutate_billing(state, fn -> wrap_admin(State.set_quota(state, uid, amount)) end)
+  end
+
+  def handle_call({:set_rate, order, rate}, _from, state) do
+    mutate_billing(state, fn -> wrap_admin(State.set_rate(state, order, rate)) end)
+  end
+
+  def handle_call(request, _from, state)
+      when is_tuple(request) and elem(request, 0) in [:set_balance, :set_quota, :set_rate] do
+    {:reply, {:error, :invalid_amount}, state}
+  end
+
   defp admit_change(state, %Admission{bill: %Bill{bill_id: bill_id}} = admission) do
     case {Map.get(state.tombstones, bill_id), Map.get(state.reservations, bill_id)} do
       {%Tombstone{} = stone, _} ->
@@ -168,6 +194,20 @@ defmodule JasminEx.Routing.Router do
     case State.expire_due(state, clock()) do
       {:ok, _state, 0} -> {:unchanged, {:ok, 0}}
       {:ok, next, count} -> {:ok, next, count}
+    end
+  end
+
+  defp wrap_admin({:unchanged, value}), do: {:unchanged, {:ok, value}}
+  defp wrap_admin(other), do: other
+
+  defp mutate_billing(state, fun) do
+    case mutate(state, fun) do
+      {:reply, {:ok, value}, %{revision: revision} = next} when revision != state.revision ->
+        Telemetry.emit([:billing], %{count: 1, bytes: 0}, %{outcome: :ok})
+        {:reply, {:ok, value}, next}
+
+      other ->
+        other
     end
   end
 
