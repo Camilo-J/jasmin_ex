@@ -34,6 +34,7 @@ defmodule JasminEx.Routing.BillingTest do
   alias JasminEx.Routing.Config
   alias JasminEx.Routing.ConnectorRef
   alias JasminEx.Routing.Group
+  alias JasminEx.Routing.Routable
   alias JasminEx.Routing.Route
   alias JasminEx.Routing.Router
   alias JasminEx.Routing.Snapshot
@@ -502,6 +503,92 @@ defmodule JasminEx.Routing.BillingTest do
                Routing.settle(router, settle_cmd(admission(bill_id: "missing"), :ok))
 
       assert_router_unchanged(router, config, after_exp, payload)
+    end
+  end
+
+  describe "administration" do
+    @describetag :admin
+    @describetag :tmp_dir
+
+    test "administration mutation persists balance, quota, and rate", %{tmp_dir: tmp_dir} do
+      {router, config, _admission} = start_admitting_router(tmp_dir)
+      before = Routing.snapshot(router)
+
+      assert {:ok, %User{balance_minor: 900}} = Routing.set_balance(router, "u1", 900)
+      assert {:ok, %User{submit_quota: 12}} = Routing.set_quota(router, "u1", 12)
+      assert {:ok, %Route{rate_minor: 250}} = Routing.set_rate(router, 10, 250)
+
+      published = Routing.snapshot(router)
+      assert published.revision == before.revision + 3
+      assert published.users["u1"].balance_minor == 900
+      assert published.users["u1"].submit_quota == 12
+      assert published.routes.routes[10].rate_minor == 250
+      assert {:ok, restored} = Snapshot.restore(config)
+      assert restored.revision == published.revision
+      assert restored.users["u1"].balance_minor == 900
+      assert restored.users["u1"].submit_quota == 12
+      assert restored.routes.routes[10].rate_minor == 250
+      assert Process.alive?(router)
+    end
+
+    test "unlimited nil and unchanged admin values do not write on no-op", %{tmp_dir: tmp_dir} do
+      {router, config, _admission} = start_admitting_router(tmp_dir)
+      assert {:ok, %User{balance_minor: nil}} = Routing.set_balance(router, "u1", nil)
+      assert {:ok, %User{submit_quota: nil}} = Routing.set_quota(router, "u1", nil)
+      published = Routing.snapshot(router)
+      payload = File.read!(config.snapshot_path)
+      assert {:ok, %User{balance_minor: nil}} = Routing.set_balance(router, "u1", nil)
+      assert {:ok, %User{submit_quota: nil}} = Routing.set_quota(router, "u1", nil)
+      assert {:ok, %Route{rate_minor: 100}} = Routing.set_rate(router, 10, 100)
+      assert_router_unchanged(router, config, published, payload)
+    end
+
+    test "malformed_admin_call_is_contained", %{tmp_dir: tmp_dir} do
+      {router, config, _admission} = start_admitting_router(tmp_dir)
+      before = Routing.snapshot(router)
+      payload = File.read!(config.snapshot_path)
+      overflow = 9_223_372_036_854_775_808
+
+      assert {:error, :unknown_user} = Routing.set_balance(router, :not_a_uid, 1)
+      assert {:error, :invalid_amount} = Routing.set_balance(router, "u1", :nope)
+      assert {:error, :invalid_amount} = Routing.set_balance(router, "u1", -1)
+      assert {:error, :amount_overflow} = Routing.set_balance(router, "u1", overflow)
+      assert {:error, :unknown_user} = Routing.set_quota(router, "missing", 1)
+      assert {:error, :unknown_route} = Routing.set_rate(router, :nope, 1)
+      assert {:error, :unknown_route} = Routing.set_rate(router, 99, 1)
+      assert {:error, :invalid_amount} = Routing.set_rate(router, 10, :nope)
+      assert {:error, :invalid_amount} = Routing.set_rate(router, 10, -1)
+      assert {:error, :amount_overflow} = Routing.set_rate(router, 10, overflow)
+      assert {:error, :invalid_amount} = GenServer.call(router, {:set_balance, "u1"})
+      assert {:error, :invalid_amount} = GenServer.call(router, {:set_quota, "u1"})
+      assert {:error, :invalid_amount} = GenServer.call(router, {:set_rate, 10})
+      assert_router_unchanged(router, config, before, payload)
+    end
+
+    test "connector-only success has no production transport side effect", %{tmp_dir: tmp_dir} do
+      {router, _config, admission} = start_admitting_router(tmp_dir)
+      assert {:ok, _} = Routing.set_rate(router, 10, 50)
+      assert {:ok, _} = Routing.admit(router, admission)
+      snap = Routing.snapshot(router)
+      user = snap.users["u1"]
+      group = snap.groups["ops"]
+
+      assert {:ok, routable} =
+               Routable.new(
+                 user: user,
+                 group: group,
+                 source: "1616",
+                 destination: "21200000",
+                 content: "hello",
+                 tags: []
+               )
+
+      assert {:ok, %ConnectorRef{id: "smpp-t"} = resolved} = Routing.resolve(router, routable)
+      assert resolved == snap.routes.routes[10].connector
+      refute is_map_key(Map.from_struct(resolved), :rate_minor)
+      refute Process.whereis(JasminEx.Messaging.RabbitMQ.Supervisor)
+      refute Process.whereis(JasminEx.Messaging.RabbitMQ.Connection)
+      assert Process.alive?(router)
     end
   end
 

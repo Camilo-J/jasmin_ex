@@ -42,6 +42,21 @@ defmodule JasminEx.Routing do
   @spec expire_due(GenServer.server()) :: {:ok, non_neg_integer()} | {:error, atom()}
   defdelegate expire_due(server), to: Router
 
+  @doc """
+  Set a user's integer balance in minor units and persist before publication.
+
+  `nil` means unlimited. An unchanged value is a no-op. Invalid input fails
+  typed without a write or revision change.
+  """
+  @spec set_balance(GenServer.server(), term(), term()) :: {:ok, User.t()} | {:error, atom()}
+  defdelegate set_balance(server, uid, amount), to: Router
+
+  @spec set_quota(GenServer.server(), term(), term()) :: {:ok, User.t()} | {:error, atom()}
+  defdelegate set_quota(server, uid, amount), to: Router
+
+  @spec set_rate(GenServer.server(), term(), term()) :: {:ok, Route.t()} | {:error, atom()}
+  defdelegate set_rate(server, order, rate), to: Router
+
   @spec authenticate(GenServer.server(), String.t(), term()) ::
           {:ok, User.t()} | {:error, :invalid_credentials | :user_disabled | :group_disabled}
   def authenticate(server, username, secret) do

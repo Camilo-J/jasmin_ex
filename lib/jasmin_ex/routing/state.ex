@@ -64,6 +64,41 @@ defmodule JasminEx.Routing.State do
 
   def delete_group(%__MODULE__{}, _gid), do: {:error, :unknown_group}
 
+  @max_int64 9_223_372_036_854_775_807
+
+  @spec set_balance(t(), term(), term()) ::
+          {:ok, t(), User.t()} | {:unchanged, User.t()} | {:error, atom()}
+  def set_balance(%__MODULE__{} = state, uid, amount) when is_binary(uid) do
+    put_user_amount(state, uid, amount, :balance_minor)
+  end
+
+  def set_balance(%__MODULE__{}, _uid, _amount), do: {:error, :unknown_user}
+
+  @spec set_quota(t(), term(), term()) ::
+          {:ok, t(), User.t()} | {:unchanged, User.t()} | {:error, atom()}
+  def set_quota(%__MODULE__{} = state, uid, amount) when is_binary(uid) do
+    put_user_amount(state, uid, amount, :submit_quota)
+  end
+
+  def set_quota(%__MODULE__{}, _uid, _amount), do: {:error, :unknown_user}
+
+  @spec set_rate(t(), term(), term()) ::
+          {:ok, t(), Route.t()} | {:unchanged, Route.t()} | {:error, atom()}
+  def set_rate(%__MODULE__{} = state, order, rate) when is_integer(order) and order >= 0 do
+    with {:ok, rate} <- validate_rate(rate),
+         {:ok, route} <- fetch_route(state, order) do
+      if route.rate_minor == rate do
+        {:unchanged, route}
+      else
+        route = %{route | rate_minor: rate}
+        {:ok, table} = RouteTable.put(state.routes, route)
+        {:ok, %{state | routes: table}, route}
+      end
+    end
+  end
+
+  def set_rate(%__MODULE__{}, _order, _rate), do: {:error, :unknown_route}
+
   @spec admit(t(), term(), Clock.clock()) :: {:ok, t()} | {:error, atom()}
   def admit(%__MODULE__{} = state, %Admission{bill: %Bill{} = bill} = admission, clock) do
     with {:ok, user} <- fetch_user(state, bill.uid),
@@ -120,6 +155,37 @@ defmodule JasminEx.Routing.State do
       existing_uid != uid and user.username == username
     end)
   end
+
+  defp put_user_amount(state, uid, amount, field) do
+    with {:ok, amount} <- validate_optional_amount(amount),
+         {:ok, user} <- fetch_user(state, uid) do
+      if Map.fetch!(user, field) == amount do
+        {:unchanged, user}
+      else
+        user = Map.put(user, field, amount)
+        {:ok, %{state | users: Map.put(state.users, uid, user)}, user}
+      end
+    end
+  end
+
+  defp validate_optional_amount(nil), do: {:ok, nil}
+
+  defp validate_optional_amount(amount) when is_integer(amount) and amount < 0,
+    do: {:error, :invalid_amount}
+
+  defp validate_optional_amount(amount) when is_integer(amount) and amount > @max_int64,
+    do: {:error, :amount_overflow}
+
+  defp validate_optional_amount(amount) when is_integer(amount), do: {:ok, amount}
+  defp validate_optional_amount(_amount), do: {:error, :invalid_amount}
+
+  defp validate_rate(rate) when is_integer(rate) and rate >= 0 and rate <= @max_int64,
+    do: {:ok, rate}
+
+  defp validate_rate(rate) when is_integer(rate) and rate > @max_int64,
+    do: {:error, :amount_overflow}
+
+  defp validate_rate(_rate), do: {:error, :invalid_amount}
 
   defp fetch_user(state, uid) do
     case Map.fetch(state.users, uid) do
