@@ -428,6 +428,37 @@ defmodule JasminEx.Routing.BillingTest do
       assert Process.alive?(router)
     end
 
+    test "restart_duplicate", %{tmp_dir: tmp_dir} do
+      {router, config, admission} = start_admitting_router(tmp_dir)
+      assert {:ok, _} = Routing.admit(router, admission)
+      :ok = stop_supervised(Router)
+      router = start_supervised!({Router, config: config})
+      assert {:ok, :duplicate, %Bill{}, %Fingerprint{}} = Routing.admit(router, admission)
+
+      assert {:ok, %Tombstone{state: :settled_ok}} =
+               Routing.settle(router, settle_cmd(admission, :ok))
+
+      :ok = stop_supervised(Router)
+      router = start_supervised!({Router, config: config})
+      assert {:ok, :duplicate} = Routing.settle(router, settle_cmd(admission, :ok))
+      assert Routing.snapshot(router).tombstones["bill-1"].state == :settled_ok
+      assert Process.alive?(router)
+    end
+
+    test "restart_expiry", %{tmp_dir: tmp_dir} do
+      {router, config, admission} = start_admitting_router(tmp_dir)
+      assert {:ok, _} = Routing.admit(router, admission)
+      :ok = stop_supervised(Router)
+      due = %{config | clock: {FakeClock, FakeClock.new(wall_ms: 2_000, monotonic_ms: 1_010)}}
+      router = start_supervised!({Router, config: due})
+      assert {:ok, 1} = Routing.expire_due(router)
+      expired = Routing.snapshot(router)
+      assert expired.reservations == %{}
+      assert expired.tombstones["bill-1"].state == :expired
+      assert expired.users["u1"].balance_minor == 490
+      assert Process.alive?(router)
+    end
+
     test "malformed_settlement_call_is_contained", %{tmp_dir: tmp_dir} do
       {router, config, admission} = start_admitting_router(tmp_dir)
       assert {:ok, _} = Routing.admit(router, admission)

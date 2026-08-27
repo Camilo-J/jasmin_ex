@@ -53,7 +53,7 @@ defmodule JasminEx.Routing.SnapshotTest do
       ~s({"version":2,"revision":0,"groups":[],"users":[],"routes":[]})
     )
 
-    assert {:error, {:restore_failed, :unsupported_version}} = Snapshot.restore(config)
+    assert {:error, {:restore_failed, :invalid_state}} = Snapshot.restore(config)
 
     File.write!(
       config.snapshot_path,
