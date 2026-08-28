@@ -8,7 +8,8 @@ defmodule JasminEx.Routing.User do
   @username_pattern ~r/^[A-Za-z0-9_-]{1,15}$/
 
   @enforce_keys [:uid, :gid, :username, :credential, :enabled]
-  defstruct [:uid, :gid, :username, :credential, :enabled, balance_minor: nil, submit_quota: nil]
+  defstruct @enforce_keys ++
+              [balance_minor: nil, submit_quota: nil, smpp_credential: nil, max_bindings: 0]
 
   @type t :: %__MODULE__{
           uid: String.t(),
@@ -17,7 +18,9 @@ defmodule JasminEx.Routing.User do
           credential: Credential.t(),
           enabled: boolean(),
           balance_minor: non_neg_integer() | nil,
-          submit_quota: non_neg_integer() | nil
+          submit_quota: non_neg_integer() | nil,
+          smpp_credential: Credential.t() | nil,
+          max_bindings: non_neg_integer()
         }
 
   @max_int64 9_223_372_036_854_775_807
@@ -54,6 +57,21 @@ defmodule JasminEx.Routing.User do
   end
 
   def new(_attrs), do: {:error, :unknown_group}
+
+  @spec set_smpp_secret(t(), term()) :: {:ok, t()} | {:error, :invalid_secret}
+  def set_smpp_secret(%__MODULE__{} = user, secret) do
+    with {:ok, credential} <- Credential.hash(secret) do
+      {:ok, %{user | smpp_credential: credential}}
+    end
+  end
+
+  @spec set_max_bindings(t(), term()) :: {:ok, t()} | {:error, :invalid_max_bindings}
+  def set_max_bindings(%__MODULE__{} = user, limit)
+      when is_integer(limit) and limit >= 0 and limit <= @max_int64 do
+    {:ok, %{user | max_bindings: limit}}
+  end
+
+  def set_max_bindings(%__MODULE__{}, _limit), do: {:error, :invalid_max_bindings}
 
   defp require_group(%Group{} = group), do: {:ok, group}
   defp require_group(_group), do: {:error, :unknown_group}

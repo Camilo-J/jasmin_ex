@@ -82,6 +82,31 @@ defmodule JasminEx.Routing.State do
 
   def set_quota(%__MODULE__{}, _uid, _amount), do: {:error, :unknown_user}
 
+  @spec set_smpp_secret(t(), term(), term()) :: {:ok, t(), User.t()} | {:error, atom()}
+  def set_smpp_secret(%__MODULE__{} = state, uid, secret) when is_binary(uid) do
+    with {:ok, user} <- fetch_user(state, uid),
+         {:ok, user} <- User.set_smpp_secret(user, secret) do
+      {:ok, %{state | users: Map.put(state.users, uid, user)}, user}
+    end
+  end
+
+  def set_smpp_secret(%__MODULE__{}, _uid, _secret), do: {:error, :unknown_user}
+
+  @spec set_max_bindings(t(), term(), term()) ::
+          {:ok, t(), User.t()} | {:unchanged, User.t()} | {:error, atom()}
+  def set_max_bindings(%__MODULE__{} = state, uid, limit) when is_binary(uid) do
+    with {:ok, user} <- fetch_user(state, uid),
+         {:ok, user} <- User.set_max_bindings(user, limit) do
+      if state.users[uid].max_bindings == user.max_bindings do
+        {:unchanged, user}
+      else
+        {:ok, %{state | users: Map.put(state.users, uid, user)}, user}
+      end
+    end
+  end
+
+  def set_max_bindings(%__MODULE__{}, _uid, _limit), do: {:error, :unknown_user}
+
   @spec set_rate(t(), term(), term()) ::
           {:ok, t(), Route.t()} | {:unchanged, Route.t()} | {:error, atom()}
   def set_rate(%__MODULE__{} = state, order, rate) when is_integer(order) and order >= 0 do
