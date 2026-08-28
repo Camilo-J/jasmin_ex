@@ -130,4 +130,19 @@ defmodule JasminEx.Smpp.FramingTest do
       assert ddc.command == :enquire_link_resp
     end
   end
+
+  describe "feed_strict/2" do
+    test "rejects zero, oversized, and malformed declared lengths" do
+      assert {:error, :zero_length} = Framing.feed_strict(<<>>, <<0::32, 0::32, 0::32, 0::32>>)
+      assert {:error, :oversized} = Framing.feed_strict(<<>>, <<70_000::32, 0::32, 0::32, 0::32>>)
+      assert {:error, :malformed} = Framing.feed_strict(<<>>, <<12::32, 0::32, 0::32, 0::32>>)
+    end
+
+    test "emits complete PDUs while feed/2 still drops a short declared length" do
+      full = pdu_bytes(:enquire_link, 1, <<>>)
+      assert {:ok, [^full], <<>>} = Framing.feed_strict(<<>>, full)
+      bad = <<12::32, 0x0000_0004::32, 0::32, 0::32>>
+      assert {[], _rest} = Framing.feed(<<>>, bad)
+    end
+  end
 end

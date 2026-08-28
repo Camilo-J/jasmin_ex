@@ -10,6 +10,7 @@ defmodule JasminEx.Application do
   alias JasminEx.Routing.Config, as: RoutingConfig
   alias JasminEx.Routing.Router
   alias JasminEx.Smpp.ConnectorSupervisor
+  alias JasminEx.Smpp.Server
   alias JasminEx.StateStore.Config
 
   @state_store_connection JasminEx.StateStore.Connection
@@ -19,7 +20,8 @@ defmodule JasminEx.Application do
     [state_store_child(Keyword.get(config, :state_store, []))] ++
       [routing_child(Keyword.get(config, :routing, []))] ++
       messaging_children(Keyword.get(config, :messaging, [])) ++
-      smpp_children(config)
+      smpp_children(config) ++
+      smpp_server_children(config)
   end
 
   @impl true
@@ -29,7 +31,8 @@ defmodule JasminEx.Application do
         state_store: Application.get_env(:jasmin_ex, :state_store, []),
         routing: Application.get_env(:jasmin_ex, :routing, []),
         messaging: Application.get_env(:jasmin_ex, :messaging, []),
-        smpp_connectors: Application.get_env(:jasmin_ex, :smpp_connectors, [])
+        smpp_connectors: Application.get_env(:jasmin_ex, :smpp_connectors, []),
+        smpp_server: Application.get_env(:jasmin_ex, :smpp_server, [])
       )
 
     # See https://hexdocs.pm/elixir/Supervisor.html
@@ -82,6 +85,17 @@ defmodule JasminEx.Application do
     case Keyword.get(config, :smpp_connectors, []) do
       [] -> []
       connectors -> [{ConnectorSupervisor, connectors}]
+    end
+  end
+
+  defp smpp_server_children(config) do
+    options = Keyword.get(config, :smpp_server, [])
+    server = Server.Config.new(options)
+
+    if server.enabled do
+      [{Server.Supervisor, [config: server, router: Keyword.get(options, :router, Router)]}]
+    else
+      []
     end
   end
 end
