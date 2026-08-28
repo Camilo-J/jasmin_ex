@@ -101,6 +101,37 @@ defmodule JasminEx.Routing.SnapshotTest do
              start_supervised({Routing.Router, [config: corrupt]}, id: :corrupt)
   end
 
+  test "v1/v2 invent no SMPP secret; v3 round-trips hashed secret; bad v3 fails closed", %{
+    tmp_dir: tmp_dir
+  } do
+    assert {:ok, v1} = Snapshot.restore(write_json(tmp_dir, "v1", legacy(1)))
+    assert {v1.users["u1"].smpp_credential, v1.users["u1"].max_bindings} == {nil, 0}
+    assert {:ok, v2} = Snapshot.restore(write_json(tmp_dir, "v2", legacy(2)))
+    assert {v2.users["u1"].smpp_credential, v2.users["u1"].max_bindings} == {nil, 0}
+
+    {:ok, user} = User.set_smpp_secret(persisted_state().users["u1"], "smpp-secret")
+    {:ok, user} = User.set_max_bindings(user, 2)
+    {:ok, state} = State.put_user(%{persisted_state() | users: %{}}, user)
+    config = tmp_config(tmp_dir, "v3")
+    assert :ok = Snapshot.write(state, config)
+    assert %{"version" => 3} = config.snapshot_path |> File.read!() |> :json.decode()
+    refute File.read!(config.snapshot_path) =~ "smpp-secret"
+    assert {:ok, restored} = Snapshot.restore(config)
+    assert restored.users["u1"].max_bindings == 2
+    assert Credential.verify(restored.users["u1"].smpp_credential, "smpp-secret")
+
+    bad_user =
+      Map.merge(hd(legacy(2)["users"]), %{"smpp_credential" => "plaintext", "max_bindings" => 2})
+
+    bad = %{legacy(2) | "version" => 3, "users" => [bad_user]}
+
+    assert {:error, {:restore_failed, :invalid_state}} =
+             Snapshot.restore(write_json(tmp_dir, "bad", bad))
+
+    assert {:error, {:restore_failed, :unsupported_version}} =
+             Snapshot.restore(write_json(tmp_dir, "v4", Map.put(legacy(2), "version", 4)))
+  end
+
   test "missing restore stays empty when leftover /tmp/jr-missing snapshot exists", %{
     tmp_dir: tmp_dir
   } do
@@ -154,6 +185,23 @@ defmodule JasminEx.Routing.SnapshotTest do
       snapshot_path: Path.join([tmp_dir, label, "routing-v1.json"]),
       file_ops: file_ops
     )
+  end
+
+  defp write_json(tmp_dir, label, map) do
+    config = tmp_config(tmp_dir, label)
+    File.mkdir_p!(Path.dirname(config.snapshot_path))
+    File.write!(config.snapshot_path, map |> :json.encode() |> IO.iodata_to_binary())
+    config
+  end
+
+  @v1_json ~s({"version":1,"revision":1,"groups":[{"gid":"ops","enabled":true}],"users":[{"uid":"u1","gid":"ops","username":"alice","enabled":true,"credential":{"algorithm":"pbkdf2-hmac-sha256-v1","iterations":600000,"salt":"AAAAAAAAAAAAAAAAAAAAAA==","digest":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}}],"routes":[]})
+
+  defp legacy(1), do: :json.decode(@v1_json)
+
+  defp legacy(2) do
+    v1 = legacy(1)
+    user = Map.merge(hd(v1["users"]), %{"balance_minor" => :null, "submit_quota" => :null})
+    Map.merge(v1, %{"version" => 2, "users" => [user], "reservations" => [], "tombstones" => []})
   end
 
   defp isolated_snapshot_path?(path, tmp_dir) do

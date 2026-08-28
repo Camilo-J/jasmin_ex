@@ -63,7 +63,7 @@ defmodule JasminEx.Routing.Snapshot do
 
   defp encode(state) do
     %{
-      "version" => 2,
+      "version" => 3,
       "revision" => state.revision,
       "groups" =>
         Enum.map(Map.values(state.groups), &%{"gid" => &1.gid, "enabled" => &1.enabled}),
@@ -80,14 +80,22 @@ defmodule JasminEx.Routing.Snapshot do
       "gid" => user.gid,
       "username" => user.username,
       "enabled" => user.enabled,
-      "credential" => %{
-        "algorithm" => cred.algorithm,
-        "iterations" => cred.iterations,
-        "salt" => Base.encode64(cred.salt),
-        "digest" => Base.encode64(cred.digest)
-      },
+      "credential" => encode_credential(cred),
       "balance_minor" => json_amount(user.balance_minor),
-      "submit_quota" => json_amount(user.submit_quota)
+      "submit_quota" => json_amount(user.submit_quota),
+      "smpp_credential" => encode_credential(user.smpp_credential),
+      "max_bindings" => user.max_bindings
+    }
+  end
+
+  defp encode_credential(nil), do: :null
+
+  defp encode_credential(cred) do
+    %{
+      "algorithm" => cred.algorithm,
+      "iterations" => cred.iterations,
+      "salt" => Base.encode64(cred.salt),
+      "digest" => Base.encode64(cred.digest)
     }
   end
 
@@ -121,7 +129,7 @@ defmodule JasminEx.Routing.Snapshot do
     _error -> {:error, :invalid_json}
   end
 
-  defp version(%{"version" => version}) when version in [1, 2], do: :ok
+  defp version(%{"version" => version}) when version in [1, 2, 3], do: :ok
   defp version(%{"version" => _version}), do: {:error, :unsupported_version}
   defp version(_map), do: {:error, :invalid_json}
 
@@ -145,7 +153,7 @@ defmodule JasminEx.Routing.Snapshot do
 
   defp load(
          %{
-           "version" => 2,
+           "version" => version,
            "revision" => rev,
            "groups" => groups,
            "users" => users,
@@ -155,10 +163,13 @@ defmodule JasminEx.Routing.Snapshot do
          },
          clock
        )
-       when is_integer(rev) and rev >= 0 and is_list(groups) and is_list(users) and
-              is_list(routes) and is_list(reservations) and is_list(tombstones) do
+       when version in [2, 3] and is_integer(rev) and rev >= 0 and is_list(groups) and
+              is_list(users) and is_list(routes) and is_list(reservations) and
+              is_list(tombstones) do
+    loader = if(version == 3, do: &load_user_v3/2, else: &load_user_v2/2)
+
     with {:ok, state} <- reduce_state(State.new(), groups, &load_group/2),
-         {:ok, state} <- reduce_state(state, users, &load_user_v2/2),
+         {:ok, state} <- reduce_state(state, users, loader),
          {:ok, state} <- reduce_state(state, routes, &load_route_v2/2),
          {:ok, state} <- reduce_state(state, reservations, &load_reservation(&1, &2, clock)),
          {:ok, state} <- reduce_state(state, tombstones, &load_tombstone/2),
@@ -319,6 +330,25 @@ defmodule JasminEx.Routing.Snapshot do
   end
 
   defp load_user_v2(_state, _attrs), do: {:error, :invalid_state}
+
+  defp load_user_v3(state, %{"smpp_credential" => smpp, "max_bindings" => max} = attrs) do
+    with {:ok, state} <- load_user_v2(state, attrs),
+         {:ok, smpp} <- decode_optional_credential(smpp),
+         {:ok, max} <- decode_max_bindings(max) do
+      user = state.users[attrs["uid"]]
+      State.put_user(state, %{user | smpp_credential: smpp, max_bindings: max})
+    else
+      _error -> {:error, :invalid_state}
+    end
+  end
+
+  defp load_user_v3(_state, _attrs), do: {:error, :invalid_state}
+
+  defp decode_optional_credential(:null), do: {:ok, nil}
+  defp decode_optional_credential(attrs), do: decode_credential(attrs)
+
+  defp decode_max_bindings(n) when is_integer(n) and n >= 0 and n <= @max_int64, do: {:ok, n}
+  defp decode_max_bindings(_n), do: {:error, :invalid_state}
 
   defp load_route_v2(state, %{"rate_minor" => rate, "precharge_percent" => percent} = attrs) do
     with {:ok, connector} <- decode_connector(attrs["connector"]),

@@ -53,6 +53,8 @@ defmodule JasminEx.Routing do
 
   @spec set_quota(GenServer.server(), term(), term()) :: {:ok, User.t()} | {:error, atom()}
   defdelegate set_quota(server, uid, amount), to: Router
+  defdelegate set_smpp_secret(server, uid, secret), to: Router
+  defdelegate set_max_bindings(server, uid, limit), to: Router
 
   @spec set_rate(GenServer.server(), term(), term()) :: {:ok, Route.t()} | {:error, atom()}
   defdelegate set_rate(server, order, rate), to: Router
@@ -61,6 +63,10 @@ defmodule JasminEx.Routing do
           {:ok, User.t()} | {:error, :invalid_credentials | :user_disabled | :group_disabled}
   def authenticate(server, username, secret) do
     authenticate_snapshot(Router.snapshot(server), username, secret)
+  end
+
+  def authenticate_smpp(server, system_id, secret) do
+    authenticate_smpp_snapshot(Router.snapshot(server), system_id, secret)
   end
 
   @spec authenticate_snapshot(State.t(), String.t(), term()) ::
@@ -76,9 +82,26 @@ defmodule JasminEx.Routing do
     result
   end
 
+  def authenticate_smpp_snapshot(%State{} = state, system_id, secret) do
+    case find_user(state.users, system_id) do
+      nil -> {:error, :invalid_credentials}
+      user -> smpp_eligibility(state, user, secret)
+    end
+  end
+
   defp eligibility(state, user, secret) do
     cond do
       not Credential.verify(user.credential, secret) -> {:error, :invalid_credentials}
+      not user.enabled -> {:error, :user_disabled}
+      not group_enabled?(state, user.gid) -> {:error, :group_disabled}
+      true -> {:ok, user}
+    end
+  end
+
+  defp smpp_eligibility(state, user, secret) do
+    cond do
+      is_nil(user.smpp_credential) -> {:error, :invalid_credentials}
+      not Credential.verify(user.smpp_credential, secret) -> {:error, :invalid_credentials}
       not user.enabled -> {:error, :user_disabled}
       not group_enabled?(state, user.gid) -> {:error, :group_disabled}
       true -> {:ok, user}

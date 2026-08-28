@@ -156,6 +156,31 @@ defmodule JasminEx.Routing.RouterTest do
     refute inspect(Routing.snapshot(router)) =~ "s3cret"
   end
 
+  test "set_max_bindings persists, rejects invalid input, and treats 0 as disable", %{
+    tmp_dir: tmp_dir
+  } do
+    router = start_router(tmp_dir)
+    assert {:ok, group} = Routing.put_group(router, gid: "ops")
+
+    assert {:ok, _} =
+             Routing.put_user(router,
+               uid: "u1",
+               username: "alice",
+               secret: "s3cret",
+               group: group
+             )
+
+    assert {:ok, %User{max_bindings: 2}} = Routing.set_max_bindings(router, "u1", 2)
+    before = Routing.snapshot(router)
+    assert {:error, :invalid_max_bindings} = Routing.set_max_bindings(router, "u1", -1)
+    assert Routing.snapshot(router) == before
+    assert {:ok, %User{max_bindings: 0}} = Routing.set_max_bindings(router, "u1", 0)
+    assert {:ok, _} = Routing.set_smpp_secret(router, "u1", "smpp-secret")
+    assert {:ok, _} = Routing.authenticate_smpp(router, "alice", "smpp-secret")
+    assert {:error, :invalid_credentials} = Routing.authenticate_smpp(router, "alice", "s3cret")
+    refute inspect(Routing.snapshot(router)) =~ "smpp-secret"
+  end
+
   defp start_router(tmp_dir) do
     config = Config.new(snapshot_path: Path.join(tmp_dir, "routing-v1.json"))
     start_supervised!({Routing.Router, name: nil, config: config})

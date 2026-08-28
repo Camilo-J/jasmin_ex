@@ -55,6 +55,12 @@ defmodule JasminEx.Routing.Router do
   @spec set_quota(GenServer.server(), term(), term()) :: {:ok, User.t()} | {:error, atom()}
   def set_quota(server, uid, amount), do: GenServer.call(server, {:set_quota, uid, amount})
 
+  def set_smpp_secret(server, uid, secret),
+    do: GenServer.call(server, {:set_smpp_secret, uid, secret})
+
+  def set_max_bindings(server, uid, limit),
+    do: GenServer.call(server, {:set_max_bindings, uid, limit})
+
   @spec set_rate(GenServer.server(), term(), term()) :: {:ok, Route.t()} | {:error, atom()}
   def set_rate(server, order, rate), do: GenServer.call(server, {:set_rate, order, rate})
 
@@ -126,6 +132,14 @@ defmodule JasminEx.Routing.Router do
 
   def handle_call({:set_quota, uid, amount}, _from, state) do
     mutate_billing(state, fn -> wrap_admin(State.set_quota(state, uid, amount)) end)
+  end
+
+  def handle_call({:set_smpp_secret, uid, secret}, _from, state) do
+    mutate(state, fn -> wrap_admin(State.set_smpp_secret(state, uid, secret)) end)
+  end
+
+  def handle_call({:set_max_bindings, uid, limit}, _from, state) do
+    mutate(state, fn -> wrap_admin(State.set_max_bindings(state, uid, limit)) end)
   end
 
   def handle_call({:set_rate, order, rate}, _from, state) do
