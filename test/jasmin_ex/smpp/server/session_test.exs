@@ -114,34 +114,37 @@ defmodule JasminEx.Smpp.Server.SessionTest do
     tmp_dir: tmp_dir
   } do
     {router, mgr} = seed(tmp_dir, 1)
-    {_s1, e1} = open(router, mgr)
-    {_s2, e2} = open(router, mgr)
+    {s1, e1} = open(router, mgr)
+    {s2, e2} = open(router, mgr)
     parent = self()
     go = make_ref()
 
-    pids =
+    tasks =
       Enum.map([e1, e2], fn esme ->
-        spawn(fn ->
+        Task.async(fn ->
           send(parent, :ready)
-          receive do: (^go -> send(parent, bind_tx(esme)))
+          receive do: (^go -> bind_tx(esme))
         end)
       end)
 
     assert_receive :ready
     assert_receive :ready
-    Enum.each(pids, &send(&1, go))
+    Enum.each(tasks, &send(&1.pid, go))
 
     results =
-      for _ <- 1..2 do
-        assert_receive {:ok, %{status: status}}
-        status
-      end
+      tasks
+      |> Task.await_many()
+      |> Enum.map(fn {:ok, %{status: status}} -> status end)
 
     assert Enum.sort(results) == [:ESME_RBINDFAIL, :ESME_ROK]
     assert BindingManager.count(mgr, "alice") == 1
-    FakeESME.close(e1)
-    FakeESME.close(e2)
-    Process.sleep(50)
+
+    for {session, esme} <- [{s1, e1}, {s2, e2}] do
+      ref = Process.monitor(session)
+      FakeESME.close(esme)
+      assert_receive {:DOWN, ^ref, :process, ^session, _}
+    end
+
     assert BindingManager.count(mgr, "alice") == 0
 
     {session, esme} = open(router, mgr)
