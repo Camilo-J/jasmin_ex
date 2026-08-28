@@ -39,7 +39,6 @@ defmodule JasminEx.Smpp.Server.SessionTest do
     assert {enq.command, enq.status, enq.sequence_number} == {:enquire_link_resp, :ESME_ROK, 10}
     {:ok, sub} = FakeESME.submit_sm(esme, 11)
     assert {sub.command, sub.status} == {:submit_sm_resp, :ESME_RSUBMITFAIL}
-    refute Code.ensure_loaded?(JasminEx.MtSubmitPipeline)
     {:ok, unb} = FakeESME.unbind(esme, 12)
     assert {unb.command, unb.status} == {:unbind_resp, :ESME_ROK}
     ref = Process.monitor(session)
@@ -57,6 +56,28 @@ defmodule JasminEx.Smpp.Server.SessionTest do
     {:ok, fail} = FakeESME.bind(elem(open(router, mgr), 1), :bind_transmitter, "alice", "wrong")
     assert fail.status == :ESME_RBINDFAIL
     refute inspect(fail) =~ "wrong"
+  end
+
+  test "bind, enquire_link, and unbind never invoke MtSubmitPipeline", %{tmp_dir: tmp_dir} do
+    {router, mgr} = seed(tmp_dir)
+    {session, esme} = open(router, mgr)
+    on_exit(fn -> :erlang.trace_pattern({JasminEx.MtSubmitPipeline, :_, :_}, false, [:local]) end)
+    :erlang.trace(session, true, [:call])
+    :erlang.trace_pattern({JasminEx.MtSubmitPipeline, :_, :_}, true, [:local])
+
+    {:ok, bind} = FakeESME.bind(esme, :bind_transmitter, "alice", "smpp-secret", 9)
+    assert bind.status == :ESME_ROK
+    refute_received {:trace, ^session, :call, {JasminEx.MtSubmitPipeline, _, _}}
+
+    {:ok, enq} = FakeESME.enquire_link(esme, 10)
+    assert enq.status == :ESME_ROK
+    refute_received {:trace, ^session, :call, {JasminEx.MtSubmitPipeline, _, _}}
+
+    {:ok, unb} = FakeESME.unbind(esme, 12)
+    assert unb.status == :ESME_ROK
+    refute_received {:trace, ^session, :call, {JasminEx.MtSubmitPipeline, _, _}}
+
+    :erlang.trace_pattern({JasminEx.MtSubmitPipeline, :_, :_}, false, [:local])
   end
 
   test "rejected inbound submit_sm does not affect a live southbound connector", %{
