@@ -51,6 +51,32 @@ defmodule JasminEx.Smpp.Framing do
     extract(state, [])
   end
 
+  def feed_strict(buffer, chunk, max \\ 65_536)
+      when is_binary(buffer) and is_binary(chunk) and is_integer(max) and max > 0 do
+    take_strict(buffer <> chunk, [], max)
+  end
+
+  defp take_strict(state, acc, _max) when byte_size(state) < 4,
+    do: {:ok, Enum.reverse(acc), state}
+
+  defp take_strict(<<0::32, _::binary>>, _acc, _max), do: {:error, :zero_length}
+  defp take_strict(<<len::32, _::binary>>, _acc, max) when len > max, do: {:error, :oversized}
+
+  defp take_strict(<<len::32, _::binary>>, _acc, _max) when len < @header_size,
+    do: {:error, :malformed}
+
+  defp take_strict(state, acc, _max) when byte_size(state) < @header_size,
+    do: {:ok, Enum.reverse(acc), state}
+
+  defp take_strict(<<len::32, _::binary>> = state, acc, max) do
+    if byte_size(state) < len do
+      {:ok, Enum.reverse(acc), state}
+    else
+      <<pdu::binary-size(^len), rest::binary>> = state
+      take_strict(rest, [pdu | acc], max)
+    end
+  end
+
   # ── private helpers ──────────────────────────────────────────────────────
 
   defp extract(<<>>), do: {[], <<>>}
