@@ -13,6 +13,9 @@ defmodule JasminEx.Messaging.RabbitMQ.Publisher do
       when is_binary(connector_id) and is_binary(payload),
       do: GenServer.call(server, {:publish, connector_id, payload})
 
+  def reservation_action({:ambiguous, _reason}), do: :leave_open
+  def reservation_action({:error, :non_ok}), do: :settle_non_ok
+
   @impl true
   def init(opts) do
     {:ok,
@@ -63,9 +66,9 @@ defmodule JasminEx.Messaging.RabbitMQ.Publisher do
 
       case confirm do
         true -> {:ok, state}
-        false -> {{:error, :nack}, state}
-        :timeout -> {{:error, :timeout}, state}
-        {:error, :channel_closed} = error -> {error, reset(state)}
+        false -> {{:error, :non_ok}, state}
+        :timeout -> {{:ambiguous, :timeout}, state}
+        {:error, :channel_closed} -> {{:ambiguous, :channel_closed}, reset(state)}
         {:error, reason} -> {{:error, reason}, state}
       end
     else

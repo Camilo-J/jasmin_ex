@@ -92,4 +92,42 @@ defmodule JasminEx.Messaging.EnvelopeTest do
     assert envelope.connector_id == "connector-a"
     refute Map.has_key?(Map.from_struct(envelope), :extra)
   end
+
+  test "round-trips basic data_coding in queued submit_sm" do
+    for data_coding <- [0, 1, 2, 3, 8] do
+      attributes = valid_attributes(data_coding: data_coding)
+      assert {:ok, envelope} = Envelope.new(attributes)
+      assert envelope.submit_sm.data_coding == data_coding
+      assert {:ok, encoded} = Envelope.encode(envelope)
+      assert {:ok, decoded} = Envelope.decode(encoded)
+      assert decoded.submit_sm.data_coding == data_coding
+      assert decoded == envelope
+    end
+  end
+
+  test "rejects data_coding outside 0, 1, 2, 3, 8" do
+    for data_coding <- [4, 7, 99, -1] do
+      assert Envelope.new(valid_attributes(data_coding: data_coding)) ==
+               {:error, :invalid_envelope}
+    end
+  end
+
+  defp valid_attributes(overrides) do
+    data_coding = Keyword.fetch!(overrides, :data_coding)
+
+    %{
+      gateway_id: "gateway-1",
+      connector_id: "connector-a",
+      attempt: 1,
+      max_attempts: 3,
+      enqueued_at: "2026-08-01T15:00:00Z",
+      expires_at: "2026-08-02T15:00:00Z",
+      submit_sm: %{
+        source_addr: "+12025550100",
+        destination_addr: "+12025550101",
+        short_message: "hello",
+        data_coding: data_coding
+      }
+    }
+  end
 end
