@@ -1,7 +1,12 @@
 defmodule JasminEx.Messaging.RabbitMQ.PublisherTest do
   use ExUnit.Case, async: true
 
+  alias JasminEx.Billing.{Admission, Bill, Reservation}
   alias JasminEx.Messaging.RabbitMQ.{Config, Publisher}
+  alias JasminEx.Routing
+  alias JasminEx.Routing.Config, as: RoutingConfig
+  alias JasminEx.Routing.ConnectorRef
+  alias JasminEx.Routing.Router
 
   defmodule Fake do
     def open_channel(%{agent: agent} = conn) do
@@ -96,14 +101,87 @@ defmodule JasminEx.Messaging.RabbitMQ.PublisherTest do
   end
 
   test "nack, timeout, and channel loss never report success", %{config: config} do
+    for {script, expected} <- [
+          {%{wait_for_confirms: false}, {:error, :non_ok}},
+          {%{wait_for_confirms: :timeout}, {:ambiguous, :timeout}},
+          {%{wait_for_confirms: :channel_down}, {:ambiguous, :channel_closed}}
+        ] do
+      agent = Fake.start(script)
+      {:ok, pub} = start(config, agent)
+      assert ^expected = Publisher.publish(pub, "c", "body")
+      stop(pub, agent)
+    end
+  end
+
+  test "ambiguous confirmation is not success and is not definite non_ok", %{config: config} do
     for {script, reason} <- [
-          {%{wait_for_confirms: false}, :nack},
           {%{wait_for_confirms: :timeout}, :timeout},
           {%{wait_for_confirms: :channel_down}, :channel_closed}
         ] do
       agent = Fake.start(script)
       {:ok, pub} = start(config, agent)
-      assert {:error, ^reason} = Publisher.publish(pub, "c", "body")
+      result = Publisher.publish(pub, "c", "body")
+      assert {:ambiguous, ^reason} = result
+      refute result == :ok
+      refute result == {:error, :non_ok}
+      stop(pub, agent)
+    end
+  end
+
+  test "definite nack is non_ok enqueue failure", %{config: config} do
+    agent = Fake.start(%{wait_for_confirms: false})
+    {:ok, pub} = start(config, agent)
+    assert {:error, :non_ok} = Publisher.publish(pub, "c", "body")
+    stop(pub, agent)
+  end
+
+  describe "ambiguous confirmation leaves reservation open" do
+    @describetag :tmp_dir
+
+    test "timeout confirm keeps the admitted reservation open", %{
+      config: config,
+      tmp_dir: tmp_dir
+    } do
+      {router, reservation} = admit_open_reservation(tmp_dir)
+      agent = Fake.start(%{wait_for_confirms: :timeout})
+      {:ok, pub} = start(config, agent)
+
+      result = Publisher.publish(pub, "c", "body")
+      assert {:ambiguous, :timeout} = result
+      assert_reservation_left_open(router, reservation, result)
+
+      stop(pub, agent)
+    end
+
+    test "channel closure confirm keeps the admitted reservation open", %{
+      config: config,
+      tmp_dir: tmp_dir
+    } do
+      {router, reservation} = admit_open_reservation(tmp_dir)
+      agent = Fake.start(%{wait_for_confirms: :channel_down})
+      {:ok, pub} = start(config, agent)
+
+      result = Publisher.publish(pub, "c", "body")
+      assert {:ambiguous, :channel_closed} = result
+      assert_reservation_left_open(router, reservation, result)
+
+      stop(pub, agent)
+    end
+
+    test "definite nack classifies settle_non_ok rather than leave_open", %{
+      config: config,
+      tmp_dir: tmp_dir
+    } do
+      {_router, reservation} = admit_open_reservation(tmp_dir)
+      assert reservation.state == :open
+      agent = Fake.start(%{wait_for_confirms: false})
+      {:ok, pub} = start(config, agent)
+
+      result = Publisher.publish(pub, "c", "body")
+      assert {:error, :non_ok} = result
+      assert Publisher.reservation_action(result) == :settle_non_ok
+      refute Publisher.reservation_action(result) == :leave_open
+
       stop(pub, agent)
     end
   end
@@ -114,6 +192,56 @@ defmodule JasminEx.Messaging.RabbitMQ.PublisherTest do
 
     assert {:close_channel, 1} in Fake.events(agent)
     stop(pub, agent)
+  end
+
+  defp assert_reservation_left_open(router, reservation, result) do
+    assert Publisher.reservation_action(result) == :leave_open
+    snapshot = Routing.snapshot(router)
+    open = snapshot.reservations[reservation.bill_id]
+    assert open.state == :open
+    assert open == reservation
+    assert snapshot.tombstones == %{}
+  end
+
+  defp admit_open_reservation(tmp_dir) do
+    routing_config = RoutingConfig.new(snapshot_path: Path.join(tmp_dir, "routing.json"))
+    router = start_supervised!({Router, name: nil, config: routing_config})
+    {:ok, group} = Routing.put_group(router, gid: "ops")
+
+    {:ok, _user} =
+      Routing.put_user(router,
+        uid: "u1",
+        username: "alice",
+        secret: "s3cret",
+        group: group,
+        balance_minor: 500,
+        submit_quota: 3
+      )
+
+    {:ok, connector} = ConnectorRef.new("smpp-t")
+
+    {:ok, _route} =
+      Routing.put_route(router,
+        kind: :static,
+        order: 10,
+        connector: connector,
+        filters: [],
+        rate_minor: 100,
+        precharge_percent: 10
+      )
+
+    {:ok, bill} =
+      Bill.new(
+        bill_id: "bill-1",
+        uid: "u1",
+        route_order: 10,
+        rate_minor: 100,
+        precharge_percent: 10
+      )
+
+    {:ok, admission} = Admission.new(bill: bill, ttl_ms: 1_000)
+    assert {:ok, %Reservation{state: :open} = reservation} = Routing.admit(router, admission)
+    {router, reservation}
   end
 
   defp start(config, agent) do

@@ -13,6 +13,7 @@ defmodule JasminEx.Messaging.Envelope do
   ]
   @enforce_keys @fields
   defstruct @fields
+  @allowed_data_coding [0, 1, 2, 3, 8]
 
   def new(attributes) when is_map(attributes) do
     with :ok <- reject_unknown_keys(attributes),
@@ -79,27 +80,52 @@ defmodule JasminEx.Messaging.Envelope do
       Map.get(attributes, :attempt) <= Map.get(attributes, :max_attempts)
   end
 
-  defp validate_submit_sm(%{
-         "source_addr" => source,
-         "destination_addr" => destination,
-         "short_message" => message
-       }),
+  defp validate_submit_sm(
+         %{
+           "source_addr" => source,
+           "destination_addr" => destination,
+           "short_message" => message
+         } = submit_sm
+       ),
        do:
          validate_submit_sm(%{
            source_addr: source,
            destination_addr: destination,
-           short_message: message
+           short_message: message,
+           data_coding: Map.get(submit_sm, "data_coding")
          })
 
-  defp validate_submit_sm(%{
-         source_addr: source,
-         destination_addr: destination,
-         short_message: message
-       })
-       when is_binary(source) and is_binary(destination) and is_binary(message),
-       do: {:ok, %{source_addr: source, destination_addr: destination, short_message: message}}
+  defp validate_submit_sm(
+         %{
+           source_addr: source,
+           destination_addr: destination,
+           short_message: message
+         } = submit_sm
+       )
+       when is_binary(source) and is_binary(destination) and is_binary(message) do
+    case normalize_data_coding(Map.get(submit_sm, :data_coding)) do
+      {:ok, data_coding} ->
+        {:ok,
+         %{
+           source_addr: source,
+           destination_addr: destination,
+           short_message: message,
+           data_coding: data_coding
+         }}
+
+      :error ->
+        {:error, :invalid_submit_sm}
+    end
+  end
 
   defp validate_submit_sm(_submit_sm), do: {:error, :invalid_submit_sm}
+
+  defp normalize_data_coding(nil), do: {:ok, 0}
+
+  defp normalize_data_coding(data_coding) when data_coding in @allowed_data_coding,
+    do: {:ok, data_coding}
+
+  defp normalize_data_coding(_data_coding), do: :error
 
   defp stringify_envelope(attributes) do
     attributes
