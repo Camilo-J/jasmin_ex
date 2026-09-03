@@ -32,8 +32,10 @@ defmodule JasminEx.MixProject do
   defp deps do
     [
       {:amqp, "4.1.1"},
+      {:bandit, "~> 1.7"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
+      {:plug, "~> 1.16"},
       {:redix, "~> 1.6.0"},
       {:telemetry, "~> 1.0"}
     ]
