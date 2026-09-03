@@ -10,17 +10,9 @@ defmodule JasminEx.HttpApi.Router do
   alias JasminEx.Routing
   alias JasminEx.Routing.Routable
 
-  @send_keys MapSet.new([
-               "username",
-               "password",
-               "to",
-               "from",
-               "content",
-               "hex-content",
-               "coding"
-             ])
-  @rate_keys MapSet.new(["username", "password", "to", "from"])
-  @balance_keys MapSet.new(["username", "password"])
+  @send_keys ~w(username password to from content hex-content coding)
+  @rate_keys ~w(username password to from)
+  @balance_keys ~w(username password)
 
   plug(:match)
   plug(:dispatch)
@@ -78,18 +70,22 @@ defmodule JasminEx.HttpApi.Router do
   end
 
   defp rate_request(conn) do
-    with {:ok, conn, user, params} <- read_authenticated_form(conn, @rate_keys) do
-      {conn, quote_rate(opts(conn).router, user, params)}
-    else
-      {:error, reason} -> {conn, {:error, reason}}
+    case read_authenticated_form(conn, @rate_keys) do
+      {:ok, conn, user, params} ->
+        {conn, quote_rate(opts(conn).router, user, params)}
+
+      {:error, reason} ->
+        {conn, {:error, reason}}
     end
   end
 
   defp balance_request(conn) do
-    with {:ok, conn, user, _params} <- read_authenticated_form(conn, @balance_keys) do
-      {conn, Queries.balance(Routing.snapshot(opts(conn).router), user.uid)}
-    else
-      {:error, reason} -> {conn, {:error, reason}}
+    case read_authenticated_form(conn, @balance_keys) do
+      {:ok, conn, user, _params} ->
+        {conn, Queries.balance(Routing.snapshot(opts(conn).router), user.uid)}
+
+      {:error, reason} ->
+        {conn, {:error, reason}}
     end
   end
 
@@ -188,8 +184,9 @@ defmodule JasminEx.HttpApi.Router do
     end
   end
 
-  defp reject_unknown(params, allowed) do
+  defp reject_unknown(params, allowed) when is_list(allowed) do
     keys = MapSet.new(Map.keys(params))
+    allowed = MapSet.new(allowed)
 
     if MapSet.subset?(keys, allowed) do
       :ok
