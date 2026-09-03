@@ -1,8 +1,14 @@
 defmodule JasminEx.MtSubmitPipeline do
   @moduledoc false
 
+  alias JasminEx.MtSubmitPipeline.Production
+
   @order [:validate, :intercept, :route, :qos, :bill, :dispatch]
   @optional [:intercept, :qos]
+
+  def submit(input, opts) when is_map(opts) do
+    run(input, Production.stages(opts))
+  end
 
   def run(input, stages) when is_map(stages) do
     Enum.reduce_while(@order, {:ok, input}, fn name, {:ok, current} ->
