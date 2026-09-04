@@ -5,6 +5,7 @@ defmodule JasminEx.Application do
 
   use Application
 
+  alias JasminEx.HttpApi
   alias JasminEx.Messaging.RabbitMQ.Config, as: MessagingConfig
   alias JasminEx.Messaging.RabbitMQ.Supervisor, as: MessagingSupervisor
   alias JasminEx.Routing.Config, as: RoutingConfig
@@ -21,7 +22,8 @@ defmodule JasminEx.Application do
       [routing_child(Keyword.get(config, :routing, []))] ++
       messaging_children(Keyword.get(config, :messaging, [])) ++
       smpp_children(config) ++
-      smpp_server_children(config)
+      smpp_server_children(config) ++
+      http_api_children(config)
   end
 
   @impl true
@@ -32,7 +34,8 @@ defmodule JasminEx.Application do
         routing: Application.get_env(:jasmin_ex, :routing, []),
         messaging: Application.get_env(:jasmin_ex, :messaging, []),
         smpp_connectors: Application.get_env(:jasmin_ex, :smpp_connectors, []),
-        smpp_server: Application.get_env(:jasmin_ex, :smpp_server, [])
+        smpp_server: Application.get_env(:jasmin_ex, :smpp_server, []),
+        http_api: Application.get_env(:jasmin_ex, :http_api, [])
       )
 
     # See https://hexdocs.pm/elixir/Supervisor.html
@@ -94,6 +97,24 @@ defmodule JasminEx.Application do
 
     if server.enabled do
       [{Server.Supervisor, [config: server, router: Keyword.get(options, :router, Router)]}]
+    else
+      []
+    end
+  end
+
+  defp http_api_children(config) do
+    options = Keyword.get(config, :http_api, [])
+    http = HttpApi.Config.new(options)
+
+    if http.enabled do
+      [
+        {HttpApi.Supervisor,
+         [
+           config: http,
+           router: Keyword.get(options, :router, Router),
+           queue: Keyword.get(options, :queue)
+         ]}
+      ]
     else
       []
     end
