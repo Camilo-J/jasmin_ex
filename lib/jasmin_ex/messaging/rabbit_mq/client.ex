@@ -27,6 +27,24 @@ defmodule JasminEx.Messaging.RabbitMQ.Client do
 
   def declare_queue(%{channel: ch}, name, opts), do: AMQP.Queue.declare(ch, name, opts)
 
+  def declare_exchange(%{channel: ch}, name, type, opts),
+    do: AMQP.Exchange.declare(ch, name, type, opts)
+
+  def bind_queue(%{channel: ch}, queue, exchange, opts),
+    do: AMQP.Queue.bind(ch, queue, exchange, opts)
+
+  def return(%{channel: ch}, handler), do: AMQP.Basic.return(ch, handler)
+
+  def headers(%{headers: headers}) when is_list(headers), do: headers
+  def headers(_meta), do: []
+
+  def header(meta, name) when is_binary(name) do
+    case List.keyfind(headers(meta), name, 0) do
+      {^name, _type, value} -> {:ok, value}
+      _ -> :error
+    end
+  end
+
   def publish(%{channel: ch}, exchange, key, payload, opts),
     do: AMQP.Basic.publish(ch, exchange, key, payload, opts)
 
