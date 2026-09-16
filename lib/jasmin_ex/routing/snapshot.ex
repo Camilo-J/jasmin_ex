@@ -63,7 +63,7 @@ defmodule JasminEx.Routing.Snapshot do
 
   defp encode(state) do
     %{
-      "version" => 3,
+      "version" => 4,
       "revision" => state.revision,
       "groups" =>
         Enum.map(Map.values(state.groups), &%{"gid" => &1.gid, "enabled" => &1.enabled}),
@@ -84,7 +84,9 @@ defmodule JasminEx.Routing.Snapshot do
       "balance_minor" => json_amount(user.balance_minor),
       "submit_quota" => json_amount(user.submit_quota),
       "smpp_credential" => encode_credential(user.smpp_credential),
-      "max_bindings" => user.max_bindings
+      "max_bindings" => user.max_bindings,
+      "set_dlr_level" => user.set_dlr_level,
+      "http_set_dlr_method" => user.http_set_dlr_method
     }
   end
 
@@ -129,7 +131,7 @@ defmodule JasminEx.Routing.Snapshot do
     _error -> {:error, :invalid_json}
   end
 
-  defp version(%{"version" => version}) when version in [1, 2, 3], do: :ok
+  defp version(%{"version" => version}) when version in [1, 2, 3, 4], do: :ok
   defp version(%{"version" => _version}), do: {:error, :unsupported_version}
   defp version(_map), do: {:error, :invalid_json}
 
@@ -163,13 +165,11 @@ defmodule JasminEx.Routing.Snapshot do
          },
          clock
        )
-       when version in [2, 3] and is_integer(rev) and rev >= 0 and is_list(groups) and
+       when version in [2, 3, 4] and is_integer(rev) and rev >= 0 and is_list(groups) and
               is_list(users) and is_list(routes) and is_list(reservations) and
               is_list(tombstones) do
-    loader = if(version == 3, do: &load_user_v3/2, else: &load_user_v2/2)
-
     with {:ok, state} <- reduce_state(State.new(), groups, &load_group/2),
-         {:ok, state} <- reduce_state(state, users, loader),
+         {:ok, state} <- reduce_state(state, users, user_loader(version)),
          {:ok, state} <- reduce_state(state, routes, &load_route_v2/2),
          {:ok, state} <- reduce_state(state, reservations, &load_reservation(&1, &2, clock)),
          {:ok, state} <- reduce_state(state, tombstones, &load_tombstone/2),
@@ -177,6 +177,10 @@ defmodule JasminEx.Routing.Snapshot do
   end
 
   defp load(_map, _clock), do: {:error, :invalid_state}
+
+  defp user_loader(2), do: &load_user_v2/2
+  defp user_loader(3), do: &load_user_v3/2
+  defp user_loader(4), do: &load_user_v4/2
 
   defp reduce_state(state, items, fun) do
     Enum.reduce_while(items, {:ok, state}, fn item, {:ok, acc} ->
@@ -343,6 +347,22 @@ defmodule JasminEx.Routing.Snapshot do
   end
 
   defp load_user_v3(_state, _attrs), do: {:error, :invalid_state}
+
+  defp load_user_v4(state, %{"set_dlr_level" => level, "http_set_dlr_method" => method} = attrs) do
+    with {:ok, state} <- load_user_v3(state, attrs),
+         {:ok, level} <- decode_boolean(level),
+         {:ok, method} <- decode_boolean(method) do
+      user = state.users[attrs["uid"]]
+      State.put_user(state, %{user | set_dlr_level: level, http_set_dlr_method: method})
+    else
+      _error -> {:error, :invalid_state}
+    end
+  end
+
+  defp load_user_v4(_state, _attrs), do: {:error, :invalid_state}
+
+  defp decode_boolean(value) when is_boolean(value), do: {:ok, value}
+  defp decode_boolean(_value), do: {:error, :invalid_state}
 
   defp decode_optional_credential(:null), do: {:ok, nil}
   defp decode_optional_credential(attrs), do: decode_credential(attrs)

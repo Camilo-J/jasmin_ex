@@ -114,7 +114,7 @@ defmodule JasminEx.Routing.SnapshotTest do
     {:ok, state} = State.put_user(%{persisted_state() | users: %{}}, user)
     config = tmp_config(tmp_dir, "v3")
     assert :ok = Snapshot.write(state, config)
-    assert %{"version" => 3} = config.snapshot_path |> File.read!() |> :json.decode()
+    assert %{"version" => 4} = config.snapshot_path |> File.read!() |> :json.decode()
     refute File.read!(config.snapshot_path) =~ "smpp-secret"
     assert {:ok, restored} = Snapshot.restore(config)
     assert restored.users["u1"].max_bindings == 2
@@ -129,7 +129,39 @@ defmodule JasminEx.Routing.SnapshotTest do
              Snapshot.restore(write_json(tmp_dir, "bad", bad))
 
     assert {:error, {:restore_failed, :unsupported_version}} =
-             Snapshot.restore(write_json(tmp_dir, "v4", Map.put(legacy(2), "version", 4)))
+             Snapshot.restore(write_json(tmp_dir, "v5-legacy", Map.put(legacy(2), "version", 5)))
+  end
+
+  test "v4 writes DLR permission flags; v1-v3 default true; false round-trips", %{
+    tmp_dir: tmp_dir
+  } do
+    assert {:ok, v1} = Snapshot.restore(write_json(tmp_dir, "v1-dlr", legacy(1)))
+    assert v1.users["u1"].set_dlr_level == true
+    assert v1.users["u1"].http_set_dlr_method == true
+    assert {:ok, v2} = Snapshot.restore(write_json(tmp_dir, "v2-dlr", legacy(2)))
+    assert v2.users["u1"].set_dlr_level == true
+    assert v2.users["u1"].http_set_dlr_method == true
+    assert {:ok, v3} = Snapshot.restore(write_json(tmp_dir, "v3-dlr", legacy(3)))
+    assert v3.users["u1"].set_dlr_level == true
+    assert v3.users["u1"].http_set_dlr_method == true
+
+    {:ok, user} = User.set_dlr_level(persisted_state().users["u1"], false)
+    {:ok, user} = User.set_http_set_dlr_method(user, false)
+    {:ok, state} = State.put_user(%{persisted_state() | users: %{}}, user)
+    config = tmp_config(tmp_dir, "v4-dlr")
+    assert :ok = Snapshot.write(state, config)
+
+    assert %{"version" => 4, "users" => [encoded]} =
+             config.snapshot_path |> File.read!() |> :json.decode()
+
+    assert encoded["set_dlr_level"] == false
+    assert encoded["http_set_dlr_method"] == false
+    assert {:ok, restored} = Snapshot.restore(config)
+    assert restored.users["u1"].set_dlr_level == false
+    assert restored.users["u1"].http_set_dlr_method == false
+
+    assert {:error, {:restore_failed, :unsupported_version}} =
+             Snapshot.restore(write_json(tmp_dir, "v5", Map.put(legacy(2), "version", 5)))
   end
 
   test "missing restore stays empty when leftover /tmp/jr-missing snapshot exists", %{
@@ -202,6 +234,16 @@ defmodule JasminEx.Routing.SnapshotTest do
     v1 = legacy(1)
     user = Map.merge(hd(v1["users"]), %{"balance_minor" => :null, "submit_quota" => :null})
     Map.merge(v1, %{"version" => 2, "users" => [user], "reservations" => [], "tombstones" => []})
+  end
+
+  defp legacy(3) do
+    user =
+      Map.merge(hd(legacy(2)["users"]), %{
+        "smpp_credential" => :null,
+        "max_bindings" => 0
+      })
+
+    Map.merge(legacy(2), %{"version" => 3, "users" => [user]})
   end
 
   defp isolated_snapshot_path?(path, tmp_dir) do

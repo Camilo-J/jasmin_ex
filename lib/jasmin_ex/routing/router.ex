@@ -61,6 +61,12 @@ defmodule JasminEx.Routing.Router do
   def set_max_bindings(server, uid, limit),
     do: GenServer.call(server, {:set_max_bindings, uid, limit})
 
+  def set_dlr_level(server, uid, value),
+    do: GenServer.call(server, {:set_dlr_level, uid, value})
+
+  def set_http_set_dlr_method(server, uid, value),
+    do: GenServer.call(server, {:set_http_set_dlr_method, uid, value})
+
   @spec set_rate(GenServer.server(), term(), term()) :: {:ok, Route.t()} | {:error, atom()}
   def set_rate(server, order, rate), do: GenServer.call(server, {:set_rate, order, rate})
 
@@ -140,6 +146,14 @@ defmodule JasminEx.Routing.Router do
 
   def handle_call({:set_max_bindings, uid, limit}, _from, state) do
     mutate(state, fn -> wrap_admin(State.set_max_bindings(state, uid, limit)) end)
+  end
+
+  def handle_call({:set_dlr_level, uid, value}, _from, state) do
+    mutate(state, fn -> wrap_admin(State.set_dlr_level(state, uid, value)) end)
+  end
+
+  def handle_call({:set_http_set_dlr_method, uid, value}, _from, state) do
+    mutate(state, fn -> wrap_admin(State.set_http_set_dlr_method(state, uid, value)) end)
   end
 
   def handle_call({:set_rate, order, rate}, _from, state) do

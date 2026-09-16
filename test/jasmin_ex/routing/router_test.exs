@@ -181,8 +181,45 @@ defmodule JasminEx.Routing.RouterTest do
     refute inspect(Routing.snapshot(router)) =~ "smpp-secret"
   end
 
+  test "DLR permission setters persist before publish and reject invalid input", %{
+    tmp_dir: tmp_dir
+  } do
+    router = start_router(tmp_dir)
+    assert {:ok, group} = Routing.put_group(router, gid: "ops")
+
+    assert {:ok, %User{set_dlr_level: true, http_set_dlr_method: true}} =
+             Routing.put_user(router,
+               uid: "u1",
+               username: "alice",
+               secret: "s3cret",
+               group: group
+             )
+
+    assert {:ok, %User{set_dlr_level: false}} = Routing.set_dlr_level(router, "u1", false)
+    before = Routing.snapshot(router)
+    assert {:error, :invalid_dlr_permission} = Routing.set_dlr_level(router, "u1", :no)
+    assert Routing.snapshot(router) == before
+
+    assert {:ok, %User{http_set_dlr_method: false}} =
+             Routing.set_http_set_dlr_method(router, "u1", false)
+
+    before = Routing.snapshot(router)
+
+    assert {:error, :invalid_dlr_permission} =
+             Routing.set_http_set_dlr_method(router, "u1", "false")
+
+    assert Routing.snapshot(router) == before
+    assert {:error, :unknown_user} = Routing.set_dlr_level(router, "missing", false)
+    restarted = start_supervised!({Routing.Router, [config: router_config(tmp_dir)]}, id: :dlr)
+    assert Routing.snapshot(restarted).users["u1"].set_dlr_level == false
+    assert Routing.snapshot(restarted).users["u1"].http_set_dlr_method == false
+  end
+
   defp start_router(tmp_dir) do
-    config = Config.new(snapshot_path: Path.join(tmp_dir, "routing-v1.json"))
-    start_supervised!({Routing.Router, name: nil, config: config})
+    start_supervised!({Routing.Router, name: nil, config: router_config(tmp_dir)})
+  end
+
+  defp router_config(tmp_dir) do
+    Config.new(snapshot_path: Path.join(tmp_dir, "routing-v1.json"))
   end
 end

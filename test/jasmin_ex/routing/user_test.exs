@@ -108,6 +108,63 @@ defmodule JasminEx.Routing.UserTest do
     assert {:ok, %User{uid: "u1"}} = Routing.authenticate_snapshot(state, "alice", "password")
   end
 
+  test "new and existing users default DLR permissions to true" do
+    assert {:ok, group} = Group.new(gid: "ops")
+
+    assert {:ok, %User{} = user} =
+             User.new(uid: "u1", username: "alice", secret: "s3cret", group: group)
+
+    assert user.set_dlr_level == true
+    assert user.http_set_dlr_method == true
+  end
+
+  test "explicit false DLR permissions survive User construction" do
+    assert {:ok, group} = Group.new(gid: "ops")
+
+    assert {:ok, %User{} = user} =
+             User.new(
+               uid: "u1",
+               username: "alice",
+               secret: "s3cret",
+               group: group,
+               set_dlr_level: false,
+               http_set_dlr_method: false
+             )
+
+    assert user.set_dlr_level == false
+    assert user.http_set_dlr_method == false
+  end
+
+  test "invalid non-boolean DLR permissions are rejected" do
+    assert {:ok, group} = Group.new(gid: "ops")
+
+    assert {:error, :invalid_dlr_permission} =
+             User.new(
+               uid: "u1",
+               username: "alice",
+               secret: "s3cret",
+               group: group,
+               set_dlr_level: :no
+             )
+
+    assert {:error, :invalid_dlr_permission} =
+             User.new(
+               uid: "u1",
+               username: "alice",
+               secret: "s3cret",
+               group: group,
+               http_set_dlr_method: "false"
+             )
+
+    assert {:ok, user} = User.new(uid: "u1", username: "alice", secret: "s3cret", group: group)
+    assert {:error, :invalid_dlr_permission} = User.set_dlr_level(user, :no)
+    assert {:error, :invalid_dlr_permission} = User.set_http_set_dlr_method(user, 0)
+    assert user.set_dlr_level == true
+    assert user.http_set_dlr_method == true
+    assert {:ok, %User{set_dlr_level: false}} = User.set_dlr_level(user, false)
+    assert {:ok, %User{http_set_dlr_method: false}} = User.set_http_set_dlr_method(user, false)
+  end
+
   test "invalid max_bindings fails typed and leaves the prior quota unchanged" do
     assert {:ok, group} = Group.new(gid: "ops")
     assert {:ok, user} = User.new(uid: "u1", username: "alice", secret: "s3cret", group: group)
