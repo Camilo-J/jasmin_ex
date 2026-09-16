@@ -9,7 +9,14 @@ defmodule JasminEx.Routing.User do
 
   @enforce_keys [:uid, :gid, :username, :credential, :enabled]
   defstruct @enforce_keys ++
-              [balance_minor: nil, submit_quota: nil, smpp_credential: nil, max_bindings: 0]
+              [
+                balance_minor: nil,
+                submit_quota: nil,
+                smpp_credential: nil,
+                max_bindings: 0,
+                set_dlr_level: true,
+                http_set_dlr_method: true
+              ]
 
   @type t :: %__MODULE__{
           uid: String.t(),
@@ -20,7 +27,9 @@ defmodule JasminEx.Routing.User do
           balance_minor: non_neg_integer() | nil,
           submit_quota: non_neg_integer() | nil,
           smpp_credential: Credential.t() | nil,
-          max_bindings: non_neg_integer()
+          max_bindings: non_neg_integer(),
+          set_dlr_level: boolean(),
+          http_set_dlr_method: boolean()
         }
 
   @max_int64 9_223_372_036_854_775_807
@@ -34,7 +43,8 @@ defmodule JasminEx.Routing.User do
              | :invalid_secret
              | :invalid_enabled
              | :invalid_amount
-             | :amount_overflow}
+             | :amount_overflow
+             | :invalid_dlr_permission}
   def new(attrs) when is_list(attrs) do
     with {:ok, group} <- require_group(Keyword.get(attrs, :group)),
          {:ok, uid} <- validate_uid(Keyword.get(attrs, :uid)),
@@ -42,7 +52,11 @@ defmodule JasminEx.Routing.User do
          {:ok, enabled} <- validate_enabled(Keyword.get(attrs, :enabled, true)),
          {:ok, credential} <- Credential.hash(Keyword.get(attrs, :secret)),
          {:ok, balance_minor} <- validate_optional_amount(Keyword.get(attrs, :balance_minor)),
-         {:ok, submit_quota} <- validate_optional_amount(Keyword.get(attrs, :submit_quota)) do
+         {:ok, submit_quota} <- validate_optional_amount(Keyword.get(attrs, :submit_quota)),
+         {:ok, set_dlr_level} <-
+           validate_dlr_permission(Keyword.get(attrs, :set_dlr_level, true)),
+         {:ok, http_set_dlr_method} <-
+           validate_dlr_permission(Keyword.get(attrs, :http_set_dlr_method, true)) do
       {:ok,
        %__MODULE__{
          uid: uid,
@@ -51,7 +65,9 @@ defmodule JasminEx.Routing.User do
          credential: credential,
          enabled: enabled,
          balance_minor: balance_minor,
-         submit_quota: submit_quota
+         submit_quota: submit_quota,
+         set_dlr_level: set_dlr_level,
+         http_set_dlr_method: http_set_dlr_method
        }}
     end
   end
@@ -73,6 +89,20 @@ defmodule JasminEx.Routing.User do
 
   def set_max_bindings(%__MODULE__{}, _limit), do: {:error, :invalid_max_bindings}
 
+  @spec set_dlr_level(t(), term()) :: {:ok, t()} | {:error, :invalid_dlr_permission}
+  def set_dlr_level(%__MODULE__{} = user, value) when is_boolean(value) do
+    {:ok, %{user | set_dlr_level: value}}
+  end
+
+  def set_dlr_level(%__MODULE__{}, _value), do: {:error, :invalid_dlr_permission}
+
+  @spec set_http_set_dlr_method(t(), term()) :: {:ok, t()} | {:error, :invalid_dlr_permission}
+  def set_http_set_dlr_method(%__MODULE__{} = user, value) when is_boolean(value) do
+    {:ok, %{user | http_set_dlr_method: value}}
+  end
+
+  def set_http_set_dlr_method(%__MODULE__{}, _value), do: {:error, :invalid_dlr_permission}
+
   defp require_group(%Group{} = group), do: {:ok, group}
   defp require_group(_group), do: {:error, :unknown_group}
 
@@ -92,6 +122,9 @@ defmodule JasminEx.Routing.User do
 
   defp validate_enabled(enabled) when is_boolean(enabled), do: {:ok, enabled}
   defp validate_enabled(_enabled), do: {:error, :invalid_enabled}
+
+  defp validate_dlr_permission(value) when is_boolean(value), do: {:ok, value}
+  defp validate_dlr_permission(_value), do: {:error, :invalid_dlr_permission}
 
   defp validate_optional_amount(nil), do: {:ok, nil}
 

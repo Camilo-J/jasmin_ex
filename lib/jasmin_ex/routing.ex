@@ -55,6 +55,8 @@ defmodule JasminEx.Routing do
   defdelegate set_quota(server, uid, amount), to: Router
   defdelegate set_smpp_secret(server, uid, secret), to: Router
   defdelegate set_max_bindings(server, uid, limit), to: Router
+  defdelegate set_dlr_level(server, uid, value), to: Router
+  defdelegate set_http_set_dlr_method(server, uid, value), to: Router
 
   @spec set_rate(GenServer.server(), term(), term()) :: {:ok, Route.t()} | {:error, atom()}
   defdelegate set_rate(server, order, rate), to: Router

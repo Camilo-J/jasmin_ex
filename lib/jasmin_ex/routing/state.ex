@@ -107,6 +107,22 @@ defmodule JasminEx.Routing.State do
 
   def set_max_bindings(%__MODULE__{}, _uid, _limit), do: {:error, :unknown_user}
 
+  @spec set_dlr_level(t(), term(), term()) ::
+          {:ok, t(), User.t()} | {:unchanged, User.t()} | {:error, atom()}
+  def set_dlr_level(%__MODULE__{} = state, uid, value) when is_binary(uid) do
+    put_user_dlr_permission(state, uid, value, :set_dlr_level)
+  end
+
+  def set_dlr_level(%__MODULE__{}, _uid, _value), do: {:error, :unknown_user}
+
+  @spec set_http_set_dlr_method(t(), term(), term()) ::
+          {:ok, t(), User.t()} | {:unchanged, User.t()} | {:error, atom()}
+  def set_http_set_dlr_method(%__MODULE__{} = state, uid, value) when is_binary(uid) do
+    put_user_dlr_permission(state, uid, value, :http_set_dlr_method)
+  end
+
+  def set_http_set_dlr_method(%__MODULE__{}, _uid, _value), do: {:error, :unknown_user}
+
   @spec set_rate(t(), term(), term()) ::
           {:ok, t(), Route.t()} | {:unchanged, Route.t()} | {:error, atom()}
   def set_rate(%__MODULE__{} = state, order, rate) when is_integer(order) and order >= 0 do
@@ -180,6 +196,22 @@ defmodule JasminEx.Routing.State do
       existing_uid != uid and user.username == username
     end)
   end
+
+  defp put_user_dlr_permission(state, uid, value, field) do
+    with {:ok, user} <- fetch_user(state, uid),
+         {:ok, user} <- apply_dlr_permission(user, field, value) do
+      if Map.fetch!(state.users[uid], field) == Map.fetch!(user, field) do
+        {:unchanged, user}
+      else
+        {:ok, %{state | users: Map.put(state.users, uid, user)}, user}
+      end
+    end
+  end
+
+  defp apply_dlr_permission(user, :set_dlr_level, value), do: User.set_dlr_level(user, value)
+
+  defp apply_dlr_permission(user, :http_set_dlr_method, value),
+    do: User.set_http_set_dlr_method(user, value)
 
   defp put_user_amount(state, uid, amount, field) do
     with {:ok, amount} <- validate_optional_amount(amount),
