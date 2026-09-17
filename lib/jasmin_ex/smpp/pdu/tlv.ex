@@ -11,7 +11,7 @@ defmodule JasminEx.Smpp.PDU.Tlv do
           | {non_neg_integer(), binary()}
 
   @spec decode(binary()) :: {:ok, [tlv()]} | {:error, :truncated | :duplicate_tag}
-  def decode(binary) when is_binary(binary), do: decode(binary, [], MapSet.new())
+  def decode(binary) when is_binary(binary), do: decode(binary, [], [])
 
   defp decode(<<>>, acc, _seen), do: {:ok, Enum.reverse(acc)}
 
@@ -33,12 +33,12 @@ defmodule JasminEx.Smpp.PDU.Tlv do
   defp decode(_truncated_header, _acc, _seen), do: {:error, :truncated}
 
   defp reject_duplicate(tag, seen) when tag in @singletons do
-    if MapSet.member?(seen, tag), do: {:error, :duplicate_tag}, else: :ok
+    if tag in seen, do: {:error, :duplicate_tag}, else: :ok
   end
 
   defp reject_duplicate(_tag, _seen), do: :ok
 
-  defp remember(seen, tag) when tag in @singletons, do: MapSet.put(seen, tag)
+  defp remember(seen, tag) when tag in @singletons, do: [tag | seen]
   defp remember(seen, _tag), do: seen
 
   defp classify(@receipted_message_id, value), do: {:ok, {:receipted_message_id, cstring(value)}}
