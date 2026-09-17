@@ -25,12 +25,14 @@ defmodule JasminEx.Messaging.StateStoreJournal do
   defp encode(%Record{} = record) do
     case SettlementJournal.canonicalize_evidence(record.evidence) do
       {:ok, evidence} ->
-        payload = %{
-          "gateway_id" => record.gateway_id,
-          "attempt" => record.attempt,
-          "state" => Atom.to_string(record.state),
-          "evidence" => evidence
-        }
+        payload =
+          %{
+            "gateway_id" => record.gateway_id,
+            "attempt" => record.attempt,
+            "state" => Atom.to_string(record.state),
+            "evidence" => evidence
+          }
+          |> maybe_put_known_response(record.known_response)
 
         {:ok, payload |> :json.encode() |> IO.iodata_to_binary()}
 
@@ -42,22 +44,45 @@ defmodule JasminEx.Messaging.StateStoreJournal do
   end
 
   defp decode(payload) do
-    with %{
+    with map when is_map(map) <- :json.decode(payload),
+         %{
            "gateway_id" => gateway_id,
            "attempt" => attempt,
            "state" => state,
            "evidence" => evidence
-         } <- :json.decode(payload),
+         } <-
+           map,
          true <-
            is_binary(gateway_id) and is_integer(attempt) and attempt > 0 and is_map(evidence),
          {:ok, state} <- known_state(state),
-         {:ok, evidence} <- SettlementJournal.canonicalize_evidence(evidence) do
-      {:ok, %Record{gateway_id: gateway_id, attempt: attempt, state: state, evidence: evidence}}
+         {:ok, evidence} <- SettlementJournal.canonicalize_evidence(evidence),
+         {:ok, known_response} <- decode_known_response(map) do
+      {:ok,
+       %Record{
+         gateway_id: gateway_id,
+         attempt: attempt,
+         state: state,
+         evidence: evidence,
+         known_response: known_response
+       }}
     else
       _ -> {:error, :invalid_journal_record}
     end
   rescue
     _error -> {:error, :invalid_journal_record}
+  end
+
+  defp maybe_put_known_response(payload, nil), do: payload
+
+  defp maybe_put_known_response(payload, known) when is_map(known),
+    do: Map.put(payload, "known_response", known)
+
+  defp decode_known_response(map) when is_map(map) do
+    case Map.get(map, "known_response") do
+      nil -> {:ok, nil}
+      known when is_map(known) -> {:ok, known}
+      _other -> {:error, :invalid_journal_record}
+    end
   end
 
   defp known_state(state),

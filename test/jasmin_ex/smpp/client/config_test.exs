@@ -33,8 +33,26 @@ defmodule JasminEx.Smpp.Client.ConfigTest do
                jitter: true
              },
              deliver_handler: {nil, nil},
-             lifecycle_notify: nil
+             lifecycle_notify: nil,
+             dlr_expiry: 86_400
            } = Config.new!(@required_opts)
+  end
+
+  test "accepts a positive connector dlr_expiry" do
+    assert %Config{dlr_expiry: 3600} =
+             Config.new!(Keyword.put(@required_opts, :dlr_expiry, 3600))
+  end
+
+  test "rejects a missing or non-positive dlr_expiry" do
+    message = fn value ->
+      ":dlr_expiry must be a positive integer, got: #{inspect(value)}"
+    end
+
+    for value <- [0, -1, 1.5, "86400"] do
+      assert_raise ArgumentError, message.(value), fn ->
+        Config.new!(Keyword.put(@required_opts, :dlr_expiry, value))
+      end
+    end
   end
 
   test "accepts an optional lifecycle_notify pid" do

@@ -98,6 +98,73 @@ defmodule JasminEx.Messaging.SettlementJournalTest do
              {:error, {:store, :unavailable}}
   end
 
+  test "known-response records round-trip and leave legacy uncertainty readable", %{store: store} do
+    dispatching = SettlementJournal.dispatching("gateway-1", 4)
+
+    known = %{
+      gateway_id: "gateway-1",
+      connector_id: "alpha",
+      attempt: 4,
+      smsc_id: "00ab12",
+      status: :ESME_ROK,
+      observed_at_ms: 1_700_000_000_000
+    }
+
+    assert {:ok, recorded} = SettlementJournal.record_known_response(dispatching, known)
+    assert recorded.state == :sent
+    assert recorded.known_response["version"] == 1
+    assert recorded.known_response["gateway_id"] == "gateway-1"
+    assert recorded.known_response["connector_id"] == "alpha"
+    assert recorded.known_response["attempt"] == 4
+    assert recorded.known_response["smsc_id"] == "00ab12"
+    assert recorded.known_response["status"] == "ESME_ROK"
+    assert recorded.known_response["observed_at_ms"] == 1_700_000_000_000
+    assert recorded.known_response["event_id"] == "alpha:gateway-1:4:submit_sm_resp"
+
+    assert StateStoreJournal.write(store, recorded, 86_400_000) == :ok
+    assert {:ok, reloaded} = StateStoreJournal.read(store, "gateway-1", 4)
+    assert reloaded.known_response == recorded.known_response
+    assert SettlementJournal.known_response(reloaded) == {:ok, recorded.known_response}
+  end
+
+  test "known-response can carry a known non-ok status without an SMSC id", %{store: store} do
+    dispatching = SettlementJournal.dispatching("gateway-2", 1)
+
+    known = %{
+      gateway_id: "gateway-2",
+      connector_id: "beta",
+      attempt: 1,
+      status: :ESME_RINVDESTADR,
+      observed_at_ms: 10
+    }
+
+    assert {:ok, recorded} = SettlementJournal.record_known_response(dispatching, known)
+    assert recorded.known_response["smsc_id"] == nil
+    assert recorded.known_response["status"] == "ESME_RINVDESTADR"
+    assert StateStoreJournal.write(store, recorded, 3_720_000) == :ok
+    assert {:ok, reloaded} = StateStoreJournal.read(store, "gateway-2", 1)
+    assert reloaded.known_response["status"] == "ESME_RINVDESTADR"
+  end
+
+  test "legacy uncertainty records still load without known_response", %{store: store} do
+    dispatching = SettlementJournal.dispatching("gateway-legacy", 1)
+
+    assert {:ok, recorded} =
+             SettlementJournal.record_outcome(dispatching, {:not_sent, %{stage: :pre_write}})
+
+    assert StateStoreJournal.write(store, recorded, 60_000) == :ok
+    assert {:ok, reloaded} = StateStoreJournal.read(store, "gateway-legacy", 1)
+    assert reloaded.known_response == nil
+    assert SettlementJournal.known_response(reloaded) == :none
+    assert reloaded.evidence == %{"stage" => "pre_write"}
+  end
+
+  test "known-response retention covers connector expiry plus handoff, not 60s alone" do
+    assert SettlementJournal.outcome_retention_ms(86_400) == 86_400_000 + 120_000
+    assert SettlementJournal.outcome_retention_ms(3600, 30_000) == 3_630_000
+    assert SettlementJournal.outcome_retention_ms(86_400) > 60_000
+  end
+
   defmodule ErrorStore do
     def fetch(result, _key), do: result
   end

@@ -92,7 +92,8 @@ defmodule JasminEx.Messaging.Envelope do
            source_addr: source,
            destination_addr: destination,
            short_message: message,
-           data_coding: Map.get(submit_sm, "data_coding")
+           data_coding: Map.get(submit_sm, "data_coding"),
+           registered_delivery: Map.get(submit_sm, "registered_delivery")
          })
 
   defp validate_submit_sm(
@@ -103,18 +104,19 @@ defmodule JasminEx.Messaging.Envelope do
          } = submit_sm
        )
        when is_binary(source) and is_binary(destination) and is_binary(message) do
-    case normalize_data_coding(Map.get(submit_sm, :data_coding)) do
-      {:ok, data_coding} ->
-        {:ok,
-         %{
-           source_addr: source,
-           destination_addr: destination,
-           short_message: message,
-           data_coding: data_coding
-         }}
-
-      :error ->
-        {:error, :invalid_submit_sm}
+    with {:ok, data_coding} <- normalize_data_coding(Map.get(submit_sm, :data_coding)),
+         {:ok, registered_delivery} <-
+           normalize_registered_delivery(Map.get(submit_sm, :registered_delivery)) do
+      {:ok,
+       %{
+         source_addr: source,
+         destination_addr: destination,
+         short_message: message,
+         data_coding: data_coding,
+         registered_delivery: registered_delivery
+       }}
+    else
+      :error -> {:error, :invalid_submit_sm}
     end
   end
 
@@ -126,6 +128,11 @@ defmodule JasminEx.Messaging.Envelope do
     do: {:ok, data_coding}
 
   defp normalize_data_coding(_data_coding), do: :error
+
+  defp normalize_registered_delivery(nil), do: {:ok, 0}
+  defp normalize_registered_delivery(0), do: {:ok, 0}
+  defp normalize_registered_delivery(1), do: {:ok, 1}
+  defp normalize_registered_delivery(_value), do: :error
 
   defp stringify_envelope(attributes) do
     attributes
