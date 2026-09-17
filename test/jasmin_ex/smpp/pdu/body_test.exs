@@ -257,6 +257,30 @@ defmodule JasminEx.Smpp.PDU.BodyTest do
       assert {:ok, decoded} = Body.decode(:deliver_sm_resp, bin)
       assert decoded.message_id == "id-1"
     end
+
+    test "preserves trailing optional bytes after short_message" do
+      optional = <<0x001E::16, 7::16, "00ab12", 0, 0x0427::16, 1::16, 2>>
+
+      body = %Body.DeliverSM{
+        short_message: "id:00ab12 stat:DELIVRD",
+        optional_parameters: optional
+      }
+
+      {:ok, iodata} = Body.encode(:deliver_sm, body)
+      bin = IO.iodata_to_binary(iodata)
+      assert {:ok, decoded} = Body.decode(:deliver_sm, bin)
+      assert decoded.short_message == "id:00ab12 stat:DELIVRD"
+      assert decoded.optional_parameters == optional
+    end
+
+    test "bodies without TLVs still decode with empty optional parameters" do
+      body = %Body.DeliverSM{short_message: "Inbound"}
+      {:ok, iodata} = Body.encode(:deliver_sm, body)
+      bin = IO.iodata_to_binary(iodata)
+      assert {:ok, decoded} = Body.decode(:deliver_sm, bin)
+      assert decoded.short_message == "Inbound"
+      assert decoded.optional_parameters == <<>>
+    end
   end
 
   describe "generic_nack round-trip" do

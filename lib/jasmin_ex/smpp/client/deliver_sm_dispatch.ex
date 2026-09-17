@@ -3,18 +3,67 @@ defmodule JasminEx.Smpp.Client.DeliverSMDispatch do
 
   require Logger
 
+  alias JasminEx.Dlr.Event
+  alias JasminEx.Dlr.Receipt
   alias JasminEx.Smpp.PDU.Body
   alias JasminEx.Smpp.PDU.Constants
 
   @type handler_config :: {module() | nil, term()}
+  @type dlr_context :: %{
+          required(:connector_id) => String.t(),
+          required(:publisher) => {module(), term()},
+          optional(:dlr_expiry) => pos_integer(),
+          optional(:clock) => {module(), term()}
+        }
 
   @spec dispatch(binary(), handler_config(), pid()) :: Constants.command_status()
-  def dispatch(body, handler_config, client) do
+  @spec dispatch(binary(), handler_config(), pid(), dlr_context() | nil) ::
+          Constants.command_status()
+  def dispatch(body, handler_config, client, dlr_context \\ nil) do
     case decode_deliver_sm(body) do
-      {:ok, pdu} -> invoke_deliver_handler(handler_config, pdu, client)
+      {:ok, pdu} -> dispatch_decoded(pdu, handler_config, client, dlr_context)
       :error -> :ESME_RSYSERR
     end
   end
+
+  defp dispatch_decoded(pdu, handler_config, client, nil) do
+    invoke_deliver_handler(handler_config, pdu, client)
+  end
+
+  defp dispatch_decoded(pdu, handler_config, client, dlr_context) do
+    case Receipt.parse(pdu) do
+      {:ok, receipt} -> publish_receipt(receipt, dlr_context)
+      :not_dlr -> invoke_deliver_handler(handler_config, pdu, client)
+      {:error, _reason} -> :ESME_RINVOPTPARSTREAM
+    end
+  end
+
+  defp publish_receipt(receipt, context) do
+    now = now_ms(context)
+    expiry = Map.get(context, :dlr_expiry, 86_400)
+
+    event = %{
+      kind: :deliver_sm,
+      connector_id: context.connector_id,
+      receipt: receipt,
+      observed_at_ms: now,
+      deadline_ms: now + expiry * 1000
+    }
+
+    with {:ok, payload} <- Event.encode(event),
+         :ok <- publish(context.publisher, payload) do
+      :ESME_ROK
+    else
+      _other -> :ESME_RX_T_APPN
+    end
+  end
+
+  defp publish({module, publisher_context}, payload) do
+    module.publish(publisher_context, "dlr.deliver_sm", payload)
+  end
+
+  defp now_ms(%{clock: {module, clock_context}}), do: module.now_ms(clock_context)
+  defp now_ms(_context), do: System.system_time(:millisecond)
 
   defp decode_deliver_sm(body) do
     case Body.decode(:deliver_sm, body) do

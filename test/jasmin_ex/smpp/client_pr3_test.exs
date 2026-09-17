@@ -4,6 +4,7 @@ defmodule JasminEx.Smpp.ClientPR3Test do
 
   import ExUnit.CaptureLog
 
+  alias JasminEx.Dlr.Event
   alias JasminEx.Smpp.Client
   alias JasminEx.Smpp.DeliverHandler.SendToPid
   alias JasminEx.Smpp.FakeSMSC
@@ -486,6 +487,38 @@ defmodule JasminEx.Smpp.ClientPR3Test do
                PDU.decode(bytes)
 
       assert {:ok, %Body.DeliverSMResp{message_id: ""}} = Body.decode(:deliver_sm_resp, body)
+      stop(client)
+      stop(handler)
+      stop(smsc)
+    end
+
+    test "publishes classified DLR receipts using configured connector identity" do
+      {port, smsc} = start_smsc()
+      {:ok, handler} = SendToPid.start_link(owner: self())
+
+      {:ok, client} =
+        start_client(port,
+          deliver_handler: {SendToPid, handler},
+          dlr_publisher: {__MODULE__.ConfirmingDlrPublisher, self()}
+        )
+
+      assert :ok = await_bound(client)
+      ref = FakeSMSC.subscribe(smsc)
+
+      message =
+        "id:00ab12 sub:001 dlvrd:001 submit date:2601011200 done date:2601011201 stat:DELIVRD err:000 text:hello"
+
+      assert :ok = FakeSMSC.send_bytes(smsc, deliver_sm_bytes(91, message))
+      refute_receive {:smpp_deliver_sm, _pdu, _ctx}, 200
+      assert_receive {:dlr_publish, "dlr.deliver_sm", payload}, 500
+      assert {:ok, event} = Event.decode(payload)
+      assert event.connector_id == "connector-a"
+      assert event.raw_smsc_id == "00ab12"
+      assert event.status == "DELIVRD"
+
+      assert {:ok, %PDU{command: :deliver_sm_resp, status: :ESME_ROK, sequence_number: 91}} =
+               ref |> await_pdu(:deliver_sm_resp) |> PDU.decode()
+
       stop(client)
       stop(handler)
       stop(smsc)
@@ -1291,6 +1324,13 @@ defmodule JasminEx.Smpp.ClientPR3Test do
         end
     after
       500 -> {:error, :timeout}
+    end
+  end
+
+  defmodule ConfirmingDlrPublisher do
+    def publish(pid, routing_key, payload) do
+      send(pid, {:dlr_publish, routing_key, payload})
+      :ok
     end
   end
 end

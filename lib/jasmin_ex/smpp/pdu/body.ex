@@ -126,7 +126,8 @@ defmodule JasminEx.Smpp.PDU.Body do
               replace_if_present_flag: 0,
               data_coding: :SMSC_DEFAULT_ALPHABET,
               sm_default_msg_id: 0,
-              short_message: ""
+              short_message: "",
+              optional_parameters: <<>>
 
     @type t :: %__MODULE__{
             service_type: String.t(),
@@ -145,7 +146,8 @@ defmodule JasminEx.Smpp.PDU.Body do
             replace_if_present_flag: non_neg_integer(),
             data_coding: atom() | non_neg_integer(),
             sm_default_msg_id: non_neg_integer(),
-            short_message: String.t()
+            short_message: String.t(),
+            optional_parameters: binary()
           }
   end
 
@@ -305,7 +307,8 @@ defmodule JasminEx.Smpp.PDU.Body do
         <<sm_int::8>>,
         <<b.sm_default_msg_id::8>>,
         <<byte_size(sm_bytes)::8>>,
-        sm_bytes
+        sm_bytes,
+        optional_bytes(b)
       ]
 
     {:ok, IO.iodata_to_binary(bytes)}
@@ -356,11 +359,26 @@ defmodule JasminEx.Smpp.PDU.Body do
     {:error, {:decode, :truncated}}
   end
 
-  # Happy path: extract short_message and build the right struct based on shape
+  # Happy path: extract short_message and keep trailing optional bytes on deliver_sm
   defp build_submit_sm(rest, sm_length, shape, fields) do
-    <<short_message::binary-size(^sm_length), _::binary>> = rest
-    {:ok, build_submit_struct(shape, Map.put(fields, :short_message, short_message))}
+    <<short_message::binary-size(^sm_length), optional::binary>> = rest
+
+    {:ok,
+     build_submit_struct(
+       shape,
+       fields
+       |> Map.put(:short_message, short_message)
+       |> maybe_optional(shape, optional)
+     )}
   end
+
+  defp maybe_optional(fields, :deliver_sm, optional),
+    do: Map.put(fields, :optional_parameters, optional)
+
+  defp maybe_optional(fields, _shape, _optional), do: fields
+
+  defp optional_bytes(%DeliverSM{optional_parameters: bytes}) when is_binary(bytes), do: bytes
+  defp optional_bytes(_body), do: <<>>
 
   # Struct dispatch — SubmitSM and DeliverSM share every SMPP 3.4 body field,
   # so only the wrapping struct varies. Using `struct/2` with a map tail

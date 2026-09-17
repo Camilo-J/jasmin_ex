@@ -418,7 +418,13 @@ defmodule JasminEx.Smpp.Client do
 
   defp apply_pdu(data, %PDU{command: :deliver_sm, sequence_number: seq, body: body}, state)
        when state in [:bound, :unbinding] do
-    status = DeliverSMDispatch.dispatch(body, data.config.deliver_handler, self())
+    status =
+      DeliverSMDispatch.dispatch(
+        body,
+        data.config.deliver_handler,
+        self(),
+        dlr_context(data.config)
+      )
 
     send_wire(
       data,
@@ -454,6 +460,17 @@ defmodule JasminEx.Smpp.Client do
   end
 
   defp apply_pdu(data, _pdu, _state), do: data
+
+  defp dlr_context(%{dlr_publisher: {module, context}, connector_id: connector_id} = config)
+       when is_atom(module) do
+    %{
+      connector_id: connector_id,
+      publisher: {module, context},
+      dlr_expiry: config.dlr_expiry
+    }
+  end
+
+  defp dlr_context(_config), do: nil
 
   defp settle_inbound(:bind_pending, %{target_state: :bound} = data) do
     kind = if data.ever_bound, do: :reconnect, else: :initial
