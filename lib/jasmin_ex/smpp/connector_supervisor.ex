@@ -118,6 +118,7 @@ defmodule JasminEx.Smpp.ConnectorSupervisor.Instance do
   alias JasminEx.Messaging.RabbitMQ.Connection
   alias JasminEx.Messaging.RabbitMQ.ConnectorWorker
   alias JasminEx.Messaging.RabbitMQ.WorkQueue
+  alias JasminEx.Messaging.SettlementJournal
   alias JasminEx.Smpp.Client
   alias JasminEx.Smpp.Client.Config
   alias JasminEx.Smpp.ConnectorSupervisor.LifecycleForwarder
@@ -220,8 +221,9 @@ defmodule JasminEx.Smpp.ConnectorSupervisor.Instance do
 
   defp worker_children(_messaging, _opts), do: []
 
-  defp worker_child(messaging, opts) do
-    connector_id = Config.new!(opts).connector_id
+  defp worker_child(messaging, opts) when is_list(messaging) do
+    client_config = Config.new!(opts)
+    connector_id = client_config.connector_id
 
     %{
       id: :connector_worker,
@@ -232,7 +234,12 @@ defmodule JasminEx.Smpp.ConnectorSupervisor.Instance do
              config: MessagingConfig.new!(messaging),
              connector_id: connector_id,
              connection_server: Connection,
-             name: LifecycleForwarder.worker_name(connector_id)
+             name: LifecycleForwarder.worker_name(connector_id),
+             dlr_enabled:
+               Keyword.get(opts, :dlr_enabled, Keyword.get(messaging, :dlr_enabled, false)),
+             dlr_outcome_ttl_ms: SettlementJournal.outcome_retention_ms(client_config.dlr_expiry),
+             dlr_publisher:
+               Keyword.get(opts, :dlr_publisher, Keyword.get(messaging, :dlr_publisher))
            ],
            connector_id
          ]},

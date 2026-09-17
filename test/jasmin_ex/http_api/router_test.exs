@@ -7,6 +7,7 @@ defmodule JasminEx.HttpApi.RouterTest do
 
   alias JasminEx.Billing.Admission
   alias JasminEx.Billing.Bill
+  alias JasminEx.Dlr.Config, as: DlrConfig
   alias JasminEx.HttpApi.Metrics
   alias JasminEx.HttpApi.Router
   alias JasminEx.Routing
@@ -14,6 +15,27 @@ defmodule JasminEx.HttpApi.RouterTest do
   alias JasminEx.Routing.ConnectorRef
   alias JasminEx.Routing.Filter
   alias JasminEx.Routing.Router, as: RoutingRouter
+
+  defmodule HttpDlrStore do
+    def put(table, key, value, ttl_ms) do
+      :ets.insert(table, {key, value, ttl_ms})
+      :ok
+    end
+
+    def fetch(table, key) do
+      case :ets.lookup(table, key) do
+        [{^key, value, _ttl_ms}] -> {:ok, value}
+        [] -> :missing
+      end
+    end
+
+    def delete(table, key) do
+      case :ets.take(table, key) do
+        [{^key, _value, _ttl_ms}] -> :deleted
+        [] -> :missing
+      end
+    end
+  end
 
   defmodule FakeQueue do
     def enqueue(agent, envelope) do
@@ -179,6 +201,112 @@ defmodule JasminEx.HttpApi.RouterTest do
     end
   end
 
+  describe "DLR HTTP intake" do
+    test "GET /send remains 405 with DLR query fields", %{tmp_dir: tmp_dir} do
+      env = start_http(tmp_dir, dlr: :enabled)
+
+      conn = request(env, :get, "/send?dlr=yes&dlr-url=http://example.com/dlr")
+
+      assert_error(conn, 405, :method_not_allowed)
+      assert_no_submit(env)
+    end
+
+    test "per-request dlr-expiry is unknown 400 with no billing or enqueue", %{tmp_dir: tmp_dir} do
+      env = start_http(tmp_dir, dlr: :enabled)
+
+      conn =
+        request(env, :post, "/send", Map.put(send_fields(), "dlr-expiry", "3600"))
+
+      assert_error(conn, 400, :unknown_field)
+      assert_no_submit(env)
+    end
+
+    test "invalid DLR fields are 400 with no billing or enqueue", %{tmp_dir: tmp_dir} do
+      env = start_http(tmp_dir, dlr: :enabled)
+
+      level = request(env, :post, "/send", Map.put(send_fields(), "dlr-level", "4"))
+
+      url =
+        request(env, :post, "/send", Map.put(send_fields(), "dlr-url", "ftp://example.com/dlr"))
+
+      method = request(env, :post, "/send", Map.put(send_fields(), "dlr-method", "PUT"))
+      dlr = request(env, :post, "/send", Map.put(send_fields(), "dlr", "maybe"))
+
+      assert_error(level, 400, :invalid_dlr_level)
+      assert_error(url, 400, :invalid_dlr_url)
+      assert_error(method, 400, :invalid_dlr_method)
+      assert_error(dlr, 400, :invalid_dlr)
+      assert_no_submit(env)
+    end
+
+    test "dlr_forbidden is HTTP 400 with no billing, map, or enqueue", %{tmp_dir: tmp_dir} do
+      env = start_http(tmp_dir, dlr: :enabled)
+      {:ok, _} = Routing.set_dlr_level(env.router, "u1", false)
+      {:ok, _} = Routing.set_http_set_dlr_method(env.router, "u1", false)
+
+      conn =
+        request(
+          env,
+          :post,
+          "/send",
+          Map.merge(send_fields(), %{
+            "dlr" => "yes",
+            "dlr-url" => "http://example.com/dlr"
+          })
+        )
+
+      assert_error(conn, 400, :dlr_forbidden)
+      refute conn.status == 403
+      assert_no_submit(env)
+    end
+
+    test "DLR-enabling request is 503 when DLR is off", %{tmp_dir: tmp_dir} do
+      env = start_http(tmp_dir)
+
+      conn =
+        request(
+          env,
+          :post,
+          "/send",
+          Map.merge(send_fields(), %{
+            "dlr" => "yes",
+            "dlr-url" => "http://example.com/dlr"
+          })
+        )
+
+      assert_error(conn, 503, :dlr_unavailable)
+      assert_no_submit(env)
+    end
+
+    test "ordinary send without DLR fields is unchanged when DLR is off", %{tmp_dir: tmp_dir} do
+      env = start_http(tmp_dir, id: "mid-plain")
+
+      conn = request(env, :post, "/send", send_fields())
+
+      assert conn.status == 200
+      assert conn.resp_body == "mid-plain\n"
+      assert [%{gateway_id: "mid-plain"}] = FakeQueue.envelopes(env.queue)
+    end
+
+    test "metrics do not introduce HTTP 403 for DLR authorization", %{tmp_dir: tmp_dir} do
+      env = start_http(tmp_dir, dlr: :enabled)
+      {:ok, _} = Routing.set_dlr_level(env.router, "u1", false)
+      {:ok, _} = Routing.set_http_set_dlr_method(env.router, "u1", false)
+
+      _ =
+        request(
+          env,
+          :post,
+          "/send",
+          Map.merge(send_fields(), %{"dlr" => "yes", "dlr-url" => "http://example.com/dlr"})
+        )
+
+      scrape = request(env, :get, "/metrics")
+      refute scrape.resp_body =~ ~s(status="403")
+      assert scrape.resp_body =~ ~s(jasmin_http_requests_total{endpoint="send",status="400"})
+    end
+  end
+
   describe "happy paths" do
     test "POST /send returns a newline-terminated message id", %{tmp_dir: tmp_dir} do
       env = start_http(tmp_dir, id: "mid-http-1")
@@ -223,6 +351,28 @@ defmodule JasminEx.HttpApi.RouterTest do
       assert conn.status == 200
       assert text_plain?(conn)
       assert conn.resp_body == "pong\n"
+    end
+
+    test "POST /send accepts DLR fields when DLR is enabled", %{tmp_dir: tmp_dir} do
+      env = start_http(tmp_dir, dlr: :enabled, id: "mid-dlr-ok")
+
+      conn =
+        request(
+          env,
+          :post,
+          "/send",
+          Map.merge(send_fields(), %{
+            "dlr" => "yes",
+            "dlr-url" => "http://example.com/dlr",
+            "dlr-level" => "1",
+            "dlr-method" => "POST"
+          })
+        )
+
+      assert conn.status == 200
+      assert conn.resp_body == "mid-dlr-ok\n"
+      refute_secret(conn)
+      assert [%{gateway_id: "mid-dlr-ok"}] = FakeQueue.envelopes(env.queue)
     end
 
     test "metrics scrape uses only fixed endpoint and status labels", %{tmp_dir: tmp_dir} do
@@ -296,6 +446,20 @@ defmodule JasminEx.HttpApi.RouterTest do
       metrics: metrics,
       id_fun: fn -> id end
     }
+
+    router_opts =
+      case Keyword.get(opts, :dlr, :off) do
+        :enabled ->
+          table = :ets.new(:http_dlr_store, [:set, :public])
+
+          Map.merge(router_opts, %{
+            dlr_config: DlrConfig.new(enabled: true),
+            dlr_store: {HttpDlrStore, table}
+          })
+
+        :off ->
+          router_opts
+      end
 
     %{router: router, queue: queue, metrics: metrics, opts: router_opts}
   end

@@ -4,13 +4,14 @@ defmodule JasminEx.HttpApi.Router do
   use Plug.Router
 
   alias JasminEx.Billing.Queries
+  alias JasminEx.Dlr.Request, as: DlrRequest
   alias JasminEx.HttpApi.Metrics
   alias JasminEx.HttpApi.Response
   alias JasminEx.MtSubmitPipeline
   alias JasminEx.Routing
   alias JasminEx.Routing.Routable
 
-  @send_keys ~w(username password to from content hex-content coding)
+  @send_keys ~w(username password to from content hex-content coding dlr dlr-url dlr-level dlr-method)
   @rate_keys ~w(username password to from)
   @balance_keys ~w(username password)
 
@@ -61,9 +62,17 @@ defmodule JasminEx.HttpApi.Router do
     opts = opts(conn)
 
     with {:ok, conn, user, params} <- read_authenticated_form(conn, @send_keys),
+         {:ok, dlr} <- DlrRequest.normalize(params),
+         :ok <- DlrRequest.authorize(dlr, user),
+         :ok <- require_dlr_available(opts, dlr),
          :ok <- require_publisher(opts.queue),
          {:ok, input} <- pipeline_input(user, params) do
-      {conn, MtSubmitPipeline.submit(input, Map.take(opts, [:router, :queue, :id_fun]))}
+      pipeline_opts =
+        opts
+        |> Map.take([:router, :queue, :id_fun, :dlr_store, :dlr_config, :dlr_clock])
+        |> Map.put(:dlr_request, dlr)
+
+      {conn, MtSubmitPipeline.submit(input, pipeline_opts)}
     else
       {:error, reason} -> {conn, {:error, reason}}
     end
@@ -197,6 +206,13 @@ defmodule JasminEx.HttpApi.Router do
 
   defp require_publisher(nil), do: {:error, :missing_publisher}
   defp require_publisher(_queue), do: :ok
+
+  defp require_dlr_available(_opts, %DlrRequest{enabled: false}), do: :ok
+
+  defp require_dlr_available(%{dlr_config: %{enabled: true}}, %DlrRequest{enabled: true}),
+    do: :ok
+
+  defp require_dlr_available(_opts, %DlrRequest{enabled: true}), do: {:error, :dlr_unavailable}
 
   defp require_param(params, key, reason) do
     case Map.get(params, key) do

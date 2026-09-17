@@ -5,6 +5,7 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
   alias JasminEx.Application
   alias JasminEx.Messaging.RabbitMQ.Config, as: MessagingConfig
   alias JasminEx.Messaging.RabbitMQ.Connection
+  alias JasminEx.Messaging.SettlementJournal
   alias JasminEx.Smpp.Client
   alias JasminEx.Smpp.ConnectorSupervisor
   alias JasminEx.Smpp.ConnectorSupervisor.Instance
@@ -39,6 +40,21 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
 
     assert %MessagingConfig{host: "broker.example", queue_prefix: "jasmin.work"} =
              worker_opts[:config]
+
+    assert worker_opts[:dlr_enabled] == false
+    assert worker_opts[:dlr_outcome_ttl_ms] == SettlementJournal.outcome_retention_ms(86_400)
+  end
+
+  test "passes connector dlr_expiry into worker outcome retention when DLR is enabled" do
+    opts =
+      connector_config(1111)
+      |> Keyword.put(:dlr_expiry, 3600)
+      |> Keyword.put(:messaging, enabled_messaging() ++ [dlr_enabled: true])
+
+    assert {:ok, {_flags, [_forwarder, _client, worker]}} = Instance.init(opts)
+    assert {Instance, :start_worker, [worker_opts, "connector-1111"]} = worker.start
+    assert worker_opts[:dlr_enabled] == true
+    assert worker_opts[:dlr_outcome_ttl_ms] == SettlementJournal.outcome_retention_ms(3600)
   end
 
   test "locate does not unsupervised-start or treat a start error as a pid" do

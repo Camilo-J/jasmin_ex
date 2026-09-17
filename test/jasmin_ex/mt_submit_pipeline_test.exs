@@ -1,6 +1,9 @@
 defmodule JasminEx.MtSubmitPipelineTest do
   use ExUnit.Case, async: true
 
+  alias JasminEx.Dlr.Config, as: DlrConfig
+  alias JasminEx.Dlr.Map, as: DlrMap
+  alias JasminEx.Dlr.Request, as: DlrRequest
   alias JasminEx.Messaging.Envelope
   alias JasminEx.MtSubmitPipeline
   alias JasminEx.MtSubmitPipeline.Production
@@ -165,6 +168,48 @@ defmodule JasminEx.MtSubmitPipelineTest do
     def envelopes(agent), do: Agent.get(agent, & &1.envelopes)
   end
 
+  defmodule LoggingQueue do
+    def enqueue({queue, log}, envelope) do
+      Agent.update(log, &(&1 ++ [:enqueue]))
+      FakeQueue.enqueue(queue, envelope)
+    end
+  end
+
+  defmodule DlrClock do
+    def now_ms(ms), do: ms
+  end
+
+  defmodule LoggingDlrStore do
+    def put({table, log, reply}, key, value, ttl_ms) do
+      Agent.update(log, &(&1 ++ [:register]))
+
+      case reply do
+        :ok ->
+          :ets.insert(table, {key, value, ttl_ms})
+          :ok
+
+        other ->
+          other
+      end
+    end
+
+    def fetch({table, _log, _reply}, key) do
+      case :ets.lookup(table, key) do
+        [{^key, value, _ttl_ms}] -> {:ok, value}
+        [] -> :missing
+      end
+    end
+
+    def delete({table, log, _reply}, key) do
+      Agent.update(log, &(&1 ++ [:delete]))
+
+      case :ets.take(table, key) do
+        [{^key, _value, _ttl_ms}] -> :deleted
+        [] -> :missing
+      end
+    end
+  end
+
   describe "production submit" do
     @describetag :tmp_dir
 
@@ -200,7 +245,8 @@ defmodule JasminEx.MtSubmitPipelineTest do
                source_addr: "1616",
                destination_addr: "21200000",
                short_message: "hello",
-               data_coding: 0
+               data_coding: 0,
+               registered_delivery: 0
              }
 
       snapshot = Routing.snapshot(router)
@@ -298,6 +344,150 @@ defmodule JasminEx.MtSubmitPipelineTest do
       refute_secret({:error, {:dispatch, :non_ok}})
     end
 
+    test "map write happens after admission and before MT enqueue", %{tmp_dir: tmp_dir} do
+      {router, queue} = start_pipeline(tmp_dir)
+      {store, log} = dlr_store()
+      dlr = dlr_request!(%{"dlr" => "yes", "dlr-url" => "http://example.com/dlr"})
+
+      assert {:ok, "mid-map"} =
+               MtSubmitPipeline.submit(
+                 valid_input(),
+                 dlr_opts(router, queue, "mid-map", store, log, dlr)
+               )
+
+      assert Agent.get(log, & &1) == [:register, :enqueue]
+      assert {:ok, record} = DlrMap.fetch_request(store, "mid-map", {DlrClock, 1_000})
+      assert record.source == "httpapi"
+      assert record.url == "http://example.com/dlr"
+      assert record.level == 1
+      assert record.method == "POST"
+      assert record.connector_id == "smpp-t"
+      assert record.expiry_s == 86_400
+      assert [%Envelope{gateway_id: "mid-map"}] = FakeQueue.envelopes(queue)
+      assert Routing.snapshot(router).reservations["mid-map"].state == :open
+    end
+
+    test "definite or ambiguous map-write failure does not enqueue and compensates", %{
+      tmp_dir: tmp_dir
+    } do
+      for reply <- [{:error, :unavailable}, {:ambiguous, :timeout}] do
+        {router, queue} = start_pipeline(tmp_dir, file: "routing-#{inspect(reply)}.json")
+        {store, log} = dlr_store(put: reply)
+        dlr = dlr_request!(%{"dlr" => "yes", "dlr-url" => "http://example.com/dlr"})
+
+        assert {:error, {:dispatch, _reason}} =
+                 MtSubmitPipeline.submit(
+                   valid_input(),
+                   dlr_opts(router, queue, "mid-fail", store, log, dlr)
+                 )
+
+        assert Agent.get(log, & &1) == [:register]
+        assert FakeQueue.envelopes(queue) == []
+        assert Routing.snapshot(router).reservations == %{}
+        assert Routing.snapshot(router).tombstones["mid-fail"].state == :settled_non_ok
+      end
+    end
+
+    test "definite MT enqueue failure compensates and best-effort deletes the map", %{
+      tmp_dir: tmp_dir
+    } do
+      {router, queue} = start_pipeline(tmp_dir, queue_reply: {:error, :non_ok})
+      {store, log} = dlr_store()
+      dlr = dlr_request!(%{"dlr" => "yes", "dlr-url" => "http://example.com/dlr"})
+
+      assert {:error, {:dispatch, :non_ok}} =
+               MtSubmitPipeline.submit(
+                 valid_input(),
+                 dlr_opts(router, queue, "mid-nack-dlr", store, log, dlr)
+               )
+
+      assert Agent.get(log, & &1) == [:register, :enqueue, :delete]
+      assert DlrMap.fetch_request(store, "mid-nack-dlr", {DlrClock, 1_000}) == :missing
+      assert Routing.snapshot(router).reservations == %{}
+      assert Routing.snapshot(router).tombstones["mid-nack-dlr"].state == :settled_non_ok
+    end
+
+    test "ambiguous MT publication retains map and open reservation", %{tmp_dir: tmp_dir} do
+      {router, queue} = start_pipeline(tmp_dir, queue_reply: {:ambiguous, :timeout})
+      {store, log} = dlr_store()
+      dlr = dlr_request!(%{"dlr" => "yes", "dlr-url" => "http://example.com/dlr"})
+
+      assert {:error, {:dispatch, {:ambiguous, :timeout}}} =
+               MtSubmitPipeline.submit(
+                 valid_input(),
+                 dlr_opts(router, queue, "mid-amb-dlr", store, log, dlr)
+               )
+
+      assert Agent.get(log, & &1) == [:register, :enqueue]
+      assert {:ok, _record} = DlrMap.fetch_request(store, "mid-amb-dlr", {DlrClock, 1_000})
+      assert Routing.snapshot(router).reservations["mid-amb-dlr"].state == :open
+      refute Agent.get(log, & &1) |> Enum.member?(:delete)
+    end
+
+    test "failed routing writes no map", %{tmp_dir: tmp_dir} do
+      {router, queue} = start_pipeline(tmp_dir)
+      {store, log} = dlr_store()
+      dlr = dlr_request!(%{"dlr" => "yes", "dlr-url" => "http://example.com/dlr"})
+
+      assert {:error, {:route, :no_route}} =
+               MtSubmitPipeline.submit(
+                 Map.put(valid_input(), :to, "999"),
+                 dlr_opts(router, queue, "mid-noroute", store, log, dlr)
+               )
+
+      assert Agent.get(log, & &1) == []
+      assert DlrMap.fetch_request(store, "mid-noroute", {DlrClock, 1_000}) == :missing
+      assert FakeQueue.envelopes(queue) == []
+      assert Routing.snapshot(router).reservations == %{}
+    end
+
+    test "dlr=yes without URL writes no map but sets registered_delivery", %{tmp_dir: tmp_dir} do
+      {router, queue} = start_pipeline(tmp_dir)
+      {store, log} = dlr_store()
+      dlr = dlr_request!(%{"dlr" => "yes"})
+
+      assert {:ok, "mid-flag"} =
+               MtSubmitPipeline.submit(
+                 valid_input(),
+                 dlr_opts(router, queue, "mid-flag", store, log, dlr)
+               )
+
+      assert Agent.get(log, & &1) == [:enqueue]
+      assert DlrMap.fetch_request(store, "mid-flag", {DlrClock, 1_000}) == :missing
+      [envelope] = FakeQueue.envelopes(queue)
+      assert envelope.submit_sm.registered_delivery == 1
+    end
+
+    test "dlr=no without forcing fields does not request a receipt", %{tmp_dir: tmp_dir} do
+      {router, queue} = start_pipeline(tmp_dir)
+      {store, log} = dlr_store()
+      dlr = dlr_request!(%{})
+
+      assert {:ok, "mid-off"} =
+               MtSubmitPipeline.submit(
+                 valid_input(),
+                 dlr_opts(router, queue, "mid-off", store, log, dlr)
+               )
+
+      assert Agent.get(log, & &1) == [:enqueue]
+      [envelope] = FakeQueue.envelopes(queue)
+      assert Map.get(envelope.submit_sm, :registered_delivery, 0) == 0
+    end
+
+    test "connector expiry comes from injected lookup not the form", %{tmp_dir: tmp_dir} do
+      {router, queue} = start_pipeline(tmp_dir)
+      {store, log} = dlr_store()
+      dlr = dlr_request!(%{"dlr" => "yes", "dlr-url" => "http://example.com/dlr"})
+
+      opts =
+        dlr_opts(router, queue, "mid-ttl", store, log, dlr)
+        |> Map.put(:dlr_expiry_fun, fn "smpp-t" -> 3600 end)
+
+      assert {:ok, "mid-ttl"} = MtSubmitPipeline.submit(valid_input(), opts)
+      assert {:ok, record} = DlrMap.fetch_request(store, "mid-ttl", {DlrClock, 1_000})
+      assert record.expiry_s == 3600
+    end
+
     test "ambiguous enqueue leaves the billing reservation open", %{tmp_dir: tmp_dir} do
       {router, queue} = start_pipeline(tmp_dir, queue_reply: {:ambiguous, :timeout})
 
@@ -356,6 +546,30 @@ defmodule JasminEx.MtSubmitPipelineTest do
 
   defp opts(router, queue, bill_id) do
     %{router: router, queue: {FakeQueue, queue}, id_fun: fn -> bill_id end}
+  end
+
+  defp dlr_opts(router, queue, bill_id, store, log, dlr) do
+    %{
+      router: router,
+      queue: {LoggingQueue, {queue, log}},
+      id_fun: fn -> bill_id end,
+      dlr_request: dlr,
+      dlr_store: store,
+      dlr_config: DlrConfig.new(enabled: true),
+      dlr_clock: {DlrClock, 1_000}
+    }
+  end
+
+  defp dlr_store(opts \\ []) do
+    table = :ets.new(:dlr_pipeline_store, [:set, :public])
+    {:ok, log} = Agent.start_link(fn -> [] end)
+    store = {LoggingDlrStore, {table, log, Keyword.get(opts, :put, :ok)}}
+    {store, log}
+  end
+
+  defp dlr_request!(params) do
+    {:ok, request} = DlrRequest.normalize(params)
+    request
   end
 
   defp valid_input do

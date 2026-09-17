@@ -105,6 +105,60 @@ defmodule JasminEx.Messaging.EnvelopeTest do
     end
   end
 
+  test "preserves registered_delivery 1 across encode, decode, and retry rebuild" do
+    attributes = valid_attributes(data_coding: 0, registered_delivery: 1)
+    assert {:ok, envelope} = Envelope.new(attributes)
+    assert envelope.submit_sm.registered_delivery == 1
+    assert {:ok, encoded} = Envelope.encode(envelope)
+    assert {:ok, decoded} = Envelope.decode(encoded)
+    assert decoded.submit_sm.registered_delivery == 1
+    assert decoded == envelope
+
+    retried = %{
+      gateway_id: envelope.gateway_id,
+      connector_id: envelope.connector_id,
+      attempt: 2,
+      max_attempts: envelope.max_attempts,
+      enqueued_at: envelope.enqueued_at,
+      expires_at: envelope.expires_at,
+      submit_sm: envelope.submit_sm
+    }
+
+    assert {:ok, next} = Envelope.new(retried)
+    assert next.submit_sm.registered_delivery == 1
+  end
+
+  test "omitted and old messages default registered_delivery to 0" do
+    attributes = valid_attributes(data_coding: 0)
+    assert {:ok, envelope} = Envelope.new(attributes)
+    assert envelope.submit_sm.registered_delivery == 0
+    assert {:ok, encoded} = Envelope.encode(envelope)
+    assert {:ok, decoded} = Envelope.decode(encoded)
+    assert decoded.submit_sm.registered_delivery == 0
+
+    payload =
+      ~s({"version":1,"gateway_id":"gateway-1","connector_id":"connector-a","attempt":1,"max_attempts":3,"enqueued_at":"2026-08-01T15:00:00Z","expires_at":"2026-08-02T15:00:00Z","submit_sm":{"source_addr":"+12025550100","destination_addr":"+12025550101","short_message":"hello","data_coding":0}})
+
+    assert {:ok, legacy} = Envelope.decode(payload)
+    assert legacy.submit_sm.registered_delivery == 0
+  end
+
+  test "callback URLs are not stored on the envelope" do
+    attributes =
+      valid_attributes(data_coding: 0)
+      |> Map.put(:dlr_url, "http://example.com/dlr")
+
+    assert Envelope.new(attributes) == {:error, :invalid_envelope}
+
+    attributes =
+      valid_attributes(data_coding: 0)
+      |> put_in([:submit_sm, :callback_url], "http://example.com/dlr")
+
+    assert {:ok, envelope} = Envelope.new(attributes)
+    refute Map.has_key?(envelope.submit_sm, :callback_url)
+    refute Map.has_key?(envelope.submit_sm, :dlr_url)
+  end
+
   test "rejects data_coding outside 0, 1, 2, 3, 8" do
     for data_coding <- [4, 7, 99, -1] do
       assert Envelope.new(valid_attributes(data_coding: data_coding)) ==
@@ -115,6 +169,19 @@ defmodule JasminEx.Messaging.EnvelopeTest do
   defp valid_attributes(overrides) do
     data_coding = Keyword.fetch!(overrides, :data_coding)
 
+    submit_sm = %{
+      source_addr: "+12025550100",
+      destination_addr: "+12025550101",
+      short_message: "hello",
+      data_coding: data_coding
+    }
+
+    submit_sm =
+      case Keyword.get(overrides, :registered_delivery) do
+        nil -> submit_sm
+        value -> Map.put(submit_sm, :registered_delivery, value)
+      end
+
     %{
       gateway_id: "gateway-1",
       connector_id: "connector-a",
@@ -122,12 +189,7 @@ defmodule JasminEx.Messaging.EnvelopeTest do
       max_attempts: 3,
       enqueued_at: "2026-08-01T15:00:00Z",
       expires_at: "2026-08-02T15:00:00Z",
-      submit_sm: %{
-        source_addr: "+12025550100",
-        destination_addr: "+12025550101",
-        short_message: "hello",
-        data_coding: data_coding
-      }
+      submit_sm: submit_sm
     }
   end
 end

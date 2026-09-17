@@ -24,6 +24,10 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
        store: Keyword.get(opts, :store),
        submit: Keyword.get(opts, :submit),
        republish: Keyword.get(opts, :republish),
+       dlr_enabled: Keyword.get(opts, :dlr_enabled, false),
+       dlr_publisher: Keyword.get(opts, :dlr_publisher),
+       dlr_clock: Keyword.get(opts, :dlr_clock, {__MODULE__, :system}),
+       dlr_outcome_ttl_ms: Keyword.get(opts, :dlr_outcome_ttl_ms),
        bound: false,
        phase: :idle,
        channel: nil,
@@ -113,6 +117,25 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
   defp settle_before_close(state), do: settle_classified(state)
 
   defp recover_unclassified(state, envelope, meta) do
+    case StateStoreJournal.read(state.store, envelope.gateway_id, envelope.attempt) do
+      {:ok, record} ->
+        case SettlementJournal.known_response(record) do
+          {:ok, _known} ->
+            state
+
+          :none ->
+            persist_unclassified(state, envelope, meta)
+        end
+
+      :missing ->
+        persist_unclassified(state, envelope, meta)
+
+      _other ->
+        state
+    end
+  end
+
+  defp persist_unclassified(state, envelope, meta) do
     case persist_dispatching(state, envelope) do
       :ok ->
         settle_quarantine(state, envelope, meta, evidence(envelope, :post_write, :bind_lost))
@@ -152,7 +175,7 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
     if dispatchable?(state) do
       case StateStoreJournal.read(state.store, envelope.gateway_id, envelope.attempt) do
         :missing -> submit_fresh(state, envelope, meta)
-        {:ok, record} -> settle_recorded(state, envelope, meta, record)
+        {:ok, record} -> settle_or_replay(state, envelope, meta, record)
         _ -> state
       end
     else
@@ -169,6 +192,16 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
         state
     end
   end
+
+  defp settle_or_replay(%{dlr_enabled: true} = state, envelope, meta, record) do
+    case SettlementJournal.known_response(record) do
+      {:ok, known} -> replay_known(state, envelope, meta, known)
+      :none -> settle_recorded(state, envelope, meta, record)
+    end
+  end
+
+  defp settle_or_replay(state, envelope, meta, record),
+    do: settle_recorded(state, envelope, meta, record)
 
   defp settle_recorded(state, envelope, meta, record) do
     case SettlementJournal.redelivery_directive(record) do
@@ -193,6 +226,63 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
   end
 
   defp persist_dispatching(_state, _envelope), do: {:error, :unavailable}
+
+  defp checkpoint_and_publish(state, envelope, meta, attrs, decision) do
+    known = %{
+      gateway_id: envelope.gateway_id,
+      connector_id: envelope.connector_id,
+      attempt: envelope.attempt,
+      smsc_id: Map.get(attrs, :smsc_id),
+      status: Map.fetch!(attrs, :status),
+      observed_at_ms: observed_at_ms(state)
+    }
+
+    ttl = state.dlr_outcome_ttl_ms || SettlementJournal.outcome_retention_ms(86_400)
+
+    with {:ok, record} <-
+           StateStoreJournal.read(state.store, envelope.gateway_id, envelope.attempt),
+         {:ok, recorded} <- SettlementJournal.record_known_response(record, known),
+         :ok <- StateStoreJournal.write(state.store, recorded, ttl),
+         :ok <- publish_known(state, recorded.known_response) do
+      finish(state, decision, meta, envelope)
+    else
+      _ -> state
+    end
+  end
+
+  defp replay_known(state, envelope, meta, known) do
+    decision = if known["status"] == "ESME_ROK", do: :ack, else: :reject
+
+    case publish_known(state, known) do
+      :ok -> finish(state, decision, meta, envelope)
+      _other -> state
+    end
+  end
+
+  defp publish_known(%{dlr_publisher: fun}, known) when is_function(fun, 2) do
+    payload = known |> :json.encode() |> IO.iodata_to_binary()
+    fun.("dlr.submit_sm_resp", payload)
+  end
+
+  defp publish_known(_state, _known), do: {:error, :dlr_unavailable}
+
+  def now_ms(:system), do: System.system_time(:millisecond)
+
+  defp observed_at_ms(%{dlr_clock: {module, context}}), do: module.now_ms(context)
+  defp observed_at_ms(_state), do: now_ms(:system)
+
+  defp classify(%{dlr_enabled: true} = state, envelope, meta, {:ok, id}) do
+    checkpoint_and_publish(state, envelope, meta, %{smsc_id: id, status: :ESME_ROK}, :ack)
+  end
+
+  defp classify(
+         %{dlr_enabled: true} = state,
+         envelope,
+         meta,
+         {:error, {:submit_rejected, status}}
+       ) do
+    checkpoint_and_publish(state, envelope, meta, %{status: status}, :reject)
+  end
 
   defp classify(state, envelope, meta, {:ok, _id}), do: finish(state, :ack, meta, envelope)
 

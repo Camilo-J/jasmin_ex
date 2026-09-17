@@ -19,7 +19,8 @@ defmodule JasminEx.Smpp.Client.Config do
     :unbind_drain_timeout_ms,
     :reconnect,
     :deliver_handler,
-    :lifecycle_notify
+    :lifecycle_notify,
+    :dlr_expiry
   ]
   defstruct @enforce_keys
 
@@ -36,7 +37,8 @@ defmodule JasminEx.Smpp.Client.Config do
           unbind_drain_timeout_ms: non_neg_integer(),
           reconnect: ReconnectPolicy.t(),
           deliver_handler: {module() | nil, term()},
-          lifecycle_notify: pid() | atom() | nil
+          lifecycle_notify: pid() | atom() | nil,
+          dlr_expiry: pos_integer()
         }
 
   @spec new!(keyword()) :: t()
@@ -61,7 +63,8 @@ defmodule JasminEx.Smpp.Client.Config do
       unbind_drain_timeout_ms: unbind_drain_timeout_ms,
       reconnect: ReconnectPolicy.new(opts),
       deliver_handler: normalize_deliver_handler(Keyword.get(opts, :deliver_handler)),
-      lifecycle_notify: lifecycle_notify!(Keyword.get(opts, :lifecycle_notify))
+      lifecycle_notify: lifecycle_notify!(Keyword.get(opts, :lifecycle_notify)),
+      dlr_expiry: dlr_expiry!(Keyword.get(opts, :dlr_expiry, 86_400))
     }
   end
 
@@ -92,4 +95,10 @@ defmodule JasminEx.Smpp.Client.Config do
 
   defp normalize_deliver_handler({handler, context}) when is_atom(handler), do: {handler, context}
   defp normalize_deliver_handler(nil), do: {nil, nil}
+
+  defp dlr_expiry!(expiry) when is_integer(expiry) and expiry > 0, do: expiry
+
+  defp dlr_expiry!(expiry) do
+    raise ArgumentError, ":dlr_expiry must be a positive integer, got: #{inspect(expiry)}"
+  end
 end

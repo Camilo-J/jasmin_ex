@@ -12,6 +12,11 @@ defmodule JasminEx.HttpApi.Response do
     missing_content: 400,
     ambiguous_content: 400,
     invalid_coding: 400,
+    invalid_dlr: 400,
+    invalid_dlr_level: 400,
+    invalid_dlr_method: 400,
+    invalid_dlr_url: 400,
+    dlr_forbidden: 400,
     invalid_credentials: 401,
     user_disabled: 401,
     group_disabled: 401,
@@ -20,6 +25,7 @@ defmodule JasminEx.HttpApi.Response do
     no_route: 404,
     unsupported_media_type: 415,
     missing_publisher: 503,
+    dlr_unavailable: 503,
     non_ok: 503,
     internal: 500
   }

@@ -4,6 +4,9 @@ defmodule JasminEx.MtSubmitPipeline.Production do
   alias JasminEx.Billing.Admission
   alias JasminEx.Billing.Bill
   alias JasminEx.Billing.Settlement
+  alias JasminEx.Dlr.Config, as: DlrConfig
+  alias JasminEx.Dlr.Map, as: DlrMap
+  alias JasminEx.Dlr.Request, as: DlrRequest
   alias JasminEx.Messaging.Envelope
   alias JasminEx.Messaging.RabbitMQ.Publisher
   alias JasminEx.Messaging.WorkQueue
@@ -101,19 +104,14 @@ defmodule JasminEx.MtSubmitPipeline.Production do
       max_attempts: Map.get(opts, :max_attempts, @default_max_attempts),
       enqueued_at: DateTime.to_iso8601(now),
       expires_at: DateTime.to_iso8601(DateTime.add(now, ttl_ms, :millisecond)),
-      submit_sm: %{
-        source_addr: message.from,
-        destination_addr: message.to,
-        short_message: message.content,
-        data_coding: message.coding
-      }
+      submit_sm: submit_sm(message, opts)
     })
   end
 
   def dispatch(message, router, queue, opts) do
     case envelope(message, opts) do
       {:ok, envelope} ->
-        after_enqueue(WorkQueue.enqueue(queue, envelope), router, message)
+        dispatch_registered(message, router, queue, opts, envelope)
 
       {:error, reason} ->
         _ = compensate(router, message, :non_ok)
@@ -121,12 +119,28 @@ defmodule JasminEx.MtSubmitPipeline.Production do
     end
   end
 
-  defp after_enqueue(:ok, _router, message), do: {:ok, message.bill_id}
+  defp dispatch_registered(message, router, queue, opts, envelope) do
+    case register_dlr(message, opts) do
+      :ok ->
+        after_enqueue(WorkQueue.enqueue(queue, envelope), router, message, opts)
 
-  defp after_enqueue(result, router, message) do
+      {:error, reason} ->
+        _ = compensate(router, message, :non_ok)
+        {:error, reason}
+
+      {:ambiguous, reason} ->
+        _ = compensate(router, message, :non_ok)
+        {:error, {:ambiguous, reason}}
+    end
+  end
+
+  defp after_enqueue(:ok, _router, message, _opts), do: {:ok, message.bill_id}
+
+  defp after_enqueue(result, router, message, opts) do
     case enqueue_action(result) do
       :settle_non_ok ->
         _ = compensate(router, message, :non_ok)
+        _ = delete_dlr(message, opts)
         {:error, :non_ok}
 
       :leave_open ->
@@ -137,6 +151,73 @@ defmodule JasminEx.MtSubmitPipeline.Production do
   defp enqueue_action({:ambiguous, _} = result), do: Publisher.reservation_action(result)
   defp enqueue_action({:error, :non_ok} = result), do: Publisher.reservation_action(result)
   defp enqueue_action({:error, _reason}), do: :settle_non_ok
+
+  defp submit_sm(message, opts) do
+    submit = %{
+      source_addr: message.from,
+      destination_addr: message.to,
+      short_message: message.content,
+      data_coding: message.coding
+    }
+
+    if request_receipt?(opts), do: Map.put(submit, :registered_delivery, 1), else: submit
+  end
+
+  defp request_receipt?(%{dlr_request: %DlrRequest{request_receipt: true}}), do: true
+  defp request_receipt?(_opts), do: false
+
+  defp register_dlr(message, opts) do
+    case Map.get(opts, :dlr_request) do
+      %DlrRequest{register_callback: true} = request ->
+        persist_dlr(message, request, opts)
+
+      _other ->
+        :ok
+    end
+  end
+
+  defp persist_dlr(message, request, opts) do
+    case Map.get(opts, :dlr_store) do
+      nil ->
+        {:error, :dlr_unavailable}
+
+      store ->
+        DlrMap.register(
+          store,
+          %{
+            gateway_id: message.bill_id,
+            connector_id: message.connector_id,
+            url: request.url,
+            level: request.level,
+            method: request.method,
+            expiry_s: dlr_expiry_s(opts, message.connector_id)
+          },
+          Map.get(opts, :dlr_clock, {__MODULE__, :system})
+        )
+    end
+  end
+
+  defp delete_dlr(message, opts) do
+    case {Map.get(opts, :dlr_request), Map.get(opts, :dlr_store)} do
+      {%DlrRequest{register_callback: true}, store} when not is_nil(store) ->
+        DlrMap.delete_request(store, message.bill_id)
+
+      _other ->
+        :ok
+    end
+  end
+
+  defp dlr_expiry_s(opts, connector_id) do
+    case Map.get(opts, :dlr_expiry_fun) do
+      fun when is_function(fun, 1) ->
+        fun.(connector_id)
+
+      _missing ->
+        DlrConfig.connector_expiry(Map.get(opts, :dlr_config) || DlrConfig.new())
+    end
+  end
+
+  def now_ms(:system), do: System.system_time(:millisecond)
 
   defp reject_unknown(input) do
     keys = MapSet.new(Map.keys(input))

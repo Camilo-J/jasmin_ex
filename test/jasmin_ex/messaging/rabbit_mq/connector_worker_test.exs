@@ -1,7 +1,7 @@
 defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
   use ExUnit.Case, async: true
 
-  alias JasminEx.Messaging.{Envelope, StateStoreJournal}
+  alias JasminEx.Messaging.{Envelope, SettlementJournal, StateStoreJournal}
   alias JasminEx.Messaging.RabbitMQ.{Config, Connection, ConnectorWorker}
 
   @future "2099-01-01T00:00:00Z"
@@ -25,6 +25,27 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     def put(a, _k, _v, _t) when is_pid(a), do: Agent.get_and_update(a, &List.pop_at(&1, 0))
     def put(_table, _key, _value, _ttl_ms), do: {:error, :unavailable}
     def fetch(_table, _key), do: :missing
+  end
+
+  defmodule ScriptedJournalStore do
+    def put({table, script}, key, value, ttl_ms) do
+      Agent.get_and_update(script, fn
+        [result | rest] ->
+          if result == :ok, do: :ets.insert(table, {key, value, ttl_ms})
+          {result, rest}
+
+        [] ->
+          :ets.insert(table, {key, value, ttl_ms})
+          {:ok, []}
+      end)
+    end
+
+    def fetch({table, _script}, key) do
+      case :ets.lookup(table, key) do
+        [{^key, value, _ttl_ms}] -> {:ok, value}
+        [] -> :missing
+      end
+    end
   end
 
   defmodule Fake do
@@ -753,6 +774,237 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     assert {:consume, 2, "jasmin.work.beta", ^beta, _} = find(events, :consume, 1)
     stop_pair(alpha, beta, agent)
     GenServer.stop(conn)
+  end
+
+  describe "DLR known-response checkpoint" do
+    test "checkpoint failure does not ACK MT or publish a DLR event", %{config: config} do
+      table = :ets.new(:ckpt_fail, [:set, :public])
+      {:ok, script} = Agent.start_link(fn -> [:ok, {:error, :unavailable}] end)
+      store = {ScriptedJournalStore, {table, script}}
+      submits = Agent.start_link(fn -> 0 end) |> elem(1)
+
+      {worker, agent} =
+        start_bound(config, "alpha", fn agent ->
+          [
+            store: store,
+            submit: fn _env ->
+              Agent.update(submits, &(&1 + 1))
+              {:ok, "smsc-ok"}
+            end,
+            dlr_enabled: true,
+            dlr_publisher: dlr_publisher(agent, :ok)
+          ]
+        end)
+
+      {_envelope, payload} = valid_payload(%{gateway_id: "gw-ckpt-fail"})
+      assert :ok = Fake.deliver(agent, payload)
+      _ = ConnectorWorker.inflight(worker)
+      assert Agent.get(submits, & &1) == 1
+      events = Fake.events(agent)
+      refute Enum.any?(events, &match?({:ack, _, _}, &1))
+      refute Enum.any?(events, &match?({:dlr_publish, _, _}, &1))
+      stop(worker, agent)
+    end
+
+    test "publish nack, return, or timeout does not ACK MT", %{config: config} do
+      for publish_result <- [{:error, :non_ok}, {:error, :unroutable}, {:ambiguous, :timeout}] do
+        {store, _} = journal_store()
+        submits = Agent.start_link(fn -> 0 end) |> elem(1)
+
+        {worker, agent} =
+          start_bound(config, "alpha", fn agent ->
+            [
+              store: store,
+              submit: fn _env ->
+                Agent.update(submits, &(&1 + 1))
+                {:ok, "smsc-ok"}
+              end,
+              dlr_enabled: true,
+              dlr_publisher: dlr_publisher(agent, publish_result)
+            ]
+          end)
+
+        {_envelope, payload} = valid_payload(%{gateway_id: "gw-pub-fail"})
+        assert :ok = Fake.deliver(agent, payload)
+        _ = ConnectorWorker.inflight(worker)
+        assert Agent.get(submits, & &1) == 1
+        events = Fake.events(agent)
+        assert {:dlr_publish, "dlr.submit_sm_resp", _payload} = find(events, :dlr_publish)
+        refute Enum.any?(events, &match?({:ack, _, _}, &1))
+        refute Enum.any?(events, &match?({:republish, {:retry, _}}, &1))
+        stop(worker, agent)
+      end
+    end
+
+    test "crash after checkpoint replays saved response and submit count stays 1", %{
+      config: config
+    } do
+      {store, _} = journal_store()
+      submits = Agent.start_link(fn -> 0 end) |> elem(1)
+
+      {worker, agent} =
+        start_bound(config, "alpha", fn agent ->
+          [
+            store: store,
+            submit: fn _env ->
+              Agent.update(submits, &(&1 + 1))
+              {:ok, "00ab12"}
+            end,
+            dlr_enabled: true,
+            dlr_publisher: dlr_publisher(agent, {:error, :unroutable})
+          ]
+        end)
+
+      {_envelope, payload} = valid_payload(%{gateway_id: "gw-replay"})
+      assert :ok = Fake.deliver(agent, payload)
+      _ = ConnectorWorker.inflight(worker)
+      assert Agent.get(submits, & &1) == 1
+      assert {:ok, record} = StateStoreJournal.read(store, "gw-replay", 1)
+      assert {:ok, known} = SettlementJournal.known_response(record)
+      assert known["smsc_id"] == "00ab12"
+      stop(worker, agent)
+
+      {worker2, agent2} =
+        start_bound(config, "alpha", fn agent ->
+          [
+            store: store,
+            submit: fn _env ->
+              Agent.update(submits, &(&1 + 1))
+              {:ok, "should-not-submit"}
+            end,
+            dlr_enabled: true,
+            dlr_publisher: dlr_publisher(agent, :ok)
+          ]
+        end)
+
+      assert :ok = Fake.deliver(agent2, payload)
+      assert ConnectorWorker.inflight(worker2) == nil
+      assert Agent.get(submits, & &1) == 1
+      events = Fake.events(agent2)
+      assert {:dlr_publish, "dlr.submit_sm_resp", published} = find(events, :dlr_publish)
+      assert {:ack, 1, 1} in events
+      decoded = :json.decode(published)
+      assert decoded["event_id"] == known["event_id"]
+      assert decoded["gateway_id"] == "gw-replay"
+      refute Enum.any?(events, &match?({:republish, {:retry, _}}, &1))
+      stop(worker2, agent2)
+    end
+
+    test "ACK failure after confirmed DLR publish is settlement-only", %{config: config} do
+      {store, _} = journal_store()
+      submits = Agent.start_link(fn -> 0 end) |> elem(1)
+
+      {worker, agent} =
+        start_bound(
+          config,
+          "alpha",
+          fn agent ->
+            [
+              store: store,
+              submit: fn _env ->
+                Agent.update(submits, &(&1 + 1))
+                {:ok, "smsc-ok"}
+              end,
+              dlr_enabled: true,
+              dlr_publisher: dlr_publisher(agent, :ok)
+            ]
+          end,
+          :ack
+        )
+
+      {_envelope, payload} = valid_payload(%{gateway_id: "gw-ack-fail"})
+      assert :ok = Fake.deliver(agent, payload)
+      assert {:classified, :ack, %{delivery_tag: 1}} = ConnectorWorker.inflight(worker)
+      assert Agent.get(submits, & &1) == 1
+      events = Fake.events(agent)
+      assert {:dlr_publish, "dlr.submit_sm_resp", _payload} = find(events, :dlr_publish)
+      assert {:ack, 1, 1} in events
+      stop(worker, agent)
+    end
+
+    test "timeout or unknown SMSC outcome is not converted into a DLR submit-response", %{
+      config: config
+    } do
+      {store, _} = journal_store()
+
+      {worker, agent} =
+        start_bound(config, "alpha", fn agent ->
+          [
+            store: store,
+            submit: fn _ -> {:unknown, :response_timeout} end,
+            republish: republish_ok(agent),
+            dlr_enabled: true,
+            dlr_publisher: dlr_publisher(agent, :ok)
+          ]
+        end)
+
+      {_envelope, payload} = valid_payload(%{gateway_id: "gw-unknown", expires_at: @future})
+      assert :ok = Fake.deliver(agent, payload)
+      assert ConnectorWorker.inflight(worker) == nil
+      events = Fake.events(agent)
+      refute Enum.any?(events, &match?({:dlr_publish, _, _}, &1))
+      assert {:republish, {:quarantine, _env, _evidence}} = find(events, :republish)
+      assert {:ok, record} = StateStoreJournal.read(store, "gw-unknown", 1)
+      assert SettlementJournal.known_response(record) == :none
+      stop(worker, agent)
+    end
+
+    test "DLR-disabled retains current settlement without topic publish", %{config: config} do
+      {store, _} = journal_store()
+
+      {worker, agent} =
+        start_bound(config, "alpha", fn agent ->
+          [
+            store: store,
+            submit: fn _ -> {:ok, "smsc-ok"} end,
+            dlr_publisher: dlr_publisher(agent, :ok)
+          ]
+        end)
+
+      {_envelope, payload} = valid_payload(%{gateway_id: "gw-disabled"})
+      assert :ok = Fake.deliver(agent, payload)
+      assert ConnectorWorker.inflight(worker) == nil
+      events = Fake.events(agent)
+      assert {:ack, 1, 1} in events
+      refute Enum.any?(events, &match?({:dlr_publish, _, _}, &1))
+      stop(worker, agent)
+    end
+
+    test "receipts are never published to an MT work queue", %{config: config} do
+      {store, _} = journal_store()
+
+      {worker, agent} =
+        start_bound(config, "alpha", fn agent ->
+          [
+            store: store,
+            submit: fn _ -> {:ok, "smsc-ok"} end,
+            republish: republish_ok(agent),
+            dlr_enabled: true,
+            dlr_publisher: dlr_publisher(agent, :ok)
+          ]
+        end)
+
+      {_envelope, payload} = valid_payload(%{gateway_id: "gw-no-mt"})
+      assert :ok = Fake.deliver(agent, payload)
+      assert ConnectorWorker.inflight(worker) == nil
+      events = Fake.events(agent)
+      assert {:dlr_publish, "dlr.submit_sm_resp", _payload} = find(events, :dlr_publish)
+      refute Enum.any?(events, &match?({:republish, _}, &1))
+
+      refute Enum.any?(events, fn
+               {:dlr_publish, key, _} -> String.starts_with?(key, "jasmin.work")
+               _ -> false
+             end)
+
+      stop(worker, agent)
+    end
+  end
+
+  defp dlr_publisher(agent, result) do
+    fn routing_key, payload ->
+      Fake.record(agent, {:dlr_publish, routing_key, payload})
+      result
+    end
   end
 
   defp start(config, id, fail_at \\ nil) do

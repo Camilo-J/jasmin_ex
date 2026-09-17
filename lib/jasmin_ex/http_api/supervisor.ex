@@ -27,13 +27,23 @@ defmodule JasminEx.HttpApi.Supervisor do
     metrics = Keyword.get(opts, :metrics, Metrics)
     router = Keyword.get(opts, :router, RoutingRouter)
     queue = Keyword.get(opts, :queue)
+    dlr_store = Keyword.get(opts, :dlr_store)
+    dlr_config = Keyword.get(opts, :dlr_config)
 
     Supervisor.init(
       [
         %{id: Metrics, start: {Metrics, :start_link, [[name: metrics]]}},
         {Bandit,
          [
-           plug: {Router, %{metrics: metrics, router: router, queue: queue}},
+           plug:
+             {Router,
+              %{
+                metrics: metrics,
+                router: router,
+                queue: queue,
+                dlr_store: dlr_store,
+                dlr_config: dlr_config
+              }},
            scheme: :http,
            port: config.port,
            ip: config.host
