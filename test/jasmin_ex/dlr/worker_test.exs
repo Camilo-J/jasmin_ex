@@ -184,7 +184,7 @@ defmodule JasminEx.Dlr.WorkerTest do
     }
 
     send(worker, {:basic_deliver, "ok-body", meta})
-    Process.sleep(20)
+    _state = :sys.get_state(worker)
   end
 
   defp find(events, kind) do
