@@ -22,7 +22,7 @@ defmodule JasminEx.Smpp.Client.Config do
     :lifecycle_notify,
     :dlr_expiry
   ]
-  defstruct @enforce_keys
+  defstruct @enforce_keys ++ [dlr_publisher: nil]
 
   @type t :: %__MODULE__{
           connector_id: String.t(),
@@ -38,7 +38,8 @@ defmodule JasminEx.Smpp.Client.Config do
           reconnect: ReconnectPolicy.t(),
           deliver_handler: {module() | nil, term()},
           lifecycle_notify: pid() | atom() | nil,
-          dlr_expiry: pos_integer()
+          dlr_expiry: pos_integer(),
+          dlr_publisher: {module(), term()} | nil
         }
 
   @spec new!(keyword()) :: t()
@@ -64,7 +65,8 @@ defmodule JasminEx.Smpp.Client.Config do
       reconnect: ReconnectPolicy.new(opts),
       deliver_handler: normalize_deliver_handler(Keyword.get(opts, :deliver_handler)),
       lifecycle_notify: lifecycle_notify!(Keyword.get(opts, :lifecycle_notify)),
-      dlr_expiry: dlr_expiry!(Keyword.get(opts, :dlr_expiry, 86_400))
+      dlr_expiry: dlr_expiry!(Keyword.get(opts, :dlr_expiry, 86_400)),
+      dlr_publisher: dlr_publisher!(Keyword.get(opts, :dlr_publisher))
     }
   end
 
@@ -100,5 +102,13 @@ defmodule JasminEx.Smpp.Client.Config do
 
   defp dlr_expiry!(expiry) do
     raise ArgumentError, ":dlr_expiry must be a positive integer, got: #{inspect(expiry)}"
+  end
+
+  defp dlr_publisher!(nil), do: nil
+  defp dlr_publisher!({module, context}) when is_atom(module), do: {module, context}
+
+  defp dlr_publisher!(value) do
+    raise ArgumentError,
+          ":dlr_publisher must be nil or {module, context}, got: #{inspect(value)}"
   end
 end

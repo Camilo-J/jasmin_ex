@@ -34,13 +34,27 @@ defmodule JasminEx.Smpp.Client.ConfigTest do
              },
              deliver_handler: {nil, nil},
              lifecycle_notify: nil,
-             dlr_expiry: 86_400
+             dlr_expiry: 86_400,
+             dlr_publisher: nil
            } = Config.new!(@required_opts)
   end
 
   test "accepts a positive connector dlr_expiry" do
     assert %Config{dlr_expiry: 3600} =
              Config.new!(Keyword.put(@required_opts, :dlr_expiry, 3600))
+  end
+
+  test "accepts an optional DLR publisher and defaults it to nil" do
+    assert %Config{dlr_publisher: nil} = Config.new!(@required_opts)
+
+    assert %Config{dlr_publisher: {__MODULE__, :publisher}} =
+             Config.new!(Keyword.put(@required_opts, :dlr_publisher, {__MODULE__, :publisher}))
+  end
+
+  test "rejects a non-tuple DLR publisher" do
+    assert_raise ArgumentError, ~r/:dlr_publisher must be nil or \{module, context\}/, fn ->
+      Config.new!(Keyword.put(@required_opts, :dlr_publisher, __MODULE__))
+    end
   end
 
   test "rejects a missing or non-positive dlr_expiry" do
