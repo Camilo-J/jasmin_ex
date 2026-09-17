@@ -221,10 +221,9 @@ defmodule JasminEx.Smpp.ConnectorSupervisor.Instance do
 
   defp worker_children(_messaging, _opts), do: []
 
-  defp worker_child(messaging, opts) do
+  defp worker_child(messaging, opts) when is_list(messaging) do
     client_config = Config.new!(opts)
     connector_id = client_config.connector_id
-    messaging_list = if is_list(messaging), do: messaging, else: []
 
     %{
       id: :connector_worker,
@@ -237,10 +236,10 @@ defmodule JasminEx.Smpp.ConnectorSupervisor.Instance do
              connection_server: Connection,
              name: LifecycleForwarder.worker_name(connector_id),
              dlr_enabled:
-               Keyword.get(opts, :dlr_enabled, Keyword.get(messaging_list, :dlr_enabled, false)),
+               Keyword.get(opts, :dlr_enabled, Keyword.get(messaging, :dlr_enabled, false)),
              dlr_outcome_ttl_ms: SettlementJournal.outcome_retention_ms(client_config.dlr_expiry),
              dlr_publisher:
-               Keyword.get(opts, :dlr_publisher, Keyword.get(messaging_list, :dlr_publisher))
+               Keyword.get(opts, :dlr_publisher, Keyword.get(messaging, :dlr_publisher))
            ],
            connector_id
          ]},
