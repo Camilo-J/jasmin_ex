@@ -25,6 +25,8 @@ defmodule JasminEx.Dlr.Receipt do
         }
 
   @state_map %{
+    0 => "ENROUTE",
+    1 => "ENROUTE",
     2 => "DELIVRD",
     3 => "EXPIRED",
     4 => "DELETED",

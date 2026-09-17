@@ -57,8 +57,16 @@ defmodule JasminEx.Dlr.ReceiptTest do
       assert receipt.text == "hi"
     end
 
+    test "TLV ENROUTE and SCHEDULED map to ENROUTE" do
+      enroute = deliver_sm("", optional_parameters: tlv_id_state("AB12", 1))
+      scheduled = deliver_sm("", optional_parameters: tlv_id_state("AB12", 0))
+
+      assert {:ok, %Receipt{stat: "ENROUTE"}} = Receipt.parse(enroute)
+      assert {:ok, %Receipt{stat: "ENROUTE"}} = Receipt.parse(scheduled)
+    end
+
     test "unknown TLV state maps to UNKNOWN" do
-      pdu = deliver_sm("", optional_parameters: tlv_id_state("AB12", 1))
+      pdu = deliver_sm("", optional_parameters: tlv_id_state("AB12", 9))
       assert {:ok, receipt} = Receipt.parse(pdu)
       assert receipt.stat == "UNKNOWN"
     end

@@ -56,6 +56,8 @@ defmodule JasminEx.Smpp.Client.DeliverSMDispatch do
     else
       _other -> :ESME_RX_T_APPN
     end
+  rescue
+    _error -> :ESME_RX_T_APPN
   end
 
   defp publish({module, publisher_context}, payload) do

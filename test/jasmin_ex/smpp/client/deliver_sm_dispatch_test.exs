@@ -152,6 +152,21 @@ defmodule JasminEx.Smpp.Client.DeliverSMDispatchTest do
     refute_receive {:dlr_publish, _key, _payload}
   end
 
+  test "a raising publisher becomes ESME_RX_T_APPN without MO handling" do
+    body = receipt_body()
+
+    assert :ESME_RX_T_APPN =
+             DeliverSMDispatch.dispatch(
+               body,
+               {RecordingHandler, self()},
+               self(),
+               dlr_context(__MODULE__.RaisingDlrPublisher)
+             )
+
+    refute_receive {:handled, _pdu, _ctx}
+    refute_receive {:dlr_publish, _key, _payload}
+  end
+
   test "publish failure and ambiguity ask the SMSC to retry without MO handling" do
     body = receipt_body()
 
@@ -256,5 +271,9 @@ defmodule JasminEx.Smpp.Client.DeliverSMDispatchTest do
 
   defmodule AmbiguousDlrPublisher do
     def publish(_pid, _routing_key, _payload), do: {:ambiguous, :timeout}
+  end
+
+  defmodule RaisingDlrPublisher do
+    def publish(_pid, _routing_key, _payload), do: raise("publisher exploded")
   end
 end
