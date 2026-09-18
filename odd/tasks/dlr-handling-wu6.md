@@ -123,31 +123,31 @@ Historical task numbers 6.1–6.12 remain stable for traceability. Each task clo
 
 ### Unit D — Destination policy, HTTP adapter, and fake endpoint
 
-- [ ] **6.8 — Observe RED for outbound callback routing threats.** Add `test/jasmin_ex/dlr/destination_policy_test.exs` for scheme/authority/query controls, forbidden IPv4/IPv6 and mapped forms, DNS rebinding, multi-address rejection, exact test exceptions, redirect non-following, TLS hostname mismatch, pinned-peer identity, and zero outbound attempts on policy rejection.
-  - Progress: `not started`
-  - RED evidence: `<command, failing assertions, exit status>`
-  - GREEN evidence: `<command, passing result, exit status>`
-  - REFACTOR evidence: `<change and rerun result>`
-- [ ] **6.9 — Implement destination policy.** Add `lib/jasmin_ex/dlr/destination_policy.ex` with injectable resolution, HTTP/HTTPS-only URI validation, IP classification, optional exact origin/CIDR allowlisting, per-attempt resolution, and an immutable approved destination carrying original-host and pinned-peer data.
-  - Progress: `not started`
-  - RED evidence: `<linked 6.8 observation>`
-  - GREEN evidence: `<focused command and exact result>`
-  - REFACTOR evidence: `<change and rerun result>`
-- [ ] **6.10 — Observe RED for the OTP adapter gate.** Add `test/jasmin_ex/dlr/httpc_test.exs` proving no redirects or hidden retries, one network attempt per call, original Host/SNI/certificate verification with a pinned peer, explicit timeouts, bounded headers/body, cancellation, exact GET/POST transport, and typed failures.
-  - Progress: `not started`
-  - RED evidence: `<command, failing assertions, exit status>`
-  - GREEN evidence: `<command, passing result, exit status>`
-  - REFACTOR evidence: `<change and rerun result>`
-- [ ] **6.11 — Implement the HTTP client port and `:httpc` adapter.** Add `lib/jasmin_ex/dlr/http_client.ex` and `lib/jasmin_ex/dlr/http_client/httpc.ex`; add only the required `:inets`/`:ssl` runtime assembly. Use a dedicated profile with no ambient proxy/cookie state. If OTP cannot preserve original-host verification while pinning the peer, stop and report the blocker rather than weakening TLS or destination policy.
-  - Progress: `not started`
-  - RED evidence: `<linked 6.10 observation>`
-  - GREEN evidence: `<focused command and exact result>`
-  - REFACTOR evidence: `<change and rerun result>`
-- [ ] **6.12 — Add the fake endpoint and broker-backed retry harness.** Add `test/support/fake_dlr_endpoint.ex` with deterministic HTTP/TLS scripts, request counters, bounded responses, redirect traps, slow/oversized cases, and explicit loopback-only policy exceptions. Prove the thrower retry/terminal budget against the real broker while the fake endpoint records actual network attempts.
-  - Progress: `not started`
-  - RED evidence: `<broker-backed command, failing behavior, exit status>`
-  - GREEN evidence: `<broker-backed command, passing result and observed attempt counts>`
-  - REFACTOR evidence: `<change and rerun result>`
+- [x] **6.8 — Observe RED for outbound callback routing threats.** Add `test/jasmin_ex/dlr/destination_policy_test.exs` for scheme/authority/query controls, forbidden IPv4/IPv6 and mapped forms, DNS rebinding, multi-address rejection, exact test exceptions, redirect non-following, TLS hostname mismatch, pinned-peer identity, and zero outbound attempts on policy rejection.
+  - Progress: `complete`; closed by work-unit commit `102c6be`.
+  - RED evidence: `mix test test/jasmin_ex/dlr/destination_policy_test.exs test/jasmin_ex/dlr/httpc_test.exs` → exit 2 because `JasminEx.Dlr.DestinationPolicy.approve/2` was undefined.
+  - GREEN evidence: the same command → exit 0, 10 passed and 1 broker integration test excluded by tag.
+  - REFACTOR evidence: after formatting and bounded streaming changes, the same command remained green with 10 passed and 1 excluded.
+- [x] **6.9 — Implement destination policy.** Add `lib/jasmin_ex/dlr/destination_policy.ex` with injectable resolution, HTTP/HTTPS-only URI validation, IP classification, optional exact origin/CIDR allowlisting, per-attempt resolution, and an immutable approved destination carrying original-host and pinned-peer data.
+  - Progress: `complete`; closed by work-unit commit `102c6be`.
+  - RED evidence: shared with task 6.8: `DestinationPolicy.approve/2` was undefined, exit 2.
+  - GREEN evidence: focused destination/adapter command exit 0, 10 passed and 1 excluded.
+  - REFACTOR evidence: URI validation, address classification, exact host/address exceptions, and approved immutable routing data remained green after formatting.
+- [x] **6.10 — Observe RED for the OTP adapter gate.** Add `test/jasmin_ex/dlr/httpc_test.exs` proving no redirects or hidden retries, one network attempt per call, original Host/SNI/certificate verification with a pinned peer, explicit timeouts, bounded headers/body, cancellation, exact GET/POST transport, and typed failures.
+  - Progress: `complete`; closed by work-unit commit `102c6be`.
+  - RED evidence: shared focused command with task 6.8 → exit 2 at the missing destination-policy boundary required by the adapter.
+  - GREEN evidence: focused destination/adapter command exit 0, 10 passed and 1 excluded; the mismatch case emitted `hostname_check_failed` while the valid certificate/SNI case returned the exact ACK.
+  - REFACTOR evidence: switched successful response reception to asynchronous `stream: {:self, :once}` flow control, bounded each chunk, and cancelled timed-out or oversized requests; focused rerun remained green.
+- [x] **6.11 — Implement the HTTP client port and `:httpc` adapter.** Add `lib/jasmin_ex/dlr/http_client.ex` and `lib/jasmin_ex/dlr/http_client/httpc.ex`; add only the required `:inets`/`:ssl` runtime assembly. Use a dedicated profile with no ambient proxy/cookie state. If OTP cannot preserve original-host verification while pinning the peer, stop and report the blocker rather than weakening TLS or destination policy.
+  - Progress: `complete`; closed by work-unit commit `102c6be`.
+  - RED evidence: shared with task 6.10: the policy/client gate was unavailable, exit 2.
+  - GREEN evidence: focused command exit 0, 10 passed and 1 excluded; the adapter connected to `127.0.0.1` while preserving `callback.test` for Host, SNI, and certificate hostname verification.
+  - REFACTOR evidence: empirical inspection found this OTP runtime ignores documented `max_header_size`/`max_body_size` request options, so the adapter now uses one-at-a-time async streaming and explicit cancellation rather than relying on ignored options; focused and broker-backed reruns passed.
+- [x] **6.12 — Add the fake endpoint and broker-backed retry harness.** Add `test/support/fake_dlr_endpoint.ex` with deterministic HTTP/TLS scripts, request counters, bounded responses, redirect traps, slow/oversized cases, and explicit loopback-only policy exceptions. Prove the thrower retry/terminal budget against the real broker while the fake endpoint records actual network attempts.
+  - Progress: `complete`; closed by work-unit commit `102c6be`. Implementation and runtime behavior are verified. No independent broker-only RED command was captured before implementation, so that strict-TDD evidence gap is recorded rather than reconstructed retroactively.
+  - RED evidence: the Unit D focused RED established that the real adapter path could not execute because `DestinationPolicy.approve/2` was undefined; the separately tagged broker test was excluded by that command, so there is no honest broker-only RED result to report.
+  - GREEN evidence: `mix test --only integration test/jasmin_ex/dlr/httpc_test.exs` → exit 0, 1 passed and 5 excluded. RabbitMQ 4.3.4 delivered counts 0 then 1; the endpoint script returned HTTP 500 then HTTP 200 with `ACK/Jasmin`; exactly two HTTP requests were recorded before terminal ACK.
+  - REFACTOR evidence: the same broker-backed command remained green after bounded async reception and cancellation replaced synchronous full-body buffering.
 
 **Feature task count: 12.**
 
@@ -174,7 +174,7 @@ No commit is authorized by this planning invocation. During implementation, clos
 | A | Pure lookup policy | `lookup.ex` and `lookup_test.exs` | `6220ba0`; 513 authored lines including the initial authoritative tracker |
 | B | Durable lookup plan and processor | `lookup_plan.ex`, its tests, and bounded worker integration | `1a9a137`; 596 authored changed lines |
 | C | HTTP job and thrower semantics | `http_job.ex`, `http_thrower.ex`, and focused tests | `5702f39`; 358 authored changed lines |
-| D | Destination policy and one-attempt adapter | destination/client modules, endpoint support, security/adapter tests, and only required runtime applications | `<commit or uncommitted diff identity>` |
+| D | Destination policy and one-attempt adapter | destination/client modules, endpoint support, security/adapter tests, and only required runtime applications | `102c6be`; 949 authored changed lines |
 
 If these units cannot stand independently because the safety contract requires a cohesive WU6 candidate, preserve the cohesive boundary and record the honest authored line count. Do not invent artificial splits or rewrite for line-count optics.
 
@@ -200,17 +200,17 @@ If these units cannot stand independently because the safety contract requires a
 
 | Item | Status | Evidence |
 |---|---|---|
-| Tasks 6.1–6.12 | 7/12 complete | Units A–C RED/GREEN/REFACTOR recorded above |
-| Focused five-test gate | Not run | `<exact result>` |
-| Full test suite | Not run | `<exact result>` |
-| Formatter | Not run | `<exact result>` |
-| Credo | Not run | `<exact result>` |
-| Dialyzer | Not run | `<exact result>` |
-| Broker-backed thrower retry harness | Not run | `<exact command, RabbitMQ version, endpoint scenario, attempt counts, result>` |
-| Authored changed lines | 1,467 through Unit C | Unit A: 513; Unit B: 596; Unit C: 358 additions plus deletions |
-| Review decision | Pending implementation evidence | `<ask-on-risk outcome>` |
-| Work-unit commits | Units A–C committed | `6220ba0` (A), `1a9a137` (B), `5702f39` (C) |
+| Tasks 6.1–6.12 | 12/12 implemented | Units A–D behavior verified; task 6.12 retains the explicit broker-only RED evidence gap recorded above |
+| Focused five-test gate | Passed | Exact command from the verification gate → exit 0, 30 passed and 1 integration test excluded |
+| Full test suite | Passed | `mix test` → exit 0, 668 passed including 1 doctest, 26 excluded |
+| Formatter | Passed | `mix format --check-formatted` → exit 0 |
+| Credo | Passed | `mix credo --strict` → exit 0, no issues |
+| Dialyzer | Passed | `mix dialyzer` → exit 0, 0 errors and 0 skipped warnings |
+| Broker-backed thrower retry harness | Passed | RabbitMQ 4.3.4; HTTP 500 then 200/`ACK/Jasmin`; delivery counts 0 then 1; two actual HTTP requests; exit 0, 1 passed |
+| Authored changed lines | 2,416 through Unit D before tracker updates | Unit A: 513; Unit B: 596; Unit C: 358; Unit D implementation: 949 additions plus deletions |
+| Review decision | High but cohesive; no delivery action authorized | Preserve the safety boundary locally; do not split by weakening destination/TLS/transport evidence |
+| Work-unit commits | Units A–D committed | `6220ba0` (A), `1a9a137` (B), `5702f39` (C), `102c6be` (D) |
 
 ## Next step
 
-Begin task **6.1** in this single writer thread: add the focused lookup-policy tests, run the exact test file to observe RED, and record the failure before implementing task 6.2. Do not begin implementation until this ODD feature document and its full Engram mirror are confirmed.
+Unit D is committed as `102c6be`. Mirror this tracker to Engram and retain the documented task 6.12 broker-only RED evidence gap. No remote delivery action is authorized; ask before opening a stacked PR to `main`.
