@@ -85,7 +85,7 @@ Historical task numbers 6.1–6.12 remain stable for traceability. Each task clo
   - GREEN evidence: `mix test test/jasmin_ex/dlr/lookup_test.exs` → exit 0, 8 passed.
   - REFACTOR evidence: `mix format lib/jasmin_ex/dlr/lookup.ex test/jasmin_ex/dlr/lookup_test.exs && mix test test/jasmin_ex/dlr/lookup_test.exs` → exit 0, 8 passed.
 - [x] **6.2 — Implement the pure lookup planner.** Add `lib/jasmin_ex/dlr/lookup.ex` with deterministic, side-effect-free `plan/2` output. Preserve the compatibility quirk: level-1 `connector` is the routed connector ID; level-2 `connector` is the raw receipt ID and `id_smsc` is the normalized SMSC ID.
-  - Progress: `complete`; work-unit commit pending.
+  - Progress: `complete`; closed by work-unit commit `6220ba0`.
   - RED evidence: shared with task 6.1: undefined `Lookup.plan/2`, exit 2.
   - GREEN evidence: focused lookup suite exit 0, 8 passed.
   - REFACTOR evidence: focused suite remained 8/8 after formatting; runtime harness `N/A` because Unit A is pure policy with no runtime boundary.
@@ -171,7 +171,7 @@ No commit is authorized by this planning invocation. During implementation, clos
 
 | Work unit | Outcome | Candidate rollback boundary | Commit evidence |
 |---|---|---|---|
-| A | Pure lookup policy | `lookup.ex` and `lookup_test.exs` | Commit pending; 513 authored lines including the initial authoritative tracker |
+| A | Pure lookup policy | `lookup.ex` and `lookup_test.exs` | `6220ba0`; 513 authored lines including the initial authoritative tracker |
 | B | Durable lookup plan and processor | `lookup_plan.ex`, its tests, and bounded worker integration | `<commit or uncommitted diff identity>` |
 | C | HTTP job and thrower semantics | `http_job.ex`, `http_thrower.ex`, and focused tests | `<commit or uncommitted diff identity>` |
 | D | Destination policy and one-attempt adapter | destination/client modules, endpoint support, security/adapter tests, and only required runtime applications | `<commit or uncommitted diff identity>` |
@@ -209,7 +209,7 @@ If these units cannot stand independently because the safety contract requires a
 | Broker-backed thrower retry harness | Not run | `<exact command, RabbitMQ version, endpoint scenario, attempt counts, result>` |
 | Authored changed lines | 513 through Unit A | Unit A: 513 additions, 0 deletions, including initial tracker |
 | Review decision | Pending implementation evidence | `<ask-on-risk outcome>` |
-| Work-unit commits | None | `<identities when authorized>` |
+| Work-unit commits | Unit A committed | `6220ba0` (`feat(dlr): add pure callback lookup policy`) |
 
 ## Next step
 
