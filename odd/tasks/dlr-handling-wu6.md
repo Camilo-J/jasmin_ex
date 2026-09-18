@@ -106,17 +106,17 @@ Historical task numbers 6.1–6.12 remain stable for traceability. Each task clo
 ### Unit C — HTTP job and thrower semantics
 
 - [x] **6.5 — Implement the versioned HTTP job codec.** Add `lib/jasmin_ex/dlr/http_job.ex` with bounded validated fields, fixed deadline, actual callback level, stable identities, and atom-safe decoding. Reject unsupported versions, kinds, methods, and malformed or expired jobs.
-  - Progress: `complete`; work-unit commit pending.
+  - Progress: `complete`; closed by work-unit commit `5702f39`.
   - RED evidence: `mix test test/jasmin_ex/dlr/http_thrower_test.exs` → exit 2, 0/7 passed because `HttpJob.encode/1` and related codec APIs were undefined.
   - GREEN evidence: grouped focused suites exit 0, 20 passed, including version/kind/method/bounds and atom-count assertions.
   - REFACTOR evidence: codec fields were shared with persisted lookup plans; formatted grouped rerun remained 20/20.
 - [x] **6.6 — Observe RED for callback payload and classification.** Add `test/jasmin_ex/dlr/http_thrower_test.exs` for exact GET query and POST form fields, stripped exact `ACK/Jasmin`, status below 400, unfollowed redirects, terminal 404, wrong ACK, other status/network/timeout retry outcomes, deadline handling, and settlement ordering.
-  - Progress: `complete`; work-unit commit pending.
+  - Progress: `complete`; closed by work-unit commit `5702f39`.
   - RED evidence: same focused command → exit 2, 0/7; `HttpThrower.process/3` and `HttpJob` were unavailable.
   - GREEN evidence: `mix test test/jasmin_ex/dlr/http_thrower_test.exs test/jasmin_ex/dlr/lookup_test.exs test/jasmin_ex/dlr/lookup_plan_test.exs` → exit 0, 20 passed.
   - REFACTOR evidence: formatted grouped rerun exit 0, 20 passed.
 - [x] **6.7 — Implement the HTTP thrower.** Add `lib/jasmin_ex/dlr/http_thrower.ex` to encode callback requests, invoke one client attempt, classify success/terminal/retry outcomes, and return settlement directives compatible with the worker and broker retry budget. Never retry inside the thrower or client.
-  - Progress: `complete`; work-unit commit pending.
+  - Progress: `complete`; closed by work-unit commit `5702f39`.
   - RED evidence: shared with task 6.6: missing thrower API, exit 2.
   - GREEN evidence: exact GET query/POST form, `<400` plus stripped exact ACK, terminal 404, retry classifications, expiry, and one-call/one-client-attempt all pass in the 20-test grouped suite.
   - REFACTOR evidence: formatting plus grouped suite remained green; external runtime harness is deferred to Unit D where the real client and broker-backed endpoint exist.
@@ -173,7 +173,7 @@ No commit is authorized by this planning invocation. During implementation, clos
 |---|---|---|---|
 | A | Pure lookup policy | `lookup.ex` and `lookup_test.exs` | `6220ba0`; 513 authored lines including the initial authoritative tracker |
 | B | Durable lookup plan and processor | `lookup_plan.ex`, its tests, and bounded worker integration | `1a9a137`; 596 authored changed lines |
-| C | HTTP job and thrower semantics | `http_job.ex`, `http_thrower.ex`, and focused tests | Commit pending; 358 authored changed lines |
+| C | HTTP job and thrower semantics | `http_job.ex`, `http_thrower.ex`, and focused tests | `5702f39`; 358 authored changed lines |
 | D | Destination policy and one-attempt adapter | destination/client modules, endpoint support, security/adapter tests, and only required runtime applications | `<commit or uncommitted diff identity>` |
 
 If these units cannot stand independently because the safety contract requires a cohesive WU6 candidate, preserve the cohesive boundary and record the honest authored line count. Do not invent artificial splits or rewrite for line-count optics.
@@ -209,7 +209,7 @@ If these units cannot stand independently because the safety contract requires a
 | Broker-backed thrower retry harness | Not run | `<exact command, RabbitMQ version, endpoint scenario, attempt counts, result>` |
 | Authored changed lines | 1,467 through Unit C | Unit A: 513; Unit B: 596; Unit C: 358 additions plus deletions |
 | Review decision | Pending implementation evidence | `<ask-on-risk outcome>` |
-| Work-unit commits | Units A–B committed | `6220ba0` (A), `1a9a137` (B) |
+| Work-unit commits | Units A–C committed | `6220ba0` (A), `1a9a137` (B), `5702f39` (C) |
 
 ## Next step
 
