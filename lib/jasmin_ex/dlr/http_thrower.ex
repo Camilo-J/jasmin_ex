@@ -1,7 +1,7 @@
 defmodule JasminEx.Dlr.HttpThrower do
   @moduledoc false
 
-  alias JasminEx.Dlr.HttpJob
+  alias JasminEx.Dlr.{DestinationPolicy, HttpJob}
 
   @ack "ACK/Jasmin"
 
@@ -9,6 +9,7 @@ defmodule JasminEx.Dlr.HttpThrower do
   def process(payload, _meta, context) when is_binary(payload) and is_list(context) do
     with {:ok, job} <- HttpJob.decode(payload),
          :ok <- fresh(job, context),
+         {:ok, _uri} <- DestinationPolicy.validate_url(job.url),
          {:ok, request} <- request(job) do
       context
       |> Keyword.fetch!(:client)

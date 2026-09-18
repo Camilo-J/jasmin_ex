@@ -6,9 +6,7 @@ defmodule JasminEx.Dlr.Lookup do
   @spec plan(map(), keyword()) :: {:ok, map()} | {:retry, term()} | {:terminal, term()}
   def plan(event, inputs) when is_map(event) and is_list(inputs) do
     with :ok <- fresh(event, Keyword.get(inputs, :now_ms)),
-         result <- plan_kind(event, inputs) do
-      result
-    end
+         do: plan_kind(event, inputs)
   end
 
   defp plan_kind(%{kind: :submit_sm_resp} = event, inputs) do

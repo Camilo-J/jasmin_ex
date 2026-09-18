@@ -210,9 +210,7 @@ defmodule JasminEx.Dlr.LookupPlan do
               is_integer(expires_at_ms) do
     with :ok <- validate_job(job),
          :ok <- validate_reverse(reverse),
-         :ok <- validate_cleanup(cleanup) do
-      :ok
-    end
+         do: validate_cleanup(cleanup)
   end
 
   defp validate(_plan), do: {:error, :invalid_plan}

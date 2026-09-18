@@ -67,9 +67,7 @@ defmodule JasminEx.Dlr.HttpJob do
          :ok <- method(job),
          :ok <- level(job),
          :ok <- timestamps(job),
-         :ok <- fields(job) do
-      :ok
-    end
+         do: fields(job)
   end
 
   defp binary(job, key) do

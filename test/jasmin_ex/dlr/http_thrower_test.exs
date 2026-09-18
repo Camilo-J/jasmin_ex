@@ -16,14 +16,16 @@ defmodule JasminEx.Dlr.HttpThrowerTest do
   end
 
   test "HTTP job codec is versioned, bounded, and atom-safe" do
-    before_atoms = :erlang.system_info(:atom_count)
     assert {:ok, encoded} = HttpJob.encode(job())
     assert {:ok, decoded} = HttpJob.decode(encoded)
     assert decoded == job()
 
-    unknown = ~s({"version":1,"kind":"http_job","unexpected_atom_name_xyz":"x"})
+    unknown_key = "unexpected_atom_#{System.unique_integer([:positive])}"
+    assert_raise ArgumentError, fn -> String.to_existing_atom(unknown_key) end
+
+    unknown = ~s({"version":1,"kind":"http_job","#{unknown_key}":"x"})
     assert {:error, :invalid_job} = HttpJob.decode(unknown)
-    assert :erlang.system_info(:atom_count) == before_atoms
+    assert_raise ArgumentError, fn -> String.to_existing_atom(unknown_key) end
 
     assert {:error, :unsupported_version} =
              HttpJob.decode(~s({"version":2,"kind":"http_job"}))
