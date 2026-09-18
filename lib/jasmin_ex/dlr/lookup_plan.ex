@@ -28,6 +28,7 @@ defmodule JasminEx.Dlr.LookupPlan do
     case fetch(store, event.event_id, clock) do
       {:ok, plan} -> execute(plan, context)
       :missing -> create_and_execute(event, context)
+      {:error, :expired} -> :terminal
       {:error, {:malformed_plan, _reason}} -> :terminal
       {:error, _reason} -> :retry
     end
@@ -98,7 +99,7 @@ defmodule JasminEx.Dlr.LookupPlan do
 
   defp build(%{kind: :submit_sm_resp} = event, context) do
     inputs = [request: DlrMap.fetch_request(store(context), event.gateway_id, clock(context))]
-    to_plan(event, inputs)
+    to_plan(event, inputs, context)
   end
 
   defp build(%{kind: :deliver_sm} = event, context) do
@@ -108,17 +109,17 @@ defmodule JasminEx.Dlr.LookupPlan do
     case reverse do
       {:ok, record} ->
         request = DlrMap.fetch_request(store(context), record.gateway_id, clock(context))
-        to_plan(event, reverse: reverse, request: request)
+        to_plan(event, [reverse: reverse, request: request], context)
 
       other ->
-        to_plan(event, reverse: other)
+        to_plan(event, [reverse: other], context)
     end
   end
 
   defp build(_event, _context), do: {:terminal, :unknown_event}
 
-  defp to_plan(event, inputs) do
-    case Lookup.plan(event, Keyword.put(inputs, :now_ms, event.observed_at_ms)) do
+  defp to_plan(event, inputs, context) do
+    case Lookup.plan(event, Keyword.put(inputs, :now_ms, now_ms(clock(context)))) do
       {:ok, actions} ->
         {:ok,
          Map.merge(actions, %{
@@ -357,7 +358,7 @@ defmodule JasminEx.Dlr.LookupPlan do
 
   defp decode_fresh(payload, now_ms) do
     case decode(payload) do
-      {:ok, %{expires_at_ms: expires_at_ms}} when expires_at_ms <= now_ms -> :missing
+      {:ok, %{expires_at_ms: expires_at_ms}} when expires_at_ms <= now_ms -> {:error, :expired}
       {:ok, plan} -> {:ok, plan}
       {:error, reason} -> {:error, {:malformed_plan, reason}}
     end

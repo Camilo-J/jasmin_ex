@@ -127,6 +127,41 @@ defmodule JasminEx.Dlr.LookupPlanTest do
     assert {:ok, _request} = DlrMap.fetch_request(store, "G1", clock)
   end
 
+  test "an expired durable plan is terminal and is never rebuilt" do
+    {:ok, agent} = Agent.start_link(fn -> %{entries: %{}, events: []} end)
+    store = {Store, agent}
+    initial_clock = {Clock, 1_000}
+    :ok = DlrMap.register(store, request_fixture(), initial_clock)
+    :ok = LookupPlan.persist(store, plan_fixture(), initial_clock)
+    Store.clear(agent)
+
+    assert :terminal =
+             LookupPlan.process_event(submit_event(),
+               store: store,
+               clock: {Clock, 80_000},
+               publisher: fn _job -> flunk("expired plans must not be rebuilt") end
+             )
+
+    assert Store.events(agent) == []
+  end
+
+  test "planning rejects an event whose deadline has passed on the current clock" do
+    {:ok, agent} = Agent.start_link(fn -> %{entries: %{}, events: []} end)
+    store = {Store, agent}
+    :ok = DlrMap.register(store, request_fixture(), {Clock, 1_000})
+    Store.clear(agent)
+
+    assert :terminal =
+             LookupPlan.process_event(submit_event(),
+               store: store,
+               clock: {Clock, 80_000},
+               publisher: fn _job -> flunk("expired events must not be published") end
+             )
+
+    assert :missing = Store.fetch(agent, LookupPlan.key("event-submit"))
+    assert Store.events(agent) == []
+  end
+
   test "worker accepts a context-bearing processor tuple" do
     context = %{marker: make_ref()}
 

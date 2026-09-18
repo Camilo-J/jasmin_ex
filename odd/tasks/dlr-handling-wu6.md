@@ -207,10 +207,11 @@ If these units cannot stand independently because the safety contract requires a
 | Credo | Passed | `mix credo --strict` → exit 0, no issues |
 | Dialyzer | Passed | `mix dialyzer` → exit 0, 0 errors and 0 skipped warnings |
 | Broker-backed thrower retry harness | Passed | RabbitMQ 4.3.4; HTTP 500 then 200/`ACK/Jasmin`; delivery counts 0 then 1; two actual HTTP requests; exit 0, 1 passed |
+| Review correction | Implemented and locally verified | Preserved streamed HTTP status and terminalized expired plan/event replay; 91/200 authored correction lines; focused gate 13 passed/1 excluded, five-suite gate 33 passed/1 excluded, full suite 671 passed/26 excluded, Credo and Dialyzer passed |
 | Authored changed lines | 2,416 through Unit D before tracker updates | Unit A: 513; Unit B: 596; Unit C: 358; Unit D implementation: 949 additions plus deletions |
-| Review decision | High but cohesive; no delivery action authorized | Preserve the safety boundary locally; do not split by weakening destination/TLS/transport evidence |
+| Review decision | Prior lineage abandoned with maintainer authorization; replacement review pending | `review-579dcd39287035c5` was quarantined after its provider continuation was lost; review the complete corrected WU6 candidate from the original base boundary |
 | Work-unit commits | Units A–D committed | `6220ba0` (A), `1a9a137` (B), `5702f39` (C), `102c6be` (D) |
 
 ## Next step
 
-Unit D is committed as `102c6be`. Mirror this tracker to Engram and retain the documented task 6.12 broker-only RED evidence gap. No remote delivery action is authorized; ask before opening a stacked PR to `main`.
+Commit the bounded review correction with its regression tests and this tracker update, then run a replacement native review over the complete corrected WU6 candidate from `main@49f49f1`. Retain the documented task 6.12 broker-only RED evidence gap. No remote delivery action is authorized; ask before opening a stacked PR to `main`.

@@ -40,6 +40,15 @@ defmodule JasminEx.Dlr.HttpcTest do
     assert FakeDlrEndpoint.requests(target) == []
   end
 
+  test "preserves the status of a streamed partial response", %{endpoint: endpoint} do
+    FakeDlrEndpoint.script(endpoint, [
+      {:reply, 206, [{"content-range", "bytes 0-10/11"}], "ACK/Jasmin"}
+    ])
+
+    assert {:ok, 206, "ACK/Jasmin"} =
+             Httpc.request(context(endpoint), request(endpoint, "/partial"))
+  end
+
   test "enforces total timeout and response body bounds", %{endpoint: endpoint} do
     FakeDlrEndpoint.script(endpoint, [{:slow, 100, 200, "ACK/Jasmin"}])
     assert {:error, _reason} = Httpc.request(context(endpoint, timeout: 20), request(endpoint))

@@ -128,7 +128,17 @@ defmodule JasminEx.Dlr.HttpClient.Httpc do
           {:error, :response_too_large}
         else
           :ok = :httpc.stream_next(handler)
-          receive_body(request_id, handler, profile, context, deadline, [], 0)
+
+          receive_body(
+            request_id,
+            handler,
+            profile,
+            context,
+            deadline,
+            [],
+            0,
+            stream_status(headers)
+          )
         end
 
       {:http, {^request_id, {{_version, status, _reason}, headers, body}}} ->
@@ -143,7 +153,7 @@ defmodule JasminEx.Dlr.HttpClient.Httpc do
     end
   end
 
-  defp receive_body(request_id, handler, profile, context, deadline, chunks, size) do
+  defp receive_body(request_id, handler, profile, context, deadline, chunks, size, status) do
     receive do
       {:http, {^request_id, :stream, chunk}} ->
         next_size = size + byte_size(chunk)
@@ -161,7 +171,8 @@ defmodule JasminEx.Dlr.HttpClient.Httpc do
             context,
             deadline,
             [chunk | chunks],
-            next_size
+            next_size,
+            status
           )
         end
 
@@ -169,7 +180,7 @@ defmodule JasminEx.Dlr.HttpClient.Httpc do
         if headers_too_large?(trailers, context) do
           {:error, :response_headers_too_large}
         else
-          {:ok, 200, chunks |> Enum.reverse() |> IO.iodata_to_binary()}
+          {:ok, status, chunks |> Enum.reverse() |> IO.iodata_to_binary()}
         end
 
       {:http, {^request_id, {:error, reason}}} ->
@@ -179,6 +190,14 @@ defmodule JasminEx.Dlr.HttpClient.Httpc do
         cancel(request_id, profile)
         {:error, :timeout}
     end
+  end
+
+  defp stream_status(headers) do
+    if Enum.any?(headers, fn {name, _value} ->
+         String.downcase(List.to_string(name)) == "content-range"
+       end),
+       do: 206,
+       else: 200
   end
 
   defp normalize_response(status, headers, body, context) do

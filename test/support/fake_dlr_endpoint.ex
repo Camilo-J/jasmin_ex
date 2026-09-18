@@ -33,6 +33,13 @@ defmodule JasminEx.FakeDlrEndpoint do
 
     defp respond(conn, {:reply, status, body}), do: send_resp(conn, status, body)
 
+    defp respond(conn, {:reply, status, headers, body}) do
+      conn =
+        Enum.reduce(headers, conn, fn {name, value}, acc -> put_resp_header(acc, name, value) end)
+
+      send_resp(conn, status, body)
+    end
+
     defp respond(conn, {:redirect, location}) do
       conn
       |> put_resp_header("location", location)
