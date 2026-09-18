@@ -75,6 +75,7 @@ defmodule JasminEx.Dlr.Lookup do
       url: request.url,
       method: request.method,
       level: 1,
+      created_at_ms: event.observed_at_ms,
       deadline_ms: event.deadline_ms,
       fields: %{
         "id" => request.gateway_id,
@@ -93,6 +94,7 @@ defmodule JasminEx.Dlr.Lookup do
       url: request.url,
       method: request.method,
       level: 2,
+      created_at_ms: event.observed_at_ms,
       deadline_ms: event.deadline_ms,
       fields: %{
         "id" => request.gateway_id,

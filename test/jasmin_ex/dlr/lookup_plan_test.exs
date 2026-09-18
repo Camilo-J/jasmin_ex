@@ -160,6 +160,7 @@ defmodule JasminEx.Dlr.LookupPlanTest do
         url: "https://example.com/dlr",
         method: "POST",
         level: 1,
+        created_at_ms: 1_000,
         deadline_ms: 80_000,
         fields: %{
           "id" => "G1",
