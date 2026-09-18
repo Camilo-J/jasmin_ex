@@ -98,7 +98,7 @@ Historical task numbers 6.1–6.12 remain stable for traceability. Each task clo
   - GREEN evidence: `mix test test/jasmin_ex/dlr/lookup_plan_test.exs test/jasmin_ex/dlr/worker_test.exs` → exit 0, 11 passed.
   - REFACTOR evidence: grouped processor phase flow and removed compiler warnings; formatted rerun exit 0, 11 passed.
 - [x] **6.4 — Implement `LookupPlan` and the lookup processor.** Add `lib/jasmin_ex/dlr/lookup_plan.ex`; integrate the processor through `lib/jasmin_ex/dlr/worker.ex` without weakening the worker's existing broker-owned retry and settlement contract. Persist the plan first, then apply idempotent mutations, obtain positive routed publication confirmation, mark forwarded, clean up, and ACK.
-  - Progress: `complete`; work-unit commit pending.
+  - Progress: `complete`; closed by work-unit commit `1a9a137`.
   - RED evidence: shared with task 6.3: missing durable plan/processor APIs, exit 2.
   - GREEN evidence: plan and existing worker suites exit 0, 11 passed; tests prove plan-first ordering and forwarded cleanup replay without deliberate republish.
   - REFACTOR evidence: `mix format lib/jasmin_ex/dlr/lookup_plan.ex lib/jasmin_ex/dlr/worker.ex test/jasmin_ex/dlr/lookup_plan_test.exs` followed by focused suites remained green; external runtime harness `N/A` because Unit B uses injected store/publisher boundaries and does not add transport topology.
@@ -172,7 +172,7 @@ No commit is authorized by this planning invocation. During implementation, clos
 | Work unit | Outcome | Candidate rollback boundary | Commit evidence |
 |---|---|---|---|
 | A | Pure lookup policy | `lookup.ex` and `lookup_test.exs` | `6220ba0`; 513 authored lines including the initial authoritative tracker |
-| B | Durable lookup plan and processor | `lookup_plan.ex`, its tests, and bounded worker integration | Commit pending; 596 authored changed lines |
+| B | Durable lookup plan and processor | `lookup_plan.ex`, its tests, and bounded worker integration | `1a9a137`; 596 authored changed lines |
 | C | HTTP job and thrower semantics | `http_job.ex`, `http_thrower.ex`, and focused tests | `<commit or uncommitted diff identity>` |
 | D | Destination policy and one-attempt adapter | destination/client modules, endpoint support, security/adapter tests, and only required runtime applications | `<commit or uncommitted diff identity>` |
 
@@ -209,7 +209,7 @@ If these units cannot stand independently because the safety contract requires a
 | Broker-backed thrower retry harness | Not run | `<exact command, RabbitMQ version, endpoint scenario, attempt counts, result>` |
 | Authored changed lines | 1,109 through Unit B | Unit A: 513; Unit B: 596 additions plus deletions |
 | Review decision | Pending implementation evidence | `<ask-on-risk outcome>` |
-| Work-unit commits | Unit A committed | `6220ba0` (`feat(dlr): add pure callback lookup policy`) |
+| Work-unit commits | Units A–B committed | `6220ba0` (A), `1a9a137` (B) |
 
 ## Next step
 
