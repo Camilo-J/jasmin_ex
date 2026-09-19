@@ -21,7 +21,7 @@ Implement WU6 locally on `feat/dlr-handling-wu6` only:
 - Pure lookup policy for submit-response and receipt events.
 - Durable, replayable `LookupPlan` processing integrated with the existing DLR worker boundary.
 - Versioned `HttpJob` payloads and HTTP thrower ACK, terminal, and retry semantics.
-- Destination validation, DNS/IP policy, original-host TLS verification with a pinned peer, and a bounded OTP `:httpc` adapter.
+- Destination validation, DNS/IP policy, original-host TLS verification with a pinned peer, and a bounded direct Mint HTTP/1 adapter. The completed OTP `:httpc` adapter remains historical WU6 evidence until the authorized migration below replaces it.
 - A local fake DLR endpoint and a broker-backed retry harness sufficient to verify WU6.
 - A narrow production assembly change only if it is required to make WU6 reachable and testable. Any such change must be recorded as a WU6 reachability decision; do not silently absorb Phase 7's full application wiring.
 
@@ -55,6 +55,32 @@ No push, pull request, merge, or remote access is authorized. Do not add an SMPP
 | Review heuristic | 400 authored changed lines, additions plus deletions, advisory rather than a code-size target |
 | Forecast | WU6 is expected to be oversized but cohesive because lookup durability, callback semantics, and outbound security form one end-to-end safety boundary. |
 | Guardrail | Do not shrink lines artificially by compressing code, deleting tests, removing comments, or weakening evidence. Ask before changing the delivery boundary when review risk becomes material. |
+
+### Authorized Mint transport migration
+
+The maintainer authorized replacing the OTP `:httpc` adapter with a direct Mint HTTP/1 adapter. This is required because `:httpc` cannot expose the exact response status while also guaranteeing streamed, bounded handling for every response body. The migration must preserve all destination-policy, TLS identity, one-attempt, redirect, timeout, header, and body bounds already established by WU6.
+
+Verified planning rationale:
+
+- Mint exposes exact `:status`, `:headers`, `:data`, and `:done` response events, so the adapter can retain the received status while bounding every body incrementally.
+- Mint supports tuple-address pinning with an explicit `hostname`, allowing connection to the approved peer while preserving the original host for HTTP Host, TLS SNI, and certificate hostname verification.
+- The adapter will force HTTP/1 and configure `max_header_list_size`; body size and total-attempt time remain explicitly enforced by the adapter.
+- No Mint, Finch, or Req dependency currently exists in `mix.exs` or `mix.lock`.
+- `hpax` already exists transitively in `mix.lock`; this observation does not replace declaring Mint as a direct dependency.
+- The current native lineage remains blocked. Migration completion requires a fresh or explicitly rebound review candidate over the complete corrected WU6 boundary; no existing terminal or blocked lineage may be presented as approval.
+
+Migration planning route and delivery decision:
+
+| Field | Decision |
+|---|---|
+| Route | `delegated` |
+| Trigger evidence | Active: the migration changes 2+ non-trivial files. Preparation read covered `mix.exs`, `mix.lock`, `lib/jasmin_ex/dlr/http_client.ex`, `lib/jasmin_ex/dlr/http_client/httpc.ex`, and `test/jasmin_ex/dlr/httpc_test.exs`. |
+| Delivery strategy | `ask-on-risk`, resolved by the maintainer to chained delivery |
+| Chain strategy | `stacked-to-main` |
+| Estimated authored change | 500–600 additions plus deletions across the implementation slices; the budget guides review slicing and must not drive code compression. |
+| Slice 1 | Task 6.14, direct Mint HTTP/1 transport and focused transport proof; targets `main`. Expected approximately 350–400 authored changed lines. |
+| Slice 2 | Task 6.15, runtime/integration cutover and `:httpc` removal; targets `main` only after Slice 1 lands or is rebased onto its merged boundary. Expected approximately 150–200 authored changed lines. |
+| Review boundary | Each slice receives its own focused checks and rollback boundary. After both slices, create a fresh or explicitly rebound native review candidate for complete WU6 from `main@49f49f1`. |
 
 ## Acceptance criteria
 
@@ -154,7 +180,28 @@ Historical task numbers 6.1–6.12 remain stable for traceability. Each task clo
   - GREEN evidence: the same focused command → exit 0, 6 passed; the table rejects translation, discard-only, Teredo, benchmarking, ORCHID, documentation, 6to4, local, multicast, unspecified, loopback, and mapped-private representatives while accepting an ordinary global-unicast address.
   - REFACTOR evidence: `mix format lib/jasmin_ex/dlr/destination_policy.ex test/jasmin_ex/dlr/destination_policy_test.exs && mix test test/jasmin_ex/dlr/destination_policy_test.exs` → exit 0, 6 passed.
 
-**Feature task count: 13.**
+### Unit E — Direct Mint HTTP/1 migration
+
+- [ ] **6.14 — Add the bounded direct Mint HTTP/1 transport.** Introduce Mint as a direct dependency and add a transport adapter that consumes exact `:status`, `:headers`, `:data`, and `:done` events. Connect to the approved tuple address with the original hostname, force HTTP/1, set `max_header_list_size`, preserve Host/SNI/certificate hostname verification, enforce connect/total/body bounds, avoid redirects and retries, and close the connection on every terminal path. Keep the existing `:httpc` adapter available until the next slice so this work unit can be reviewed and rolled back independently.
+  - Progress: `pending`.
+  - Objective: prove the replacement transport's exact-status and bounded-streaming contract before removing the established adapter.
+  - Acceptance criteria: focused tests observe RED before implementation; streamed 2xx/3xx/4xx/5xx responses retain their exact status; headers and body are bounded incrementally; tuple-address pinning retains the original hostname for Host and verified TLS identity; GET/POST payloads are unchanged; one call creates at most one attempt; redirects are not followed; timeout, protocol, oversized, and TLS failures are typed; every success or failure path closes the Mint connection.
+  - Authorized file scope: `mix.exs`, `mix.lock`, `lib/jasmin_ex/dlr/http_client/mint.ex`, `test/jasmin_ex/dlr/mint_test.exs`, and this tracker for exact evidence only. `lib/jasmin_ex/dlr/http_client.ex` may change only if the existing port type cannot represent the verified Mint result without loss. Do not modify the destination-policy contract, thrower classification, fake endpoint, broker harness, or existing `:httpc` files in this slice.
+  - Exact checks: `mix test test/jasmin_ex/dlr/mint_test.exs`; `mix test test/jasmin_ex/dlr/destination_policy_test.exs test/jasmin_ex/dlr/http_thrower_test.exs test/jasmin_ex/dlr/mint_test.exs`; `mix format --check-formatted`; `mix credo --strict`; `mix dialyzer`.
+  - Rollback boundary: remove the Mint adapter and its focused tests, remove the direct Mint dependency and resulting lock changes, and revert only any necessary `HttpClient` type adjustment. The existing `:httpc` path remains intact and no broker/runtime consumer is cut over by this slice.
+  - Route and trigger: `delegated`; active because `mix.exs`, the new adapter, and the focused test are 2+ non-trivial files, with the preparation read recorded in the migration table.
+  - Delivery: `ask-on-risk` resolved to `stacked-to-main`; Slice 1 targets `main`, carries only task 6.14, and is expected to remain near the 400-line heuristic without reducing safety evidence.
+- [ ] **6.15 — Cut over WU6 integration and remove `:httpc`.** Move the broker-backed retry harness and complete WU6 transport gate to the Mint adapter, remove the OTP adapter and dedicated profile configuration, remove `:inets` if no longer required elsewhere, and retain `:ssl`. Preserve the fake endpoint's deterministic status, TLS, redirect, timeout, oversized-response, and request-count evidence.
+  - Progress: `pending`; blocked on task 6.14 landing or being available as the immediate stacked dependency.
+  - Objective: complete the replacement without changing callback semantics, retry ownership, destination approval, or the established runtime evidence boundary.
+  - Acceptance criteria: no runtime or test reference to `JasminEx.Dlr.HttpClient.Httpc`, `:httpc`, or adapter profiles remains; Mint is the exercised client in the broker-backed retry harness; HTTP 500 then HTTP 200/`ACK/Jasmin` still produces delivery counts 0 then 1, exactly two network attempts, and terminal ACK; all five WU6 focused suites, full tests, formatter, Credo, and Dialyzer pass; the final authored slice count is recorded; current native lineage is still reported blocked pending a fresh or explicitly rebound complete-WU6 candidate.
+  - Authorized file scope: `lib/jasmin_ex/dlr/http_client/httpc.ex` (deletion), `test/jasmin_ex/dlr/httpc_test.exs` (deletion after equivalent Mint coverage exists), `test/jasmin_ex/dlr/mint_test.exs`, `test/support/fake_dlr_endpoint.ex` only if Mint exposes a missing deterministic transport case, `mix.exs` for runtime application cleanup, and this tracker for exact evidence. No lookup, job, thrower, worker, messaging, or destination-policy behavior changes are authorized.
+  - Exact checks: `mix test --only integration test/jasmin_ex/dlr/mint_test.exs`; `mix test test/jasmin_ex/dlr/lookup_test.exs test/jasmin_ex/dlr/lookup_plan_test.exs test/jasmin_ex/dlr/http_thrower_test.exs test/jasmin_ex/dlr/destination_policy_test.exs test/jasmin_ex/dlr/mint_test.exs`; `mix test`; `mix format --check-formatted`; `mix credo --strict`; `mix dialyzer`; `git grep -n -E 'HttpClient\\.Httpc|:httpc|dlr_.*httpc|profile:' -- '*.ex' '*.exs'` must return no migration residue.
+  - Rollback boundary: restore the deleted `:httpc` adapter/test and `:inets` runtime declaration, restore the broker harness client/profile configuration, and remove only the Mint integration additions from this slice. Do not roll back task 6.14's already-reviewed transport proof or any WU1–WU6 domain behavior.
+  - Route and trigger: `delegated`; active because adapter deletion, integration-test cutover, and runtime cleanup span 2+ non-trivial files, with the preparation read recorded in the migration table.
+  - Delivery: `ask-on-risk` resolved to `stacked-to-main`; Slice 2 follows Slice 1, targets `main` after Slice 1 lands or is rebased onto that merged boundary, and carries only task 6.15.
+
+**Feature task count: 15; pending Mint migration tasks: 2 (`6.14`, `6.15`).**
 
 ## Verification gates
 
@@ -170,9 +217,11 @@ mix dialyzer
 
 The runtime gate must also run the broker-backed HTTP thrower retry harness with `test/support/fake_dlr_endpoint.ex`. Record the exact command selected by the implementation, RabbitMQ version, endpoint script, broker redelivery/attempt counters, actual HTTP request count, terminal disposition, and exit status. A fake-only retry assertion is insufficient.
 
+The command above remains the completed pre-migration `:httpc` gate. Tasks 6.14 and 6.15 define the exact Mint migration checks; after task 6.15, `test/jasmin_ex/dlr/mint_test.exs` replaces `test/jasmin_ex/dlr/httpc_test.exs` in the authoritative five-suite and broker-backed gates.
+
 ## Work-unit commits
 
-No commit is authorized by this planning invocation. During implementation, close cohesive behavior with tests in the same work-unit commit and use Conventional Commits. Proposed review story:
+This planning invocation authorizes only the tracker commit; no source or test commit is authorized. During implementation, close cohesive behavior with tests in the same work-unit commit and use Conventional Commits. Proposed review story:
 
 | Work unit | Outcome | Candidate rollback boundary | Commit evidence |
 |---|---|---|---|
@@ -180,6 +229,8 @@ No commit is authorized by this planning invocation. During implementation, clos
 | B | Durable lookup plan and processor | `lookup_plan.ex`, its tests, and bounded worker integration | `1a9a137`; 596 authored changed lines |
 | C | HTTP job and thrower semantics | `http_job.ex`, `http_thrower.ex`, and focused tests | `5702f39`; 358 authored changed lines |
 | D | Destination policy and one-attempt adapter | destination/client modules, endpoint support, security/adapter tests, and only required runtime applications | `102c6be`; 949 authored changed lines |
+| E1 | Direct Mint HTTP/1 transport proof | direct dependency, Mint adapter, and focused tests; existing `:httpc` path remains intact | Pending task 6.14; stacked-to-main Slice 1; estimated 350–400 authored changed lines |
+| E2 | Runtime/integration cutover and OTP adapter removal | broker-backed Mint gate, `:httpc` adapter/test deletion, and `:inets` cleanup | Pending task 6.15; stacked-to-main Slice 2; estimated 150–200 authored changed lines |
 
 If these units cannot stand independently because the safety contract requires a cohesive WU6 candidate, preserve the cohesive boundary and record the honest authored line count. Do not invent artificial splits or rewrite for line-count optics.
 
@@ -199,7 +250,9 @@ If these units cannot stand independently because the safety contract requires a
 4. Unit B rolls back lookup-plan storage and worker processor integration together so no event can mutate maps without its persisted plan.
 5. Unit C rolls back the job/thrower contract together; do not leave a published job without a compatible consumer.
 6. Unit D rolls back destination policy, client port/adapter, fake endpoint support, and any WU6-only `:inets`/`:ssl` assembly together. Never retain an adapter path that bypasses destination approval.
-7. Do not roll back or modify WU1–WU5 correlation, SMPP receipt, topic transport, or MT queue behavior as part of WU6 recovery.
+7. Unit E1 rolls back the direct Mint dependency, adapter, and focused tests while leaving the existing `:httpc` transport operational.
+8. Unit E2 rolls back the integration cutover, `:httpc` deletions, and `:inets` cleanup together; do not leave tests or runtime assembly pointing at a removed adapter.
+9. Do not roll back or modify WU1–WU5 correlation, SMPP receipt, topic transport, or MT queue behavior as part of WU6 recovery.
 
 ## Progress and evidence summary
 
@@ -214,10 +267,11 @@ If these units cannot stand independently because the safety contract requires a
 | Broker-backed thrower retry harness | Passed | RabbitMQ 4.3.4; HTTP 500 then 200/`ACK/Jasmin`; delivery counts 0 then 1; two actual HTTP requests; exit 0, 1 passed |
 | Review correction | Implemented and locally verified | Preserved streamed HTTP status and terminalized expired plan/event replay; 91/200 authored correction lines; focused gate 13 passed/1 excluded, five-suite gate 33 passed/1 excluded, full suite 671 passed/26 excluded, Credo and Dialyzer passed |
 | Native review `R3-ipv6-reserved-bypass` | Terminal `escalated` for lineage `review-45e3beccb7ea46f5`; superseded locally by task 6.13 | The narrow correction rejected site-local and documentation space but retained a permissive IPv6 fallback; the fresh follow-up now uses positive global-unicast eligibility plus special-purpose exclusions. |
+| Mint transport migration | Planned; tasks 6.14 and 6.15 pending | Maintainer authorized direct Mint HTTP/1 replacement in two stacked-to-main slices, estimated at 500–600 authored changed lines. |
 | Authored changed lines | 2,416 through Unit D before tracker updates | Unit A: 513; Unit B: 596; Unit C: 358; Unit D implementation: 949 additions plus deletions |
-| Review decision | Prior lineage abandoned with maintainer authorization; replacement review pending | `review-579dcd39287035c5` was quarantined after its provider continuation was lost; review the complete corrected WU6 candidate from the original base boundary |
+| Review decision | Current native lineage blocked; fresh/rebound review required after migration | `review-579dcd39287035c5` was quarantined after its provider continuation was lost, and `review-45e3beccb7ea46f5` is terminal escalated; after tasks 6.14–6.15, review the complete corrected WU6 candidate from the original base boundary. |
 | Work-unit commits | Units A–D committed | `6220ba0` (A), `1a9a137` (B), `5702f39` (C), `102c6be` (D) |
 
 ## Next step
 
-Task 6.13 is the fresh follow-up. Commit its implementation, tests, and tracker update as the next work unit, then run a new native review over the complete WU6 candidate from `main@49f49f1`. Retain the documented task 6.12 broker-only RED evidence gap. No remote delivery action is authorized without asking.
+Implement task 6.14 as stacked-to-main Slice 1, then task 6.15 as Slice 2 after Slice 1 lands or is rebased onto its merged boundary. Retain the documented task 6.12 broker-only RED evidence gap. After both migration slices, create a fresh or explicitly rebound native review candidate over the complete corrected WU6 candidate from `main@49f49f1`; the current lineage remains blocked. No remote delivery action is authorized without asking.
