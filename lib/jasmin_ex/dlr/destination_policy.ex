@@ -125,8 +125,10 @@ defmodule JasminEx.Dlr.DestinationPolicy do
   defp public?({0, 0, 0, 0, 0, 0, 0, 0}), do: false
   defp public?({0, 0, 0, 0, 0, 0, 0, 1}), do: false
   defp public?({a, _b, _c, _d, _e, _f, _g, _h}) when (a &&& 0xFE00) == 0xFC00, do: false
+  defp public?({a, _b, _c, _d, _e, _f, _g, _h}) when (a &&& 0xFFC0) == 0xFEC0, do: false
   defp public?({a, _b, _c, _d, _e, _f, _g, _h}) when (a &&& 0xFFC0) == 0xFE80, do: false
   defp public?({a, _b, _c, _d, _e, _f, _g, _h}) when (a &&& 0xFF00) == 0xFF00, do: false
+  defp public?({0x2001, 0xDB8, _c, _d, _e, _f, _g, _h}), do: false
 
   defp public?({0, 0, 0, 0, 0, 0xFFFF, high, low}) do
     public?({high >>> 8, high &&& 255, low >>> 8, low &&& 255})

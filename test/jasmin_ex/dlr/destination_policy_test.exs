@@ -44,7 +44,7 @@ defmodule JasminEx.Dlr.DestinationPolicyTest do
              )
   end
 
-  test "rejects private, loopback, link-local, multicast, unspecified, and mapped IPv6" do
+  test "rejects private, reserved, loopback, link-local, multicast, unspecified, and mapped IPv6" do
     forbidden = [
       {127, 0, 0, 1},
       {10, 0, 0, 1},
@@ -55,7 +55,9 @@ defmodule JasminEx.Dlr.DestinationPolicyTest do
       {224, 0, 0, 1},
       {0, 0, 0, 0, 0, 0, 0, 1},
       {0xFC00, 0, 0, 0, 0, 0, 0, 1},
+      {0xFEC0, 0, 0, 0, 0, 0, 0, 1},
       {0xFE80, 0, 0, 0, 0, 0, 0, 1},
+      {0x2001, 0xDB8, 0, 0, 0, 0, 0, 1},
       {0, 0, 0, 0, 0, 0xFFFF, 0x7F00, 1}
     ]
 
