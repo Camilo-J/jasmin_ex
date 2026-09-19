@@ -148,8 +148,13 @@ Historical task numbers 6.1–6.12 remain stable for traceability. Each task clo
   - RED evidence: the Unit D focused RED established that the real adapter path could not execute because `DestinationPolicy.approve/2` was undefined; the separately tagged broker test was excluded by that command, so there is no honest broker-only RED result to report.
   - GREEN evidence: `mix test --only integration test/jasmin_ex/dlr/httpc_test.exs` → exit 0, 1 passed and 5 excluded. RabbitMQ 4.3.4 delivered counts 0 then 1; the endpoint script returned HTTP 500 then HTTP 200 with `ACK/Jasmin`; exactly two HTTP requests were recorded before terminal ACK.
   - REFACTOR evidence: the same broker-backed command remained green after bounded async reception and cancellation replaced synchronous full-body buffering.
+- [x] **6.13 — Replace permissive IPv6 fallback with explicit global-unicast eligibility.** Require IPv6 destinations to be in `2000::/3` and outside the IANA special-purpose ranges that overlap it, while preserving exact operator-owned host/address exceptions and existing IPv4 behavior.
+  - Progress: `complete`; fresh follow-up candidate after terminal lineage `review-45e3beccb7ea46f5`; parent review pending.
+  - RED evidence: `mix test test/jasmin_ex/dlr/destination_policy_test.exs` → exit 2, 5/6 passed; IPv4-IPv6 translation address `64:ff9b::c000:201` was approved.
+  - GREEN evidence: the same focused command → exit 0, 6 passed; the table rejects translation, discard-only, Teredo, benchmarking, ORCHID, documentation, 6to4, local, multicast, unspecified, loopback, and mapped-private representatives while accepting an ordinary global-unicast address.
+  - REFACTOR evidence: `mix format lib/jasmin_ex/dlr/destination_policy.ex test/jasmin_ex/dlr/destination_policy_test.exs && mix test test/jasmin_ex/dlr/destination_policy_test.exs` → exit 0, 6 passed.
 
-**Feature task count: 12.**
+**Feature task count: 13.**
 
 ## Verification gates
 
@@ -208,11 +213,11 @@ If these units cannot stand independently because the safety contract requires a
 | Dialyzer | Passed | `mix dialyzer` → exit 0, 0 errors and 0 skipped warnings |
 | Broker-backed thrower retry harness | Passed | RabbitMQ 4.3.4; HTTP 500 then 200/`ACK/Jasmin`; delivery counts 0 then 1; two actual HTTP requests; exit 0, 1 passed |
 | Review correction | Implemented and locally verified | Preserved streamed HTTP status and terminalized expired plan/event replay; 91/200 authored correction lines; focused gate 13 passed/1 excluded, five-suite gate 33 passed/1 excluded, full suite 671 passed/26 excluded, Credo and Dialyzer passed |
-| Native review `R3-ipv6-reserved-bypass` | Corrected for lineage `review-45e3beccb7ea46f5` and target `sha256:9710dbddcbdd09fa7d6e112065bd447a3917859812305dd3246b7788e76f08e0` | RED: focused destination-policy suite rejected the new expectation because `fec0::1` was approved (4/5 passed). GREEN: deprecated site-local `fec0::/10` and documentation-only `2001:db8::/32` are rejected (5 passed). |
+| Native review `R3-ipv6-reserved-bypass` | Terminal `escalated` for lineage `review-45e3beccb7ea46f5`; superseded locally by task 6.13 | The narrow correction rejected site-local and documentation space but retained a permissive IPv6 fallback; the fresh follow-up now uses positive global-unicast eligibility plus special-purpose exclusions. |
 | Authored changed lines | 2,416 through Unit D before tracker updates | Unit A: 513; Unit B: 596; Unit C: 358; Unit D implementation: 949 additions plus deletions |
 | Review decision | Prior lineage abandoned with maintainer authorization; replacement review pending | `review-579dcd39287035c5` was quarantined after its provider continuation was lost; review the complete corrected WU6 candidate from the original base boundary |
 | Work-unit commits | Units A–D committed | `6220ba0` (A), `1a9a137` (B), `5702f39` (C), `102c6be` (D) |
 
 ## Next step
 
-Commit the bounded review correction with its regression tests and this tracker update, then run a replacement native review over the complete corrected WU6 candidate from `main@49f49f1`. Retain the documented task 6.12 broker-only RED evidence gap. No remote delivery action is authorized; ask before opening a stacked PR to `main`.
+Task 6.13 is the fresh follow-up. Commit its implementation, tests, and tracker update as the next work unit, then run a new native review over the complete WU6 candidate from `main@49f49f1`. Retain the documented task 6.12 broker-only RED evidence gap. No remote delivery action is authorized without asking.

@@ -4,6 +4,14 @@ defmodule JasminEx.Dlr.DestinationPolicy do
 
   @reserved_query_fields ~w(id level message_status connector id_smsc sub dlvrd subdate donedate err text)
 
+  @ipv6_global_unicast_prefix {{0x2000, 0, 0, 0, 0, 0, 0, 0}, 3}
+  @ipv6_special_purpose_prefixes [
+    {{0x2001, 0, 0, 0, 0, 0, 0, 0}, 23},
+    {{0x2001, 0xDB8, 0, 0, 0, 0, 0, 0}, 32},
+    {{0x2002, 0, 0, 0, 0, 0, 0, 0}, 16},
+    {{0x3FFF, 0, 0, 0, 0, 0, 0, 0}, 20}
+  ]
+
   defmodule SystemResolver do
     @moduledoc false
 
@@ -122,20 +130,29 @@ defmodule JasminEx.Dlr.DestinationPolicy do
   defp public?({203, 0, 113, _d}), do: false
   defp public?({_a, _b, _c, _d}), do: true
 
-  defp public?({0, 0, 0, 0, 0, 0, 0, 0}), do: false
-  defp public?({0, 0, 0, 0, 0, 0, 0, 1}), do: false
-  defp public?({a, _b, _c, _d, _e, _f, _g, _h}) when (a &&& 0xFE00) == 0xFC00, do: false
-  defp public?({a, _b, _c, _d, _e, _f, _g, _h}) when (a &&& 0xFFC0) == 0xFEC0, do: false
-  defp public?({a, _b, _c, _d, _e, _f, _g, _h}) when (a &&& 0xFFC0) == 0xFE80, do: false
-  defp public?({a, _b, _c, _d, _e, _f, _g, _h}) when (a &&& 0xFF00) == 0xFF00, do: false
-  defp public?({0x2001, 0xDB8, _c, _d, _e, _f, _g, _h}), do: false
-
-  defp public?({0, 0, 0, 0, 0, 0xFFFF, high, low}) do
-    public?({high >>> 8, high &&& 255, low >>> 8, low &&& 255})
+  defp public?(address) when is_tuple(address) and tuple_size(address) == 8 do
+    ipv6_address?(address) and ipv6_prefix?(address, @ipv6_global_unicast_prefix) and
+      Enum.all?(@ipv6_special_purpose_prefixes, &(not ipv6_prefix?(address, &1)))
   end
 
-  defp public?({_a, _b, _c, _d, _e, _f, _g, _h}), do: true
   defp public?(_address), do: false
+
+  defp ipv6_address?(address) do
+    address
+    |> Tuple.to_list()
+    |> Enum.all?(&(&1 in 0..0xFFFF))
+  end
+
+  defp ipv6_prefix?(address, {network, prefix_length}) do
+    shift = 128 - prefix_length
+    ipv6_integer(address) >>> shift == ipv6_integer(network) >>> shift
+  end
+
+  defp ipv6_integer(address) do
+    address
+    |> Tuple.to_list()
+    |> Enum.reduce(0, fn segment, result -> result <<< 16 ||| segment end)
+  end
 
   defp default_port("http"), do: 80
   defp default_port("https"), do: 443

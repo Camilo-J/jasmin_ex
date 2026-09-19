@@ -44,29 +44,49 @@ defmodule JasminEx.Dlr.DestinationPolicyTest do
              )
   end
 
-  test "rejects private, reserved, loopback, link-local, multicast, unspecified, and mapped IPv6" do
+  test "rejects non-global and special-purpose callback destinations" do
     forbidden = [
-      {127, 0, 0, 1},
-      {10, 0, 0, 1},
-      {172, 16, 0, 1},
-      {192, 168, 0, 1},
-      {169, 254, 169, 254},
-      {0, 0, 0, 0},
-      {224, 0, 0, 1},
-      {0, 0, 0, 0, 0, 0, 0, 1},
-      {0xFC00, 0, 0, 0, 0, 0, 0, 1},
-      {0xFEC0, 0, 0, 0, 0, 0, 0, 1},
-      {0xFE80, 0, 0, 0, 0, 0, 0, 1},
-      {0x2001, 0xDB8, 0, 0, 0, 0, 0, 1},
-      {0, 0, 0, 0, 0, 0xFFFF, 0x7F00, 1}
+      {"IPv4 loopback", {127, 0, 0, 1}},
+      {"IPv4 private 10/8", {10, 0, 0, 1}},
+      {"IPv4 private 172.16/12", {172, 16, 0, 1}},
+      {"IPv4 private 192.168/16", {192, 168, 0, 1}},
+      {"IPv4 link-local metadata", {169, 254, 169, 254}},
+      {"IPv4 unspecified", {0, 0, 0, 0}},
+      {"IPv4 multicast", {224, 0, 0, 1}},
+      {"IPv4-compatible/translatable", {0x64, 0xFF9B, 0, 0, 0, 0, 0xC000, 0x201}},
+      {"discard-only", {0x100, 0, 0, 0, 0, 0, 0, 1}},
+      {"Teredo", {0x2001, 0, 0, 0, 0, 0, 0, 1}},
+      {"benchmarking", {0x2001, 2, 0, 0, 0, 0, 0, 1}},
+      {"deprecated ORCHID", {0x2001, 0x10, 0, 0, 0, 0, 0, 1}},
+      {"ORCHIDv2", {0x2001, 0x20, 0, 0, 0, 0, 0, 1}},
+      {"documentation", {0x2001, 0xDB8, 0, 0, 0, 0, 0, 1}},
+      {"6to4 transition", {0x2002, 0xC000, 0x204, 0, 0, 0, 0, 1}},
+      {"unique-local", {0xFC00, 0, 0, 0, 0, 0, 0, 1}},
+      {"deprecated site-local", {0xFEC0, 0, 0, 0, 0, 0, 0, 1}},
+      {"link-local", {0xFE80, 0, 0, 0, 0, 0, 0, 1}},
+      {"multicast", {0xFF02, 0, 0, 0, 0, 0, 0, 1}},
+      {"unspecified", {0, 0, 0, 0, 0, 0, 0, 0}},
+      {"loopback", {0, 0, 0, 0, 0, 0, 0, 1}},
+      {"IPv4-mapped private", {0, 0, 0, 0, 0, 0xFFFF, 0xA00, 1}}
     ]
 
-    for address <- forbidden do
+    for {category, address} <- forbidden do
       resolver = resolver(%{"callback.test" => {:ok, [address]}})
 
       assert {:error, :forbidden_address} =
-               DestinationPolicy.approve("https://callback.test/dlr", resolver: resolver)
+               DestinationPolicy.approve("https://callback.test/dlr", resolver: resolver),
+             category
     end
+  end
+
+  test "accepts an ordinary global-unicast IPv6 destination" do
+    address = {0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111}
+    resolver = resolver(%{"callback.test" => {:ok, [address]}})
+
+    assert {:ok, approved} =
+             DestinationPolicy.approve("https://callback.test/dlr", resolver: resolver)
+
+    assert approved.peer == address
   end
 
   test "rejects an answer set containing a forbidden rebinding address" do
