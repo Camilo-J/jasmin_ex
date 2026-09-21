@@ -287,6 +287,7 @@ If these units cannot stand independently because the safety contract requires a
 | Task 6.15 authored changed lines | 660 | Additions plus deletions for legacy adapter/test removal, Mint broker harness cutover, runtime cleanup, and tracker evidence. |
 | Authored changed lines | 2,416 through Unit D before tracker updates | Unit A: 513; Unit B: 596; Unit C: 358; Unit D implementation: 949 additions plus deletions |
 | Review decision | Current native lineage blocked; fresh/rebound review required after migration | `review-579dcd39287035c5` was quarantined after its provider continuation was lost, and `review-45e3beccb7ea46f5` is terminal escalated; after tasks 6.14–6.15, review the complete corrected WU6 candidate from the original base boundary. |
+| Post-E2 RDD assessment | Unavailable; treated as review-due/high | `gentle-ai review assess --agent opencode --base-ref e4862c3 --committed-only --json` exited 1 because this runtime is not eligible for immutable receipt review. No review lifecycle was started and RDD remains enabled. |
 | Work-unit commits | Units A–E2 committed in separate slices | `6220ba0` (A), `1a9a137` (B), `5702f39` (C), `102c6be` (D), `b45a733` (E1), and E2 `this commit` with its resulting hash reported out-of-band |
 
 ## Next step
