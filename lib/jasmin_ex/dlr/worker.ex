@@ -59,7 +59,7 @@ defmodule JasminEx.Dlr.Worker do
         :terminal
 
       true ->
-        invoke(state.processor, payload, meta)
+        invoke_processor(state.processor, payload, meta)
     end
   end
 
@@ -70,10 +70,14 @@ defmodule JasminEx.Dlr.Worker do
     end
   end
 
-  defp invoke(processor, payload, meta) when is_function(processor, 2),
+  def invoke_processor(processor, payload, meta) when is_function(processor, 2),
     do: processor.(payload, meta)
 
-  defp invoke({module, function}, payload, meta), do: apply(module, function, [payload, meta])
+  def invoke_processor({module, function}, payload, meta),
+    do: apply(module, function, [payload, meta])
+
+  def invoke_processor({module, function, context}, payload, meta),
+    do: apply(module, function, [payload, meta, context])
 
   defp settle(%{inflight: {channel, tag}} = state, channel, tag, meta, outcome) do
     if live_channel?(channel) do

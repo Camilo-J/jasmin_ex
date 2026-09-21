@@ -23,7 +23,7 @@ defmodule JasminEx.MixProject do
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
-      extra_applications: [:logger],
+      extra_applications: [:logger, :ssl],
       mod: {JasminEx.Application, []}
     ]
   end
@@ -35,6 +35,7 @@ defmodule JasminEx.MixProject do
       {:bandit, "~> 1.7"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
+      {:mint, "~> 1.10"},
       {:plug, "~> 1.16"},
       {:redix, "~> 1.6.0"},
       {:telemetry, "~> 1.0"}
