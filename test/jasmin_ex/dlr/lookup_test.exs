@@ -64,6 +64,11 @@ defmodule JasminEx.Dlr.LookupTest do
              Lookup.plan(event, request: {:ok, %{@request | level: 2}})
   end
 
+  test "submit request with an unsupported level is terminal instead of crashing" do
+    assert {:terminal, {:malformed_map, :invalid_state}} =
+             Lookup.plan(submit_event(), request: {:ok, %{@request | level: 4}})
+  end
+
   test "final receipt creates level 2 callback using Python-compatible connector fields" do
     event = receipt_event()
     reverse = {:ok, %{gateway_id: "G1", connector_id: "c1"}}

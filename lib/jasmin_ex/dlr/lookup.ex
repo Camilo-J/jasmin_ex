@@ -45,6 +45,9 @@ defmodule JasminEx.Dlr.Lookup do
 
       {3, false} ->
         {:ok, base_plan(event, job(event, request, 1), nil, {:request, request.gateway_id})}
+
+      _unsupported_level ->
+        {:terminal, {:malformed_map, :invalid_state}}
     end
   end
 
