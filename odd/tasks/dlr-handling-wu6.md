@@ -198,8 +198,15 @@ Historical task numbers 6.1–6.12 remain stable for traceability. Each task clo
   - Rollback boundary: remove the Mint adapter and its focused tests, remove the direct Mint dependency and resulting lock changes, and revert only any necessary `HttpClient` type adjustment. The existing `:httpc` path remains intact and no broker/runtime consumer is cut over by this slice.
   - Route and trigger: `delegated`; active because `mix.exs`, the new adapter, and the focused test are 2+ non-trivial files, with the preparation read recorded in the migration table.
   - Delivery: `ask-on-risk` resolved to `stacked-to-main`; Slice 1 targets `main`, carries only task 6.14, and is expected to remain near the 400-line heuristic without reducing safety evidence.
-- [ ] **6.15 — Cut over WU6 integration and remove `:httpc`.** Move the broker-backed retry harness and complete WU6 transport gate to the Mint adapter, remove the OTP adapter and dedicated profile configuration, remove `:inets` if no longer required elsewhere, and retain `:ssl`. Preserve the fake endpoint's deterministic status, TLS, redirect, timeout, oversized-response, and request-count evidence.
-  - Progress: `pending`; blocked on task 6.14 landing or being available as the immediate stacked dependency.
+- [x] **6.15 — Cut over WU6 integration and remove `:httpc`.** Move the broker-backed retry harness and complete WU6 transport gate to the Mint adapter, remove the OTP adapter and dedicated profile configuration, remove `:inets` if no longer required elsewhere, and retain `:ssl`. Preserve the fake endpoint's deterministic status, TLS, redirect, timeout, oversized-response, and request-count evidence.
+  - Progress: `complete`; closed by `this commit` on top of E1 commit `b45a733`. The broker-backed harness now exercises Mint, the legacy adapter and test are deleted, and `:inets` is removed while `:ssl` remains.
+  - RED evidence: `mix test --only integration test/jasmin_ex/dlr/mint_test.exs` → exit 2, 0/1 passed and 11 excluded. The new Mint broker harness completed HTTP 500 then HTTP 200/`ACK/Jasmin`, delivery counts 0 then 1, and two network attempts, then failed the migration-boundary assertion because the legacy adapter file still existed.
+  - GREEN evidence: after deleting the legacy adapter/test and removing `:inets`, the same command → exit 0, 1 passed and 11 excluded. RabbitMQ 4.3.4 delivered counts 0 then 1; exactly two endpoint requests occurred before terminal ACK.
+  - REFACTOR evidence: removed the temporary source-layout assertion, formatted the final test/runtime changes, and reran `mix test --only integration test/jasmin_ex/dlr/mint_test.exs` → exit 0, 1 passed and 11 excluded.
+  - Check evidence: five-suite command exit 0, 39 passed and 1 excluded; full `mix test` exit 0, 677 passed including 1 doctest and 26 excluded; formatter exit 0; Credo exit 0 with no issues across 175 source files; Dialyzer exit 0 with 0 errors, 0 skipped, and 0 unnecessary skips; residue grep exit 1 with no output as expected.
+  - Runtime harness: RabbitMQ 4.3.4; scripted HTTP 500 then HTTP 200/`ACK/Jasmin`; delivery counts 0 then 1; exactly two actual HTTP requests; terminal ACK; exit 0, 1 passed and 11 excluded.
+  - Authored changed lines: 660 additions plus deletions, including adapter/test deletion, Mint harness cutover, runtime cleanup, and this tracker evidence.
+  - Risks: current native review lineage remains blocked; no native review lifecycle command was run. The cutover intentionally changes no callback classification, broker retry ownership, destination policy, or production assembly beyond removing unused `:inets`.
   - Objective: complete the replacement without changing callback semantics, retry ownership, destination approval, or the established runtime evidence boundary.
   - Acceptance criteria: no runtime or test reference to `JasminEx.Dlr.HttpClient.Httpc`, `:httpc`, or adapter profiles remains; Mint is the exercised client in the broker-backed retry harness; HTTP 500 then HTTP 200/`ACK/Jasmin` still produces delivery counts 0 then 1, exactly two network attempts, and terminal ACK; all five WU6 focused suites, full tests, formatter, Credo, and Dialyzer pass; the final authored slice count is recorded; current native lineage is still reported blocked pending a fresh or explicitly rebound complete-WU6 candidate.
   - Authorized file scope: `lib/jasmin_ex/dlr/http_client/httpc.ex` (deletion), `test/jasmin_ex/dlr/httpc_test.exs` (deletion after equivalent Mint coverage exists), `test/jasmin_ex/dlr/mint_test.exs`, `test/support/fake_dlr_endpoint.ex` only if Mint exposes a missing deterministic transport case, `mix.exs` for runtime application cleanup, and this tracker for exact evidence. No lookup, job, thrower, worker, messaging, or destination-policy behavior changes are authorized.
@@ -208,14 +215,14 @@ Historical task numbers 6.1–6.12 remain stable for traceability. Each task clo
   - Route and trigger: `delegated`; active because adapter deletion, integration-test cutover, and runtime cleanup span 2+ non-trivial files, with the preparation read recorded in the migration table.
   - Delivery: `ask-on-risk` resolved to `stacked-to-main`; Slice 2 follows Slice 1, targets `main` after Slice 1 lands or is rebased onto that merged boundary, and carries only task 6.15.
 
-**Feature task count: 15; pending Mint migration tasks: 1 (`6.15`).**
+**Feature task count: 15; pending Mint migration tasks: 0.**
 
 ## Verification gates
 
 Run and record exact command, exit status, and concise observed result. Passing results without the required prior RED evidence do not close a behavior.
 
 ```bash
-mix test test/jasmin_ex/dlr/lookup_test.exs test/jasmin_ex/dlr/lookup_plan_test.exs test/jasmin_ex/dlr/http_thrower_test.exs test/jasmin_ex/dlr/destination_policy_test.exs test/jasmin_ex/dlr/httpc_test.exs
+mix test test/jasmin_ex/dlr/lookup_test.exs test/jasmin_ex/dlr/lookup_plan_test.exs test/jasmin_ex/dlr/http_thrower_test.exs test/jasmin_ex/dlr/destination_policy_test.exs test/jasmin_ex/dlr/mint_test.exs
 mix test
 mix format --check-formatted
 mix credo --strict
@@ -224,7 +231,7 @@ mix dialyzer
 
 The runtime gate must also run the broker-backed HTTP thrower retry harness with `test/support/fake_dlr_endpoint.ex`. Record the exact command selected by the implementation, RabbitMQ version, endpoint script, broker redelivery/attempt counters, actual HTTP request count, terminal disposition, and exit status. A fake-only retry assertion is insufficient.
 
-The command above remains the completed pre-migration `:httpc` gate. Tasks 6.14 and 6.15 define the exact Mint migration checks; after task 6.15, `test/jasmin_ex/dlr/mint_test.exs` replaces `test/jasmin_ex/dlr/httpc_test.exs` in the authoritative five-suite and broker-backed gates.
+The command above is the authoritative post-migration Mint gate. Task 6.15 also requires the tagged broker-backed command and the no-residue grep recorded in its evidence.
 
 ## Work-unit commits
 
@@ -236,8 +243,8 @@ This planning invocation authorizes only the tracker commit; no source or test c
 | B | Durable lookup plan and processor | `lookup_plan.ex`, its tests, and bounded worker integration | `1a9a137`; 596 authored changed lines |
 | C | HTTP job and thrower semantics | `http_job.ex`, `http_thrower.ex`, and focused tests | `5702f39`; 358 authored changed lines |
 | D | Destination policy and one-attempt adapter | destination/client modules, endpoint support, security/adapter tests, and only required runtime applications | `102c6be`; 949 authored changed lines |
-| E1 | Direct Mint HTTP/1 transport proof | direct dependency, Mint adapter, and focused tests; existing `:httpc` path remains intact | Task 6.14 closed by `this commit`; 573 authored changed lines excluding generated `mix.lock`; resulting hash reported out-of-band |
-| E2 | Runtime/integration cutover and OTP adapter removal | broker-backed Mint gate, `:httpc` adapter/test deletion, and `:inets` cleanup | Pending task 6.15; stacked-to-main Slice 2; estimated 150–200 authored changed lines |
+| E1 | Direct Mint HTTP/1 transport proof | direct dependency, Mint adapter, and focused tests; existing `:httpc` path remains intact | `b45a733`; 573 authored changed lines excluding generated `mix.lock` |
+| E2 | Runtime/integration cutover and OTP adapter removal | broker-backed Mint gate, legacy adapter/test deletion, and `:inets` cleanup | Task 6.15 closed by `this commit`; 660 authored changed lines; resulting hash reported out-of-band |
 
 If these units cannot stand independently because the safety contract requires a cohesive WU6 candidate, preserve the cohesive boundary and record the honest authored line count. Do not invent artificial splits or rewrite for line-count optics.
 
@@ -266,21 +273,22 @@ If these units cannot stand independently because the safety contract requires a
 | Item | Status | Evidence |
 |---|---|---|
 | Tasks 6.1–6.12 | 12/12 implemented | Units A–D behavior verified; task 6.12 retains the explicit broker-only RED evidence gap recorded above |
-| Focused five-test gate | Passed | Exact command from the verification gate → exit 0, 30 passed and 1 integration test excluded |
-| Full test suite | Passed | `mix test` → exit 0, 668 passed including 1 doctest, 26 excluded |
+| Focused five-test gate | Passed | Exact post-migration command from the verification gate → exit 0, 39 passed and 1 integration test excluded |
+| Full test suite | Passed | `mix test` → exit 0, 677 passed including 1 doctest, 26 excluded |
 | Formatter | Passed | `mix format --check-formatted` → exit 0 |
 | Credo | Passed | `mix credo --strict` → exit 0, no issues |
 | Dialyzer | Passed | `mix dialyzer` → exit 0, 0 errors and 0 skipped warnings |
-| Broker-backed thrower retry harness | Passed | RabbitMQ 4.3.4; HTTP 500 then 200/`ACK/Jasmin`; delivery counts 0 then 1; two actual HTTP requests; exit 0, 1 passed |
+| Broker-backed thrower retry harness | Passed with Mint | RabbitMQ 4.3.4; HTTP 500 then 200/`ACK/Jasmin`; delivery counts 0 then 1; two actual HTTP requests; terminal ACK; exit 0, 1 passed and 11 excluded |
 | Review correction | Implemented and locally verified | Preserved streamed HTTP status and terminalized expired plan/event replay; 91/200 authored correction lines; focused gate 13 passed/1 excluded, five-suite gate 33 passed/1 excluded, full suite 671 passed/26 excluded, Credo and Dialyzer passed |
 | Native review `R3-ipv6-reserved-bypass` | Terminal `escalated` for lineage `review-45e3beccb7ea46f5`; superseded locally by task 6.13 | The narrow correction rejected site-local and documentation space but retained a permissive IPv6 fallback; the fresh follow-up now uses positive global-unicast eligibility plus special-purpose exclusions. |
-| Mint transport task 6.14 | Complete; closed by `this commit` | Direct Mint 1.10.0 HTTP/1 proof preserves exact final status after 1xx, pins the approved tuple while retaining Host/SNI/certificate identity, bounds streamed headers/body and one total deadline, returns typed failures, avoids redirects/retries/second DNS, and closes every established connection. Focused: 11 passed; grouped: 24 passed; formatter, Credo, and Dialyzer passed. |
-| Mint runtime cutover task 6.15 | Pending | Existing `:httpc` adapter, tests, fake endpoint, and broker harness remain intact; task 6.15 owns runtime cutover and removal. |
+| Mint transport task 6.14 | Complete; `b45a733` | Direct Mint 1.10.0 HTTP/1 proof preserves exact final status after 1xx, pins the approved tuple while retaining Host/SNI/certificate identity, bounds streamed headers/body and one total deadline, returns typed failures, avoids redirects/retries/second DNS, and closes every established connection. Focused: 11 passed; grouped: 24 passed; formatter, Credo, and Dialyzer passed. |
+| Mint runtime cutover task 6.15 | Complete; closed by `this commit` | Mint now owns the broker-backed retry gate; the legacy adapter/test and unused `:inets` runtime application are removed. All required checks passed and the residue grep returned no output. |
 | Task 6.14 authored changed lines | 573 | Additions plus deletions for authored source, tests, dependency declaration, and tracker evidence; excludes the generated one-line `mix.lock` update. |
+| Task 6.15 authored changed lines | 660 | Additions plus deletions for legacy adapter/test removal, Mint broker harness cutover, runtime cleanup, and tracker evidence. |
 | Authored changed lines | 2,416 through Unit D before tracker updates | Unit A: 513; Unit B: 596; Unit C: 358; Unit D implementation: 949 additions plus deletions |
 | Review decision | Current native lineage blocked; fresh/rebound review required after migration | `review-579dcd39287035c5` was quarantined after its provider continuation was lost, and `review-45e3beccb7ea46f5` is terminal escalated; after tasks 6.14–6.15, review the complete corrected WU6 candidate from the original base boundary. |
-| Work-unit commits | Units A–D committed | `6220ba0` (A), `1a9a137` (B), `5702f39` (C), `102c6be` (D) |
+| Work-unit commits | Units A–E2 committed in separate slices | `6220ba0` (A), `1a9a137` (B), `5702f39` (C), `102c6be` (D), `b45a733` (E1), and E2 `this commit` with its resulting hash reported out-of-band |
 
 ## Next step
 
-Implement task 6.15 as stacked-to-main Slice 2 only after task 6.14 lands or is rebased onto its merged boundary. Cut the broker/runtime path over to Mint, preserve the deterministic broker-backed evidence, and then remove `:httpc` in that separately reviewable slice. Retain the documented task 6.12 broker-only RED evidence gap. After task 6.15, create a fresh or explicitly rebound native review candidate over the complete corrected WU6 candidate from `main@49f49f1`; the current lineage remains blocked. No remote delivery action is authorized without asking.
+Tasks 6.14 and 6.15 are complete as separate local commits. Retain the documented task 6.12 broker-only RED evidence gap. A future authorized step may create a fresh or explicitly rebound native review candidate over the complete corrected WU6 candidate from `main@49f49f1`; the current lineage remains blocked, and no native review or remote delivery action was run here.
