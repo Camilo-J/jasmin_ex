@@ -182,7 +182,7 @@ WU7 is acceptable only when all of the following are demonstrated:
 
 ## Stable top-level ODD tasks
 
-- [ ] **WU7-A — Add the optional DLR supervision and application contract (estimated 180–280 authored lines).**
+- [x] **WU7-A — Add the optional DLR supervision and application contract (estimated 180–280 authored lines).**
 - [ ] **WU7-B — Prove production E2E/restart recovery and document operations (estimated 530–840 authored lines).**
 
 The two identifiers above are stable. Do not split them into additional top-level
@@ -274,13 +274,19 @@ preparation is complete.
 
 | Evidence | Status | Exact observation |
 |---|---|---|
-| Progress | Ready | Delivery choice recorded; WU7-A implementation authorized |
-| RED | Pending | Command, exit status, failing tests, and missing behavior |
-| GREEN | Pending | Command, exit status, passing tests, and implemented contract |
-| REFACTOR | Pending | Format/refactor command and unchanged focused result |
-| Compatibility | Pending | Existing application suites and result |
-| Authored lines | 0 | Update with additions plus deletions |
-| Work-unit commit | Pending | Conventional commit hash and subject |
+| Progress | Complete | Optional DLR root supervision/config assembly implemented; WU6 workers and runtime adapters remain dormant for WU7-B. |
+| RED | Observed | `mix test test/jasmin_ex/dlr/application_test.exs test/jasmin_ex/http_api/application_test.exs` exited 2 with 3/8 passing and 5 failures: no DLR child, no enabled dependency validation, and no HTTP DLR injection. A compatibility strengthening RED exited 2 with 7/8 passing because disabled DLR added nil HTTP options. |
+| GREEN | Passed | The same focused command exited 0 with 8/8 passing after optional child assembly, dependency validation, ordering, and conditional HTTP injection were implemented. |
+| REFACTOR | Passed | `mix format` followed by the same focused command exited 0 with 8/8 passing; after the Credo alias-order correction, the focused command again exited 0 with 8/8 passing. |
+| Compatibility | Passed | `mix test` exited 0 with 684 passing (1 doctest, 683 tests) and 26 excluded. |
+| Formatter | Passed | `mix format --check-formatted` exited 0 with no output. |
+| Credo | Passed after correction | The first `mix credo --strict` found one alias-order readability issue and exited 4; after reordering aliases, the required command exited 0 across 177 files with no issues. |
+| Dialyzer | Passed | `mix dialyzer` exited 0 with 0 errors, 0 skipped, and 0 unnecessary skips. |
+| Runtime harness | N/A | WU7-A proves child-spec/config assembly only. Real topology readiness, workers, adapters, connection retry, and restart behavior belong to WU7-B. |
+| Route/trigger evidence | Complete | `delegated direct`; mapping and writer triggers remained active across four implementation/test files plus this tracker. |
+| Rollback boundary | Reviewed | Remove `lib/jasmin_ex/dlr/supervisor.ex`, `test/jasmin_ex/dlr/application_test.exs`, the WU7-A assertions in `test/jasmin_ex/http_api/application_test.exs`, and only the DLR branches in `lib/jasmin_ex/application.ex`; preserve WU1–WU6 and all non-DLR children. |
+| Authored lines | 306 | 268 additions plus 38 deletions in this implementation commit, including tracker evidence; no generated artifacts. The estimate was exceeded without code-golf and remains below the 400-line review heuristic. |
+| Work-unit commit | Complete | `this commit` — `feat(dlr): add optional application supervision` |
 
 ## WU7-B — Production E2E/restart recovery and operator documentation
 
@@ -484,15 +490,15 @@ preparation is complete.
 
 | Gate | WU7-A | WU7-B | Final feature |
 |---|---|---|---|
-| Focused RED | Pending | Pending | N/A; evidence belongs to each task |
-| Focused GREEN | Pending | Pending | Pending |
-| Focused REFACTOR | Pending | Pending | Pending |
+| Focused RED | Observed: exit 2, 3/8 passed and 5 failed; compatibility strengthening RED exit 2, 7/8 passed | Pending | N/A; evidence belongs to each task |
+| Focused GREEN | Passed: exit 0, 8/8 | Pending | Pending |
+| Focused REFACTOR | Passed: exit 0, 8/8 | Pending | Pending |
 | Runtime harness | N/A; application contract only | Pending | Pending |
-| Full `mix test` | Pending compatibility result | Pending | Pending |
-| Formatter | Pending | Pending | Pending |
-| Credo | Pending if run for slice | Pending | Pending |
-| Dialyzer | Pending if run for slice | Pending | Pending |
-| Rollback reviewed | Pending | Pending | Pending |
+| Full `mix test` | Passed: 684 tests, 26 excluded | Pending | Pending |
+| Formatter | Passed | Pending | Pending |
+| Credo | Passed after correcting one WU7-A alias-order issue | Pending | Pending |
+| Dialyzer | Passed: 0 errors | Pending | Pending |
+| Rollback reviewed | Complete | Pending | Pending |
 
 ## Work-unit commit placeholders
 
@@ -501,7 +507,7 @@ tests and docs with the behavior they verify.
 
 | Work unit | Intended outcome | Commit placeholder | Review slice |
 |---|---|---|---|
-| WU7-A | Optional DLR supervisor and application contract | Pending: `feat(dlr): add optional application supervision` | Slice 1 targeting `main` |
+| WU7-A | Optional DLR supervisor and application contract | `this commit`: `feat(dlr): add optional application supervision` | Slice 1 targeting `main` |
 | WU7-B | Production recovery proof and operator documentation | Pending: `feat(dlr): prove production recovery and operations` | Slice 2, blocked until WU7-A delivery |
 
 Commit hashes, exact subjects, focused checks, runtime evidence or N/A rationale,
@@ -511,20 +517,20 @@ and rollback boundaries must be recorded before a task is marked complete.
 
 | Boundary | Forecast | Current authored additions + deletions | Notes |
 |---|---:|---:|---|
-| WU7-A | 180–280 | 0 | Tracker preparation is not implementation scope. |
+| WU7-A | 180–280 | 306 | 268 additions plus 38 deletions, including tracker evidence; coherent scope retained without code-golf. |
 | WU7-B | 530–840 | 0 | Includes E2E/restart proof and `docs/dlr-handling.md`. |
-| Total WU7 | **710–1,120** | **0** | Update after each work-unit commit; do not optimize for the heuristic. |
+| Total WU7 | **710–1,120** | **306** | WU7-B remains blocked; do not optimize for the heuristic. |
 
 ## Review assessment placeholders
 
 | Assessment | Current value |
 |---|---|
-| Review-load risk | High by forecast; exact assessment pending implementation |
-| Review due | Pending authored-line count for WU7-A Slice 1 |
+| Review-load risk | WU7-A is 306 authored lines and below the 400-line heuristic; broader WU7 remains high by forecast |
+| Review due | WU7-A Slice 1 is ready for delivery assessment; native review was not run |
 | Proposed review order | WU7-A child/config contract → readiness/retry ownership → production injection → E2E/restart proof → operator docs |
-| Smallest honest boundary | WU7-A and WU7-B are the current candidates; validate after implementation |
+| Smallest honest boundary | WU7-A is a coherent child/config assembly slice; WU7-B remains a separate runtime/recovery/docs slice |
 | Native review lineage | None started; native review is explicitly out of scope for setup |
-| Findings/corrections | Pending |
+| Findings/corrections | Placeholder for reviewer assessment; implementation checks required only an alias-order correction |
 | Final reviewer disposition | Pending |
 | Delivery exception | None; maintainer selected two stacked PR slices with `stacked-to-main` |
 
@@ -534,16 +540,16 @@ and rollback boundaries must be recorded before a task is marked complete.
 |---|---|---|
 | Branch synchronization | Complete | `feat/dlr-handling-wu7` created from `main@b980d4ebd7e5f004f2e3cebc657f87e9d9812d78` after fast-forward-only update from `origin/main` |
 | Delegated mapping/preparation | Complete | Route and mapped facts recorded above |
-| Stable top-level tasks | 2 pending | WU7-A authorized; WU7-B blocked until WU7-A delivery |
+| Stable top-level tasks | 1 complete, 1 blocked | WU7-A complete; WU7-B blocked until WU7-A delivery |
 | Delivery choice | Complete | Two stacked PR slices with `stacked-to-main`; WU7-A targets `main` |
-| Source changes | Not started | Explicitly excluded from setup |
-| Tests | Not run | No behavior implementation authorized |
+| Source changes | WU7-A complete | Optional DLR supervisor and application dependency assembly only |
+| Tests | Passed | Focused 8/8; full suite 684 passing with 26 excluded |
 | Documentation | Not started | `docs/dlr-handling.md` belongs to WU7-B |
-| Commits | None | Tracker intentionally remains uncommitted pending delivery choice |
+| Commits | 2 planned/completed | Planning `256617f`; WU7-A implementation recorded as `this commit` pending commit creation |
 | Remote delivery | None | No push or PR authorized |
 | Native review | None | Explicitly excluded |
 
 ## Next step
 
-Implement and deliver WU7-A as Slice 1 targeting `main`. Keep WU7-B blocked until
-WU7-A merges, then rebase the WU7-B branch onto the updated `main` boundary.
+Deliver WU7-A as Slice 1 targeting `main`. Keep WU7-B blocked until WU7-A merges,
+then rebase the WU7-B branch onto the updated `main` boundary before implementation.

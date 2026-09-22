@@ -5,25 +5,35 @@ defmodule JasminEx.Application do
 
   use Application
 
+  alias JasminEx.Dlr.Config, as: DlrConfig
+  alias JasminEx.Dlr.Supervisor, as: DlrSupervisor
   alias JasminEx.HttpApi
   alias JasminEx.Messaging.RabbitMQ.Config, as: MessagingConfig
+  alias JasminEx.Messaging.RabbitMQ.Connection, as: MessagingConnection
   alias JasminEx.Messaging.RabbitMQ.Supervisor, as: MessagingSupervisor
+  alias JasminEx.Messaging.RabbitMQ.TopicPublisher
   alias JasminEx.Routing.Config, as: RoutingConfig
   alias JasminEx.Routing.Router
   alias JasminEx.Smpp.ConnectorSupervisor
   alias JasminEx.Smpp.Server
-  alias JasminEx.StateStore.Config
+  alias JasminEx.StateStore.Config, as: StateStoreConfig
+  alias JasminEx.StateStore.Redix, as: StateStore
 
   @state_store_connection JasminEx.StateStore.Connection
 
   @spec children(keyword()) :: list()
   def children(config) do
-    [state_store_child(Keyword.get(config, :state_store, []))] ++
+    state_store_config = StateStoreConfig.new!(Keyword.get(config, :state_store, []))
+    messaging_options = Keyword.get(config, :messaging, [])
+    dlr_options = dlr_options(config, state_store_config, messaging_options)
+
+    [state_store_child(state_store_config)] ++
       [routing_child(Keyword.get(config, :routing, []))] ++
-      messaging_children(Keyword.get(config, :messaging, [])) ++
+      messaging_children(messaging_options) ++
+      dlr_children(dlr_options) ++
       smpp_children(config) ++
       smpp_server_children(config) ++
-      http_api_children(config)
+      http_api_children(config, dlr_options)
   end
 
   @impl true
@@ -33,6 +43,7 @@ defmodule JasminEx.Application do
         state_store: Application.get_env(:jasmin_ex, :state_store, []),
         routing: Application.get_env(:jasmin_ex, :routing, []),
         messaging: Application.get_env(:jasmin_ex, :messaging, []),
+        dlr: Application.get_env(:jasmin_ex, :dlr, []),
         smpp_connectors: Application.get_env(:jasmin_ex, :smpp_connectors, []),
         smpp_server: Application.get_env(:jasmin_ex, :smpp_server, []),
         http_api: Application.get_env(:jasmin_ex, :http_api, [])
@@ -44,9 +55,7 @@ defmodule JasminEx.Application do
     Supervisor.start_link(children, opts)
   end
 
-  defp state_store_child(options) do
-    config = Config.new!(options)
-
+  defp state_store_child(config) do
     %{
       id: @state_store_connection,
       start: {Redix, :start_link, [redix_options(config)]}
@@ -84,6 +93,47 @@ defmodule JasminEx.Application do
     end
   end
 
+  defp dlr_options(config, state_store_config, messaging_options) do
+    options = Keyword.get(config, :dlr, [])
+
+    case Keyword.get(options, :enabled, false) do
+      false ->
+        []
+
+      true ->
+        require_messaging!(messaging_options)
+        dlr_config = dlr_config!(options)
+
+        [
+          config: dlr_config,
+          store:
+            Keyword.get(options, :store, {StateStore, StateStore.context(state_store_config)}),
+          connection_server: Keyword.get(options, :connection_server, MessagingConnection),
+          publisher: Keyword.get(options, :publisher, {TopicPublisher, TopicPublisher})
+        ]
+        |> DlrSupervisor.validate_options!()
+
+      _invalid ->
+        raise ArgumentError, "invalid DLR configuration"
+    end
+  end
+
+  defp dlr_config!(options) do
+    case DlrConfig.new(options) do
+      %DlrConfig{} = config -> config
+      {:error, :invalid_dlr_config} -> raise ArgumentError, "invalid DLR configuration"
+    end
+  end
+
+  defp require_messaging!(options) do
+    unless Keyword.get(options, :enabled, false) == true do
+      raise ArgumentError, "enabled DLR requires enabled RabbitMQ messaging"
+    end
+  end
+
+  defp dlr_children([]), do: []
+  defp dlr_children(options), do: [{DlrSupervisor, options}]
+
   defp smpp_children(config) do
     case Keyword.get(config, :smpp_connectors, []) do
       [] -> []
@@ -102,7 +152,7 @@ defmodule JasminEx.Application do
     end
   end
 
-  defp http_api_children(config) do
+  defp http_api_children(config, dlr_options) do
     options = Keyword.get(config, :http_api, [])
     http = HttpApi.Config.new(options)
 
@@ -113,10 +163,19 @@ defmodule JasminEx.Application do
            config: http,
            router: Keyword.get(options, :router, Router),
            queue: Keyword.get(options, :queue)
-         ]}
+         ] ++ http_dlr_dependencies(dlr_options)}
       ]
     else
       []
     end
+  end
+
+  defp http_dlr_dependencies([]), do: []
+
+  defp http_dlr_dependencies(dlr_options) do
+    [
+      dlr_store: Keyword.fetch!(dlr_options, :store),
+      dlr_config: Keyword.fetch!(dlr_options, :config)
+    ]
   end
 end
