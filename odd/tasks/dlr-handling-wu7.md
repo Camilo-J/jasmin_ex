@@ -97,7 +97,7 @@ tests.
 | Forecast | **710–1,120 authored additions plus deletions** |
 | Review heuristic | About 400 authored changed lines per review slice, advisory |
 | Maintainer choice | **WU7-A and WU7-B are separate stacked PR slices** |
-| Current delivery state | WU7-A merged via PR #82; WU7-B implemented and verified locally. Its candidate at `938edad` was approved/acknowledged; the accepted reliability follow-up is locally verified, awaiting the parent session's reassessment before any PR. |
+| Current delivery state | WU7-A merged via PR #82; WU7-B implemented and verified locally. Its candidate at `938edad` was approved/acknowledged; the accepted reliability follow-up is committed locally, with native assessment `medium/under_budget` against that reviewed boundary. No push or PR. |
 | Counting rule | Count authored additions plus deletions; exclude generated artifacts only when identified explicitly, while retaining them in complete snapshot evidence. |
 | Guardrail | Do not code-golf, remove tests/docs/comments, or weaken evidence to approach the heuristic. |
 
@@ -628,12 +628,12 @@ and rollback boundaries must be recorded before a task is marked complete.
 | Assessment | Current value |
 |---|---|
 | Review-load risk | WU7-A is 306 authored lines and below the 400-line heuristic; broader WU7 remains high by forecast |
-| Review due | WU7-A Slice 1 merged after native Claude review; WU7-B candidate `938edad` approved/acknowledged under `review-e1989d51d986e786`. Parent assessed correction commit `60269b6` as medium risk, `under_budget` against that prior reviewed boundary; the returned-error correction creates another candidate requiring parent reassessment. |
+| Review due | WU7-A Slice 1 merged after native Claude review; WU7-B candidate `938edad` approved/acknowledged under `review-e1989d51d986e786`. Parent assessed both correction commits `60269b6..4a164af` against the prior reviewed boundary as medium risk, `review_due=false`, `under_budget` (6 paths, 285 changed lines). No review of those corrections has started. |
 | Proposed review order | WU7-A child/config contract → readiness/retry ownership → production injection → E2E/restart proof → operator docs |
 | Smallest honest boundary | WU7-A child/config assembly is merged; WU7-B runtime/recovery/docs is one coherent but over-heuristic unit, accepted without splitting tests/docs away from behavior |
 | Native review lineage | WU7-A approved/acknowledged; WU7-B `review-e1989d51d986e786` approved/acknowledged at candidate `938edad`. Do not reuse old authority for the correction. |
 | Findings/corrections | Three nonblocking warnings accepted for local correction: readiness channel leak on exit, overbroad topology exit classification, and publisher nil-channel shutdown. Known-response publisher test suggestion deferred. |
-| Final reviewer disposition | WU7-B reviewed candidate approved/acknowledged; correction pending fresh parent reassessment. |
+| Final reviewer disposition | WU7-B candidate at `938edad` approved/acknowledged; later reliability corrections are unreviewed and below the native review threshold. |
 | Delivery exception | No delivery exception granted or requested; WU7-B exceeds the advisory 400-line review heuristic (1449 authored lines) and remains local. Any future PR sizing decision needs separate authorization. |
 
 ## Tracker progress
@@ -645,17 +645,17 @@ and rollback boundaries must be recorded before a task is marked complete.
 | Stable top-level tasks | 2 implemented locally, 1 merged | WU7-A merged as PR #82; WU7-B committed locally and not delivered remotely |
 | Delivery choice | Complete | Two stacked PR slices with `stacked-to-main`; WU7-A targets `main` |
 | Source changes | WU7-B implemented and committed locally | Readiness/topology retry, channel cleanup, connector/HTTP injection and broker-owned settlement in `aabe813`; tracker evidence in `914e5d3` |
-| Tests | WU7-B final gates passed | E2E 2 passed with broker/Valkey outages and terminal budgets, actual broker topology 4 passed, regular suite 692 passed / 29 excluded; formatter/Credo/Dialyzer/`git diff --check` exit 0 |
+| Tests | WU7-B and reliability follow-up gates passed | E2E 2 passed with broker/Valkey outages and terminal budgets, actual broker topology 4 passed, final regular suite 696 passed / 29 excluded; formatter/Credo/Dialyzer/`git diff --check` exit 0 |
 | Documentation | Complete and committed locally | `docs/dlr-handling.md` verified against implementation and integration observations in `aabe813` |
-| Commits | WU7-A merged; WU7-B local work-unit committed | WU7-A included in `origin/main@da4c3a6`; WU7-B `aabe81330f55b029c2a720a265d6b0f5dd527f5c`, plus local tracker-evidence closure commit |
+| Commits | WU7-A merged; WU7-B and reliability corrections committed locally | WU7-A in `origin/main@da4c3a6`; WU7-B `aabe813`, tracker evidence `914e5d3`, reconciliation `938edad`, reliability fixes `60269b6` and `4a164af` |
 | Remote delivery | WU7-A PR #82 merged | Four checks succeeded; no WU7-B push or PR authorized |
 | Native review | WU7-A and WU7-B candidate approved/acknowledged | WU7-B review lineage `review-e1989d51d986e786` reported three nonblocking warnings; accepted local correction verified, no new review in this task |
 
 ## Next step
 
 Local WU7-B is implemented and verified at the reviewed boundary. The accepted
-reliability follow-up is locally verified; the publisher nil-channel path was
-already safe and is now regression-tested. Commit the correction locally before
-parent reassessment.
+reliability follow-up is committed and locally verified; the publisher nil-channel
+path was already safe and is now regression-tested. Native assessment of the
+unreviewed correction range is `medium/under_budget`; it did not open a new review.
 Preserve existing `.v1` queues. Push, PR creation, native review, and any
 delivery-strategy exception require separate authorization; none is included here.
