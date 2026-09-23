@@ -84,7 +84,10 @@ defmodule JasminEx.Messaging.RabbitMQ.TopicTopology do
   def classify_declaration_failure(reason) do
     case reason do
       {{:shutdown, {:server_initiated_close, 406, _detail}} = close, {:gen_server, :call, _args}} ->
-        classify_declaration_failure(close)
+        case classify_declaration_failure(close) do
+          {:broker, _} -> {:broker, reason}
+          classification -> classification
+        end
 
       {:shutdown, {:server_initiated_close, 406, detail}} when is_binary(detail) ->
         cond do
