@@ -97,7 +97,7 @@ tests.
 | Forecast | **710–1,120 authored additions plus deletions** |
 | Review heuristic | About 400 authored changed lines per review slice, advisory |
 | Maintainer choice | **WU7-A and WU7-B are separate stacked PR slices** |
-| Current delivery state | WU7-A merged via PR #82; WU7-B locally authorized and in progress |
+| Current delivery state | WU7-A merged via PR #82; WU7-B implemented and verified locally, awaiting review and separate delivery authorization |
 | Counting rule | Count authored additions plus deletions; exclude generated artifacts only when identified explicitly, while retaining them in complete snapshot evidence. |
 | Guardrail | Do not code-golf, remove tests/docs/comments, or weaken evidence to approach the heuristic. |
 
@@ -182,7 +182,7 @@ WU7 is acceptable only when all of the following are demonstrated:
 ## Stable top-level ODD tasks
 
 - [x] **WU7-A — Add the optional DLR supervision and application contract (estimated 180–280 authored lines).**
-- [ ] **WU7-B — Prove production E2E/restart recovery and document operations (estimated 530–840 authored lines).**
+- [x] **WU7-B — Prove production E2E/restart recovery and document operations (estimated 530–840 authored lines).**
 
 The two identifiers above are stable. Do not split them into additional top-level
 ODD tasks merely to improve line-count optics.
@@ -269,7 +269,7 @@ behavior, and non-DLR application child.
 `delegated direct`; mapping and writer triggers are active, and delegated
 preparation is complete.
 
-### WU7-B progress and evidence
+### WU7-A progress and evidence
 
 | Evidence | Status | Exact observation |
 |---|---|---|
@@ -550,7 +550,7 @@ and rollback boundaries must be recorded before a task is marked complete.
 | Assessment | Current value |
 |---|---|
 | Review-load risk | WU7-A is 306 authored lines and below the 400-line heuristic; broader WU7 remains high by forecast |
-| Review due | WU7-A Slice 1 merged after native Claude review approved/acknowledged with a nonblocking partial-activation warning; WU7-B review is not authorized here |
+| Review due | WU7-A Slice 1 merged after native Claude review approved/acknowledged with a nonblocking partial-activation warning; read-only WU7-B assessment reports medium risk and `slice_budget_reached`, with review not yet started |
 | Proposed review order | WU7-A child/config contract → readiness/retry ownership → production injection → E2E/restart proof → operator docs |
 | Smallest honest boundary | WU7-A child/config assembly is merged; WU7-B runtime/recovery/docs is one coherent but over-heuristic unit, accepted without splitting tests/docs away from behavior |
 | Native review lineage | WU7-A native Claude review approved/acknowledged; WU7-B native review is out of scope here |
@@ -566,9 +566,9 @@ and rollback boundaries must be recorded before a task is marked complete.
 | Delegated mapping/preparation | Complete | Route and mapped facts recorded above |
 | Stable top-level tasks | 2 implemented locally, 1 merged | WU7-A merged as PR #82; WU7-B committed locally and not delivered remotely |
 | Delivery choice | Complete | Two stacked PR slices with `stacked-to-main`; WU7-A targets `main` |
-| Source changes | WU7-B implemented locally | Readiness/topology retry, channel cleanup, connector/HTTP injection and broker-owned settlement; final evidence/commit pending |
+| Source changes | WU7-B implemented and committed locally | Readiness/topology retry, channel cleanup, connector/HTTP injection and broker-owned settlement in `aabe813`; tracker evidence in `914e5d3` |
 | Tests | WU7-B final gates passed | E2E 2 passed with broker/Valkey outages and terminal budgets, actual broker topology 4 passed, regular suite 692 passed / 29 excluded; formatter/Credo/Dialyzer/`git diff --check` exit 0 |
-| Documentation | Complete in worktree | `docs/dlr-handling.md` verified against implementation and integration observations |
+| Documentation | Complete and committed locally | `docs/dlr-handling.md` verified against implementation and integration observations in `aabe813` |
 | Commits | WU7-A merged; WU7-B local work-unit committed | WU7-A included in `origin/main@da4c3a6`; WU7-B `aabe81330f55b029c2a720a265d6b0f5dd527f5c`, plus local tracker-evidence closure commit |
 | Remote delivery | WU7-A PR #82 merged | Four checks succeeded; no WU7-B push or PR authorized |
 | Native review | WU7-A approved/acknowledged | Nonblocking partial-activation warning; WU7-B native review excluded |
