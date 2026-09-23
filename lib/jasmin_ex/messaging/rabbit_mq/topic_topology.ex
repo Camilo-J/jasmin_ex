@@ -82,9 +82,17 @@ defmodule JasminEx.Messaging.RabbitMQ.TopicTopology do
   end
 
   def classify_declaration_failure(reason) do
-    if String.contains?(inspect(reason), "inequivalent arg"),
-      do: :incompatible_queue_arguments,
-      else: :delayed_retry_unsupported
+    case reason do
+      {:shutdown, {:server_initiated_close, 406, detail}} when is_binary(detail) ->
+        cond do
+          String.contains?(detail, "inequivalent arg") -> :incompatible_queue_arguments
+          String.contains?(detail, "x-delayed-retry") -> :delayed_retry_unsupported
+          true -> {:broker, reason}
+        end
+
+      _ ->
+        {:broker, reason}
+    end
   end
 
   defp queue_opts(args), do: [durable: true, arguments: args]

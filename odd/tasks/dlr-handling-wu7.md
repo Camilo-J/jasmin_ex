@@ -97,7 +97,7 @@ tests.
 | Forecast | **710–1,120 authored additions plus deletions** |
 | Review heuristic | About 400 authored changed lines per review slice, advisory |
 | Maintainer choice | **WU7-A and WU7-B are separate stacked PR slices** |
-| Current delivery state | WU7-A merged via PR #82; WU7-B implemented and verified locally, awaiting review and separate delivery authorization |
+| Current delivery state | WU7-A merged via PR #82; WU7-B implemented and verified locally. Its candidate at `938edad` was approved/acknowledged; the accepted reliability follow-up is locally verified, awaiting the parent session's reassessment before any PR. |
 | Counting rule | Count authored additions plus deletions; exclude generated artifacts only when identified explicitly, while retaining them in complete snapshot evidence. |
 | Guardrail | Do not code-golf, remove tests/docs/comments, or weaken evidence to approach the heuristic. |
 
@@ -439,6 +439,57 @@ RED showed for the same ownership pattern. Closing only this DLR-owned publisher
 channel is necessary to prevent orphan channels/consumer ambiguity; MT publisher
 and MT work-queue semantics are unchanged.
 
+### WU7-B accepted reliability follow-up (locally verified)
+
+The candidate at `938edad` was approved and acknowledged under native review
+lineage `review-e1989d51d986e786`. The maintainer accepted only these three
+nonblocking warnings as a local correction before PR; the separate known-response
+publisher test suggestion is deferred. This does not reopen WU7-A or invalidate
+the original WU7-B implementation evidence. Do not bind or change the old review.
+
+- [x] Close a readiness AMQP channel if topology declaration exits after opening it;
+      retries must not accumulate orphan channels.
+- [x] Classify transient declaration exits as broker/transient errors, while
+      preserving explicit inequivalent-argument and unsupported quorum delayed-retry
+      errors, with no classic fallback or queue deletion.
+- [x] Verify DLR topic publisher shutdown when its channel is nil. The existing
+      `close(%{channel: nil})` clause already avoids `ch.pid`; the regression test
+      passed before source changes, so no publisher source change was justified.
+- [x] Observe focused RED for changed behavior, then GREEN and REFACTOR; run the exact
+      application, topology, publisher, E2E, full suite, formatter, Credo, Dialyzer,
+      and `git diff --check` gates before committing the correction.
+
+The focused publisher test file is necessary to reproduce shutdown with no channel;
+it is within the previously recorded DLR publisher ownership extension. Rollback
+only this correction's DLR readiness, classification, publisher-close changes,
+focused tests, and tracker evidence; preserve all existing `.v1` queues and state.
+
+Follow-up TDD evidence: topology test RED `mix test
+test/jasmin_ex/messaging/rabbit_mq/topic_topology_test.exs`, exit 2, 7/8 passed,
+4 excluded: `:disconnected` was incorrectly classified as
+`:delayed_retry_unsupported`. Readiness test RED `mix test
+test/jasmin_ex/dlr/application_test.exs`, exit 2, 7/8 passed: the new isolated
+failure-path test could not use the injected client (production hardcoded
+`Client.open_channel/1`), before the channel-close behavior could be observed.
+After narrow client injection and closing on the post-open worker-startup exit,
+both declaration-exit and worker-startup-exit tests confirmed channel closure.
+Publisher baseline GREEN `mix test
+test/jasmin_ex/messaging/rabbit_mq/topic_publisher_test.exs`, exit 0, 7 passed,
+including shutdown with a nil channel after connection loss. No RED is claimed
+for that pre-existing safe behavior. `mix format` ran before final checks.
+
+| Follow-up gate | Observed result |
+|---|---|
+| `mix test test/jasmin_ex/dlr/application_test.exs` | Exit 0; 9 passed. |
+| `mix test test/jasmin_ex/messaging/rabbit_mq/topic_topology_test.exs` | Exit 0; 8 passed, 4 integration excluded. |
+| `mix test test/jasmin_ex/messaging/rabbit_mq/topic_publisher_test.exs` | Exit 0; 7 passed. |
+| `mix test --only integration test/jasmin_ex/dlr/e2e_test.exs` | Exit 0; 2 passed, broker/StateStore/FakeSMSC/endpoint recovery scenario. |
+| `mix test` | Exit 0; 695 passed (1 doctest, 694 tests), 29 excluded. |
+| `mix format --check-formatted` | Exit 0; no output. |
+| `mix credo --strict` | Exit 0; 178 files, 2515 mods/funs, no issues. |
+| `mix dialyzer` | Exit 0; 0 errors, 0 skipped, 0 unnecessary skips. |
+| `git diff --check` | Exit 0; no output. |
+
 ### Focused integration command
 
 ```bash
@@ -550,12 +601,12 @@ and rollback boundaries must be recorded before a task is marked complete.
 | Assessment | Current value |
 |---|---|
 | Review-load risk | WU7-A is 306 authored lines and below the 400-line heuristic; broader WU7 remains high by forecast |
-| Review due | WU7-A Slice 1 merged after native Claude review approved/acknowledged with a nonblocking partial-activation warning; read-only WU7-B assessment reports medium risk and `slice_budget_reached`, with review not yet started |
+| Review due | WU7-A Slice 1 merged after native Claude review; WU7-B candidate `938edad` approved/acknowledged under `review-e1989d51d986e786`. Accepted local reliability follow-up verified; later reassessment belongs to the parent. |
 | Proposed review order | WU7-A child/config contract → readiness/retry ownership → production injection → E2E/restart proof → operator docs |
 | Smallest honest boundary | WU7-A child/config assembly is merged; WU7-B runtime/recovery/docs is one coherent but over-heuristic unit, accepted without splitting tests/docs away from behavior |
-| Native review lineage | WU7-A native Claude review approved/acknowledged; WU7-B native review is out of scope here |
-| Findings/corrections | Placeholder for reviewer assessment; implementation checks required only an alias-order correction |
-| Final reviewer disposition | Pending |
+| Native review lineage | WU7-A approved/acknowledged; WU7-B `review-e1989d51d986e786` approved/acknowledged at candidate `938edad`. Do not reuse old authority for the correction. |
+| Findings/corrections | Three nonblocking warnings accepted for local correction: readiness channel leak on exit, overbroad topology exit classification, and publisher nil-channel shutdown. Known-response publisher test suggestion deferred. |
+| Final reviewer disposition | WU7-B reviewed candidate approved/acknowledged; correction pending fresh parent reassessment. |
 | Delivery exception | No delivery exception granted or requested; WU7-B exceeds the advisory 400-line review heuristic (1449 authored lines) and remains local. Any future PR sizing decision needs separate authorization. |
 
 ## Tracker progress
@@ -571,10 +622,13 @@ and rollback boundaries must be recorded before a task is marked complete.
 | Documentation | Complete and committed locally | `docs/dlr-handling.md` verified against implementation and integration observations in `aabe813` |
 | Commits | WU7-A merged; WU7-B local work-unit committed | WU7-A included in `origin/main@da4c3a6`; WU7-B `aabe81330f55b029c2a720a265d6b0f5dd527f5c`, plus local tracker-evidence closure commit |
 | Remote delivery | WU7-A PR #82 merged | Four checks succeeded; no WU7-B push or PR authorized |
-| Native review | WU7-A approved/acknowledged | Nonblocking partial-activation warning; WU7-B native review excluded |
+| Native review | WU7-A and WU7-B candidate approved/acknowledged | WU7-B review lineage `review-e1989d51d986e786` reported three nonblocking warnings; accepted local correction verified, no new review in this task |
 
 ## Next step
 
-Local WU7-B is implemented and verified. Preserve existing `.v1` queues. Push,
-PR creation, native review, and any delivery-strategy exception require a separate
-authorization; none is included here.
+Local WU7-B is implemented and verified at the reviewed boundary. The accepted
+reliability follow-up is locally verified; the publisher nil-channel path was
+already safe and is now regression-tested. Commit the correction locally before
+parent reassessment.
+Preserve existing `.v1` queues. Push, PR creation, native review, and any
+delivery-strategy exception require separate authorization; none is included here.

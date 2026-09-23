@@ -141,7 +141,14 @@ defmodule JasminEx.Messaging.RabbitMQ.TopicTopologyTest do
         "PRECONDITION_FAILED - inequivalent arg 'x-delayed-retry-min' for queue 'configured.dlr.lookup.v1'"}}
 
     assert TopicTopology.classify_declaration_failure(reason) == :incompatible_queue_arguments
-    assert TopicTopology.classify_declaration_failure(:disconnected) == :delayed_retry_unsupported
+    assert TopicTopology.classify_declaration_failure(:disconnected) == {:broker, :disconnected}
+
+    unsupported =
+      {:shutdown,
+       {:server_initiated_close, 406,
+        "PRECONDITION_FAILED - unsupported arg 'x-delayed-retry-type' for quorum queue"}}
+
+    assert TopicTopology.classify_declaration_failure(unsupported) == :delayed_retry_unsupported
   end
 
   defp arg(args, name) do

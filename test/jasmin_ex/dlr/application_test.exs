@@ -3,6 +3,7 @@ defmodule JasminEx.Dlr.ApplicationTest do
 
   alias JasminEx.Application
   alias JasminEx.Dlr.Config
+  alias JasminEx.Dlr.Readiness
   alias JasminEx.Dlr.Supervisor, as: DlrSupervisor
   alias JasminEx.Messaging.RabbitMQ.Connection
   alias JasminEx.Messaging.RabbitMQ.Supervisor, as: MessagingSupervisor
@@ -17,6 +18,82 @@ defmodule JasminEx.Dlr.ApplicationTest do
     username: "app",
     password: "secret"
   ]
+
+  defmodule ReadinessClient do
+    def open_channel(agent) do
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      Agent.update(agent, &Map.put(&1, :channel_pid, pid))
+      {:ok, %{pid: pid, agent: agent}}
+    end
+
+    def declare_exchange(_channel, _name, _type, _opts), do: :ok
+
+    def declare_queue(%{agent: agent}, name, _opts) do
+      if Agent.get(agent, &Map.get(&1, :exit_on_declare, false)) do
+        exit(:simulated_disconnect)
+      else
+        {:ok, %{queue: name}}
+      end
+    end
+
+    def bind_queue(_channel, _queue, _exchange, _opts), do: :ok
+
+    def close_channel(%{pid: pid, agent: agent}) do
+      Process.exit(pid, :shutdown)
+      Agent.update(agent, &Map.put(&1, :closed, true))
+      :ok
+    end
+  end
+
+  test "readiness closes a newly opened channel when worker startup exits" do
+    {:ok, agent} = Agent.start_link(fn -> %{closed: false, channel_pid: nil} end)
+
+    connection_server =
+      spawn(fn ->
+        receive do
+          {:"$gen_call", from, :get} -> GenServer.reply(from, {:ok, agent})
+        end
+      end)
+
+    opts = [
+      config: Config.new(enabled: true),
+      connection_server: connection_server,
+      client: ReadinessClient,
+      owner: :missing_dlr_supervisor,
+      publisher: {TestPublisher, :unused},
+      store: {TestStore, :unused},
+      http_client: {TestClient, []}
+    ]
+
+    {:ok, state} = Readiness.init(opts)
+    assert {:noreply, retried} = Readiness.handle_info(:declare, state)
+    assert match?({:broker, _}, retried.error)
+    assert Agent.get(agent, & &1.closed)
+    refute Agent.get(agent, &Process.alive?(&1.channel_pid))
+  end
+
+  test "readiness closes an opened channel when topology declaration exits" do
+    {:ok, agent} = Agent.start_link(fn -> %{closed: false, exit_on_declare: true} end)
+
+    connection_server =
+      spawn(fn ->
+        receive do
+          {:"$gen_call", from, :get} -> GenServer.reply(from, {:ok, agent})
+        end
+      end)
+
+    {:ok, state} =
+      Readiness.init(
+        config: Config.new(enabled: true),
+        connection_server: connection_server,
+        client: ReadinessClient
+      )
+
+    assert {:noreply, retried} = Readiness.handle_info(:declare, state)
+    assert retried.error == {:broker, :simulated_disconnect}
+    assert Agent.get(agent, & &1.closed)
+    refute Agent.get(agent, &Process.alive?(&1.channel_pid))
+  end
 
   test "omits DLR supervision when DLR config is absent or disabled" do
     refute Enum.any?(Application.children([]), &dlr_child?/1)

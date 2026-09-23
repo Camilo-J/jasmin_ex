@@ -106,21 +106,28 @@ defmodule JasminEx.Dlr.Readiness do
   @impl true
   def terminate(_reason, state) do
     if state.monitor, do: Process.demonitor(state.monitor, [:flush])
-    if state.channel, do: safe_close(state.channel)
+    if state.channel, do: safe_close(state.channel, Keyword.get(state.opts, :client, Client))
   end
 
   defp declare(state) do
     opts = state.opts
+    client = Keyword.get(opts, :client, Client)
 
     with {:ok, connection} <- Connection.get(Keyword.fetch!(opts, :connection_server)),
-         {:ok, channel} <- Client.open_channel(connection) do
-      case declare_channel(channel, opts) do
-        :ok ->
-          start_ready(state, channel)
+         {:ok, channel} <- client.open_channel(connection) do
+      try do
+        case declare_channel(channel, opts, client) do
+          :ok ->
+            start_ready(state, channel)
 
-        {:error, reason} ->
-          safe_close(channel)
-          retry(state, reason)
+          {:error, reason} ->
+            safe_close(channel, client)
+            retry(state, reason)
+        end
+      catch
+        :exit, reason ->
+          safe_close(channel, client)
+          retry(state, {:broker, reason})
       end
     else
       {:error, reason} -> retry(state, reason)
@@ -142,15 +149,16 @@ defmodule JasminEx.Dlr.Readiness do
         }
 
       {:error, reason} ->
-        safe_close(channel)
+        safe_close(channel, Keyword.get(state.opts, :client, Client))
         retry(state, reason)
     end
   end
 
-  defp declare_channel(channel, opts) do
+  defp declare_channel(channel, opts, client) do
     TopicTopology.declare(channel,
       prefix: Keyword.fetch!(opts, :config).queue_prefix,
-      config: Keyword.fetch!(opts, :config)
+      config: Keyword.fetch!(opts, :config),
+      client: client
     )
   catch
     :exit, reason -> {:error, TopicTopology.classify_declaration_failure(reason)}
@@ -230,8 +238,8 @@ defmodule JasminEx.Dlr.Readiness do
     end)
   end
 
-  defp safe_close(channel) do
-    if Process.alive?(channel.pid), do: Client.close_channel(channel)
+  defp safe_close(channel, client) do
+    if Process.alive?(channel.pid), do: client.close_channel(channel)
   catch
     :exit, _ -> :ok
   end
