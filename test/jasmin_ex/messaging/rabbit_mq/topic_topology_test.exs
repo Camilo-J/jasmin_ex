@@ -174,6 +174,31 @@ defmodule JasminEx.Messaging.RabbitMQ.TopicTopologyTest do
     assert TopicTopology.classify_declaration_failure(unsupported) == :delayed_retry_unsupported
   end
 
+  test "client-wrapped declaration exits retain explicit 406 and transient distinctions" do
+    call = {:gen_server, :call, [:channel, :declare_queue, 5_000]}
+
+    incompatible =
+      {{:shutdown,
+        {:server_initiated_close, 406,
+         "PRECONDITION_FAILED - inequivalent arg 'x-delayed-retry-min' for queue 'configured.dlr.lookup.v1'"}},
+       call}
+
+    unsupported =
+      {{:shutdown,
+        {:server_initiated_close, 406,
+         "PRECONDITION_FAILED - unsupported arg 'x-delayed-retry-type' for quorum queue"}}, call}
+
+    transient = {{:shutdown, :connection_closed}, call}
+
+    assert TopicTopology.classify_declaration_failure(incompatible) ==
+             :incompatible_queue_arguments
+
+    assert TopicTopology.classify_declaration_failure(unsupported) ==
+             :delayed_retry_unsupported
+
+    assert TopicTopology.classify_declaration_failure(transient) == {:broker, transient}
+  end
+
   defp arg(args, name) do
     case List.keyfind(args, name, 0) do
       {^name, _type, value} -> value

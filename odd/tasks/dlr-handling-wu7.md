@@ -517,6 +517,65 @@ injection boundary; publisher nil shutdown was already safe on baseline.
 | `mix dialyzer` | Exit 0; 0 errors, 0 skipped, 0 unnecessary skips. |
 | `git diff --check` | Exit 0; no output. |
 
+### WU7-B accepted review follow-up at `0010375` (locally verified)
+
+The maintainer authorized two additional local corrections under the existing
+completed WU7-B task. Existing implementation and earlier reliability evidence
+remain intact; edits do not inherit the original review authority.
+
+- [x] Classify the actual RabbitMQ client-wrapped 406 inequivalent queue argument
+      exit as `:incompatible_queue_arguments`, while retaining explicit unsupported
+      delayed retry and broker/transient distinctions. Preserve existing queues;
+      never declare a classic fallback or perform migration.
+- [x] Synchronize the two readiness channel-closure assertions with the channel
+      process's actual `:DOWN`, rather than assuming `Process.exit/2` is synchronous.
+      This is a test reliability correction; no flaky RED is claimed.
+- [x] Run focused, pinned-broker, E2E, full-suite, formatter, Credo, Dialyzer, and
+      diff checks; record exact outcomes and commit tests, source, and tracker as
+      one local correction work unit only if all gates pass.
+
+Observed baseline RED (before this edit): `mix test --only integration
+test/jasmin_ex/messaging/rabbit_mq/topic_topology_test.exs` exited 2 with 3/4
+passing and 9 excluded. At `topic_topology_test.exs:266`, the queue argument
+mismatch arrived as `{{:shutdown, {:server_initiated_close, 406, "...inequivalent
+arg..."}}, {:gen_server, :call, ...}}` and was classified as `{:broker, reason}`.
+The baseline is a real pinned-broker RED for the classification behavior. For the
+test-only closure synchronization, do not manufacture a failing test run.
+
+Focused test RED after adding wrapped-exit cases: `mix test
+test/jasmin_ex/messaging/rabbit_mq/topic_topology_test.exs` exited 2,
+9/10 passed, 4 excluded (seed 195322); the wrapped inequivalent 406 exit was
+returned as `{:broker, reason}`. A single structural match for the AMQP client's
+`{:gen_server, :call, ...}` wrapper delegates to the existing 406 classifier;
+unrelated wrapped transient exits keep their original broker reason. The fake
+readiness client now registers a process monitor before shutdown, so each test
+waits for the matching `:DOWN` with reason `:shutdown` after checking `closed`.
+No test-only race RED was reproduced or asserted.
+
+`mix format` ran before the final checks. The real broker mismatch now passes
+while the existing queue and its durable message remain intact.
+
+| Final correction gate | Observed result |
+|---|---|
+| `mix test test/jasmin_ex/messaging/rabbit_mq/topic_topology_test.exs` | Exit 0; 10 passed, 4 integration excluded (seed 749327). |
+| `mix test --only integration test/jasmin_ex/messaging/rabbit_mq/topic_topology_test.exs` | Exit 0; 4 passed, 10 excluded (seed 554072); real configured queue mismatch retained original queue and message. |
+| `mix test test/jasmin_ex/dlr/application_test.exs` | Exit 0; 9 passed (seed 959999). |
+| `mix test --only integration test/jasmin_ex/dlr/e2e_test.exs` | Exit 0; 2 passed (seed 670171). |
+| `mix test` | Exit 0; 697 passed (1 doctest, 696 tests), 29 excluded (seed 460894). |
+| `mix format --check-formatted` | Exit 0; no output. |
+| `mix credo --strict` | Exit 0; 178 files, 2515 mods/funs, no issues. |
+| `mix dialyzer` | Exit 0; 0 errors, 0 skipped, 0 unnecessary skips. |
+| `git diff --check` | Exit 0; no output before final Markdown evidence update; rerun before commit. |
+
+This new result supersedes only the earlier actual-broker mismatch GREEN claim
+for the intervening pre-fix candidate; prior runtime and review evidence remains
+historical. The correction does not change the original native review authority.
+
+Rollback boundary: revert only the narrow topology classification and its tests,
+the two readiness test assertions and this follow-up evidence; preserve all
+existing WU7-B behavior, `.v1` queues, and durable state. No remote delivery,
+native review, or deferred known-response suggestion belongs to this correction.
+
 ### Focused integration command
 
 ```bash
@@ -645,7 +704,7 @@ and rollback boundaries must be recorded before a task is marked complete.
 | Stable top-level tasks | 2 implemented locally, 1 merged | WU7-A merged as PR #82; WU7-B committed locally and not delivered remotely |
 | Delivery choice | Complete | Two stacked PR slices with `stacked-to-main`; WU7-A targets `main` |
 | Source changes | WU7-B implemented and committed locally | Readiness/topology retry, channel cleanup, connector/HTTP injection and broker-owned settlement in `aabe813`; tracker evidence in `914e5d3` |
-| Tests | WU7-B and reliability follow-up gates passed | E2E 2 passed with broker/Valkey outages and terminal budgets, actual broker topology 4 passed, final regular suite 696 passed / 29 excluded; formatter/Credo/Dialyzer/`git diff --check` exit 0 |
+| Tests | WU7-B and accepted review follow-up gates passed locally | E2E 2 passed with broker/Valkey outages and terminal budgets, actual broker topology 4 passed after wrapped-exit correction, regular suite 697 passed / 29 excluded; formatter/Credo/Dialyzer/`git diff --check` exit 0 |
 | Documentation | Complete and committed locally | `docs/dlr-handling.md` verified against implementation and integration observations in `aabe813` |
 | Commits | WU7-A merged; WU7-B and reliability corrections committed locally | WU7-A in `origin/main@da4c3a6`; WU7-B `aabe813`, tracker evidence `914e5d3`, reconciliation `938edad`, reliability fixes `60269b6` and `4a164af` |
 | Remote delivery | WU7-A PR #82 merged | Four checks succeeded; no WU7-B push or PR authorized |

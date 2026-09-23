@@ -22,7 +22,8 @@ defmodule JasminEx.Dlr.ApplicationTest do
   defmodule ReadinessClient do
     def open_channel(agent) do
       pid = spawn(fn -> Process.sleep(:infinity) end)
-      Agent.update(agent, &Map.put(&1, :channel_pid, pid))
+      ref = Process.monitor(pid)
+      Agent.update(agent, &Map.merge(&1, %{channel_pid: pid, channel_ref: ref}))
       {:ok, %{pid: pid, agent: agent}}
     end
 
@@ -69,7 +70,8 @@ defmodule JasminEx.Dlr.ApplicationTest do
     assert {:noreply, retried} = Readiness.handle_info(:declare, state)
     assert match?({:broker, _}, retried.error)
     assert Agent.get(agent, & &1.closed)
-    refute Agent.get(agent, &Process.alive?(&1.channel_pid))
+    {channel_pid, ref} = Agent.get(agent, &{&1.channel_pid, &1.channel_ref})
+    assert_receive {:DOWN, ^ref, :process, ^channel_pid, :shutdown}
   end
 
   test "readiness closes an opened channel when topology declaration exits" do
@@ -92,7 +94,8 @@ defmodule JasminEx.Dlr.ApplicationTest do
     assert {:noreply, retried} = Readiness.handle_info(:declare, state)
     assert retried.error == {:broker, :simulated_disconnect}
     assert Agent.get(agent, & &1.closed)
-    refute Agent.get(agent, &Process.alive?(&1.channel_pid))
+    {channel_pid, ref} = Agent.get(agent, &{&1.channel_pid, &1.channel_ref})
+    assert_receive {:DOWN, ^ref, :process, ^channel_pid, :shutdown}
   end
 
   test "omits DLR supervision when DLR config is absent or disabled" do
