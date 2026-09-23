@@ -18,6 +18,8 @@ defmodule JasminEx.Messaging.RabbitMQ.TopicPublisher do
 
   @impl true
   def init(opts) do
+    Process.flag(:trap_exit, true)
+
     {:ok,
      ensure(%{
        config: Keyword.fetch!(opts, :config),
@@ -144,8 +146,10 @@ defmodule JasminEx.Messaging.RabbitMQ.TopicPublisher do
 
   defp close(%{client: client, channel: ch, mon: mon}) do
     if is_reference(mon), do: Process.demonitor(mon, [:flush])
-    _ = client.close_channel(ch)
+    if Process.alive?(ch.pid), do: client.close_channel(ch)
     :ok
+  catch
+    :exit, _reason -> :ok
   end
 
   defp name_opts(nil), do: []

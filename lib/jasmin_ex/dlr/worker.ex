@@ -12,14 +12,18 @@ defmodule JasminEx.Dlr.Worker do
 
   @impl true
   def init(opts) do
+    Process.flag(:trap_exit, true)
+
     {:ok,
      consume(%{
        queue_kind: Keyword.fetch!(opts, :queue_kind),
+       additional_attempts: Keyword.get(opts, :additional_attempts),
        queue: Keyword.fetch!(opts, :queue),
        processor: Keyword.fetch!(opts, :processor),
        client: Keyword.get(opts, :client, JasminEx.Messaging.RabbitMQ.Client),
        connection: Keyword.get(opts, :connection),
        connection_server: Keyword.get(opts, :connection_server),
+       reconnect_backoff_ms: min(max(Keyword.get(opts, :reconnect_backoff_ms, 250), 25), 5_000),
        channel: nil,
        mon: nil,
        inflight: nil
@@ -35,6 +39,8 @@ defmodule JasminEx.Dlr.Worker do
 
   def handle_info({:basic_cancel, _meta}, state), do: {:noreply, recover(state)}
   def handle_info({:basic_consume_ok, _meta}, state), do: {:noreply, state}
+  def handle_info(:retry_consume, %{channel: nil} = state), do: {:noreply, consume(state)}
+  def handle_info(:retry_consume, state), do: {:noreply, state}
   def handle_info(_, state), do: {:noreply, state}
 
   @impl true
@@ -55,7 +61,7 @@ defmodule JasminEx.Dlr.Worker do
       not allowed?(state.queue_kind, meta.routing_key) ->
         :terminal
 
-      not processable?(state.queue_kind, meta) ->
+      not processable?(state, meta) ->
         :terminal
 
       true ->
@@ -63,9 +69,11 @@ defmodule JasminEx.Dlr.Worker do
     end
   end
 
-  defp processable?(kind, meta) do
-    case RetryPolicy.failures(kind, meta) do
-      {:ok, count} -> count <= RetryPolicy.additional_attempts(kind)
+  defp processable?(state, meta) do
+    additional = state.additional_attempts || RetryPolicy.additional_attempts(state.queue_kind)
+
+    case RetryPolicy.failures(state.queue_kind, meta, additional) do
+      {:ok, count} -> count <= additional
       {:error, _reason} -> false
     end
   end
@@ -91,7 +99,12 @@ defmodule JasminEx.Dlr.Worker do
   defp settle(state, _channel, _tag, _meta, _outcome), do: %{state | inflight: nil}
 
   defp apply_settle(state, channel, tag, meta, outcome) do
-    case RetryPolicy.settle(state.queue_kind, meta, outcome_for_policy(outcome)) do
+    case RetryPolicy.settle(
+           state.queue_kind,
+           meta,
+           outcome_for_policy(outcome),
+           state.additional_attempts
+         ) do
       :ack -> state.client.ack(channel, tag)
       {:reject, opts} -> state.client.reject(channel, tag, opts)
     end
@@ -111,13 +124,34 @@ defmodule JasminEx.Dlr.Worker do
 
   defp consume(state) do
     with {:ok, conn} <- resolve(state),
-         {:ok, ch} <- state.client.open_channel(conn),
-         :ok <- state.client.qos(ch, prefetch_count: 1),
+         {:ok, ch} <- state.client.open_channel(conn) do
+      consume_opened(state, ch)
+    else
+      _ -> retry_later(state)
+    end
+  catch
+    :exit, _reason -> retry_later(state)
+  end
+
+  defp consume_opened(state, ch) do
+    with :ok <- state.client.qos(ch, prefetch_count: 1),
          {:ok, _tag} <- state.client.consume(ch, state.queue, self(), no_ack: false) do
       %{state | channel: ch, mon: Process.monitor(ch.pid), inflight: nil}
     else
-      _ -> %{state | channel: nil, mon: nil, inflight: nil}
+      _ -> close_and_retry(state, ch)
     end
+  catch
+    :exit, _reason -> close_and_retry(state, ch)
+  end
+
+  defp close_and_retry(state, ch) do
+    close(%{state | channel: ch})
+    retry_later(state)
+  end
+
+  defp retry_later(state) do
+    Process.send_after(self(), :retry_consume, state.reconnect_backoff_ms)
+    %{state | channel: nil, mon: nil, inflight: nil}
   end
 
   defp recover(state) do
@@ -136,8 +170,10 @@ defmodule JasminEx.Dlr.Worker do
 
   defp close(%{client: client, channel: ch, mon: mon}) do
     if is_reference(mon), do: Process.demonitor(mon, [:flush])
-    _ = client.close_channel(ch)
+    if live_channel?(ch), do: client.close_channel(ch)
     :ok
+  catch
+    :exit, _reason -> :ok
   end
 
   defp emit(outcome, state) do

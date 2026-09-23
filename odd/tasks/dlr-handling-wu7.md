@@ -5,8 +5,8 @@
 The maintainer chose **two stacked PR slices** using `stacked-to-main`:
 
 1. WU7-A is Slice 1 and targets `main`.
-2. WU7-B waits until WU7-A is delivered, then follows after WU7-A merges and its
-   branch is rebased onto the updated `main` boundary.
+2. WU7-A merged as PR #82 at `origin/main@da4c3a6631a6785269b66d8b488ab3b789c7dbb3`.
+   WU7-B proceeds on local `feat/dlr-handling-wu7b` from that boundary.
 
 The forecast is **710–1,120 authored lines**, so the 400-line review heuristic is
 advisory and MUST NOT cause code-golf, compressed tests, reduced documentation, or
@@ -21,8 +21,8 @@ weakened runtime evidence.
 | Objective | Make the completed DLR pipeline reachable from the production application, resilient to broker unavailability and restart, and operable through accurate documentation. |
 | Problem | WU1–WU6 provide DLR contracts, durable mappings and plans, receipt parsing, topic transport, lookup processing, and secure HTTP callbacks, but the application does not supervise or inject the complete production path. |
 | Why now | WU6 is merged. Production wiring and restart recovery are the remaining boundary before issue #10 can claim an operational DLR path. |
-| Branch | `feat/dlr-handling-wu7` |
-| Base | `main@b980d4ebd7e5f004f2e3cebc657f87e9d9812d78` |
+| Branch | `feat/dlr-handling-wu7b` (WU7-B); WU7-A was delivered separately |
+| Base | `origin/main@da4c3a6631a6785269b66d8b488ab3b789c7dbb3` (WU7-B) |
 | Development route | Organic Driven Development (ODD), delegated direct |
 | Tracker role | Authoritative ODD feature document for WU7 |
 
@@ -97,16 +97,15 @@ tests.
 | Forecast | **710–1,120 authored additions plus deletions** |
 | Review heuristic | About 400 authored changed lines per review slice, advisory |
 | Maintainer choice | **WU7-A and WU7-B are separate stacked PR slices** |
-| Current delivery state | WU7-A authorized; WU7-B blocked until WU7-A delivery |
+| Current delivery state | WU7-A merged via PR #82; WU7-B implemented and verified locally. Its candidate at `938edad` was approved/acknowledged; the accepted reliability follow-up is committed locally, with native assessment `medium/under_budget` against that reviewed boundary. No push or PR. |
 | Counting rule | Count authored additions plus deletions; exclude generated artifacts only when identified explicitly, while retaining them in complete snapshot evidence. |
 | Guardrail | Do not code-golf, remove tests/docs/comments, or weaken evidence to approach the heuristic. |
 
 ### Delivery slices
 
 1. Slice 1 contains WU7-A and targets `main`.
-2. Slice 2 contains WU7-B. Work on it remains blocked until Slice 1 is delivered;
-   after Slice 1 merges, WU7-B follows from the updated `main` boundary without
-   force or hidden history rewriting.
+2. Slice 2 contains WU7-B on local `feat/dlr-handling-wu7b`, based on the merged
+   Slice 1 boundary `da4c3a6631a6785269b66d8b488ab3b789c7dbb3`.
 
 ## Mapped repository facts
 
@@ -183,7 +182,7 @@ WU7 is acceptable only when all of the following are demonstrated:
 ## Stable top-level ODD tasks
 
 - [x] **WU7-A — Add the optional DLR supervision and application contract (estimated 180–280 authored lines).**
-- [ ] **WU7-B — Prove production E2E/restart recovery and document operations (estimated 530–840 authored lines).**
+- [x] **WU7-B — Prove production E2E/restart recovery and document operations (estimated 530–840 authored lines).**
 
 The two identifiers above are stable. Do not split them into additional top-level
 ODD tasks merely to improve line-count optics.
@@ -270,7 +269,7 @@ behavior, and non-DLR application child.
 `delegated direct`; mapping and writer triggers are active, and delegated
 preparation is complete.
 
-### Progress and evidence placeholders
+### WU7-A progress and evidence
 
 | Evidence | Status | Exact observation |
 |---|---|---|
@@ -286,7 +285,7 @@ preparation is complete.
 | Route/trigger evidence | Complete | `delegated direct`; mapping and writer triggers remained active across four implementation/test files plus this tracker. |
 | Rollback boundary | Reviewed | Remove `lib/jasmin_ex/dlr/supervisor.ex`, `test/jasmin_ex/dlr/application_test.exs`, the WU7-A assertions in `test/jasmin_ex/http_api/application_test.exs`, and only the DLR branches in `lib/jasmin_ex/application.ex`; preserve WU1–WU6 and all non-DLR children. |
 | Authored lines | 306 | 268 additions plus 38 deletions in this implementation commit, including tracker evidence; no generated artifacts. The estimate was exceeded without code-golf and remains below the 400-line review heuristic. |
-| Work-unit commit | Complete | `this commit` — `feat(dlr): add optional application supervision` |
+| Work-unit commit | Complete | `da4c3a6631a6785269b66d8b488ab3b789c7dbb3` — `feat(dlr): add optional application supervision (#82)` (squash merge) |
 
 ## WU7-B — Production E2E/restart recovery and operator documentation
 
@@ -419,6 +418,164 @@ Documentation and evidence:
 Before editing any unlisted file, record why the existing boundary is insufficient
 and how the extra file remains inside WU7 scope.
 
+WU7-B scope extensions recorded before edits: `test/jasmin_ex/dlr/worker_test.exs`
+is needed to isolate the currently one-shot startup-consume retry without treating
+a Docker outage as a unit-test RED. `lib/jasmin_ex/dlr/retry_policy.ex` and its focused
+test file may be needed because the current fixed runtime settlement budget would
+disagree with newly configured durable queue delivery limits; this is DLR-only retry
+consistency, not a change to MT queue behavior. No other unlisted file is authorized
+by this note.
+
+Additional WU7-B harness scope reason: `test/support/rabbit_mq_harness.ex` needs
+non-destructive service stop/start helpers to prove startup unavailability while
+preserving the same published port, durable queue volume, and existing Compose
+project. `restart!/1` cannot leave the broker unavailable while starting the
+application, and `stop!/1` destroys volumes; the extension remains test-only.
+
+Additional production scope reason before edit: `lib/jasmin_ex/messaging/rabbit_mq/topic_publisher.ex`
+owns the DLR topic publish channel. OTP supervisor shutdown without trapping exits
+leaves that AMQP channel alive after DLR subtree restart, as the worker-channel
+RED showed for the same ownership pattern. Closing only this DLR-owned publisher
+channel is necessary to prevent orphan channels/consumer ambiguity; MT publisher
+and MT work-queue semantics are unchanged.
+
+### WU7-B accepted reliability follow-up (locally verified)
+
+The candidate at `938edad` was approved and acknowledged under native review
+lineage `review-e1989d51d986e786`. The maintainer accepted only these three
+nonblocking warnings as a local correction before PR; the separate known-response
+publisher test suggestion is deferred. This does not reopen WU7-A or invalidate
+the original WU7-B implementation evidence. Do not bind or change the old review.
+
+- [x] Close a readiness AMQP channel if topology declaration exits after opening it;
+      retries must not accumulate orphan channels.
+- [x] Classify transient declaration exits and returned errors as broker/transient errors, while
+      preserving explicit inequivalent-argument and unsupported quorum delayed-retry
+      errors, with no classic fallback or queue deletion.
+- [x] Verify DLR topic publisher shutdown when its channel is nil. The existing
+      `close(%{channel: nil})` clause already avoids `ch.pid`; the regression test
+      passed before source changes, so no publisher source change was justified.
+- [x] Record observed RED for changed classification and the earlier readiness
+      injection boundary without claiming an observed readiness leak RED; then
+      GREEN and REFACTOR. Run the exact
+      application, topology, publisher, E2E, full suite, formatter, Credo, Dialyzer,
+      and `git diff --check` gates before committing the correction.
+
+The focused publisher test file is necessary to reproduce shutdown with no channel;
+it is within the previously recorded DLR publisher ownership extension. Rollback
+only this correction's DLR readiness, classification, publisher-close changes,
+focused tests, and tracker evidence; preserve all existing `.v1` queues and state.
+
+Follow-up TDD evidence: topology test RED `mix test
+test/jasmin_ex/messaging/rabbit_mq/topic_topology_test.exs`, exit 2, 7/8 passed,
+4 excluded: `:disconnected` was incorrectly classified as
+`:delayed_retry_unsupported`. Readiness test RED `mix test
+test/jasmin_ex/dlr/application_test.exs`, exit 2, 7/8 passed: the new isolated
+failure-path test could not use the injected client (production hardcoded
+`Client.open_channel/1`), before the channel-close behavior could be observed.
+After narrow client injection and closing on the post-open worker-startup exit,
+both declaration-exit and worker-startup-exit tests confirmed channel closure.
+Publisher baseline GREEN `mix test
+test/jasmin_ex/messaging/rabbit_mq/topic_publisher_test.exs`, exit 0, 7 passed,
+including shutdown with a nil channel after connection loss. No RED is claimed
+for that pre-existing safe behavior. `mix format` ran before final checks.
+
+The parent independently found a missed returned-error branch in `retry_queue/4`
+after commit `60269b6`: `{:error, :channel_closed}` and other returned transients
+still mapped to `:delayed_retry_unsupported`. This is the same accepted
+classification warning, not a new top-level task. A focused test first observed
+RED: `mix test test/jasmin_ex/messaging/rabbit_mq/topic_topology_test.exs`, exit 2,
+8/9 passed, 4 excluded; returned `:channel_closed` was mislabeled unsupported.
+Using the existing exit classifier for returned errors produced GREEN (9 passed,
+4 excluded) for `:channel_closed`, `:disconnected`, `:timeout`, explicit unsupported
+delayed retry, and inequivalent arguments, with one declaration only and no
+classic fallback. `mix format` ran before the repeated checks below. No queue
+deletion or migration was added. The readiness RED remains limited to the
+injection boundary; publisher nil shutdown was already safe on baseline.
+
+| Returned-error follow-up gate | Observed result |
+|---|---|
+| `mix test test/jasmin_ex/messaging/rabbit_mq/topic_topology_test.exs` | Exit 0; 9 passed, 4 integration excluded. |
+| `mix test test/jasmin_ex/dlr/application_test.exs` | Exit 0; 9 passed. |
+| `mix test test/jasmin_ex/messaging/rabbit_mq/topic_publisher_test.exs` | Exit 0; 7 passed. |
+| `mix test --only integration test/jasmin_ex/dlr/e2e_test.exs` | Exit 0; 2 passed. |
+| `mix test` | Exit 0; 696 passed (1 doctest, 695 tests), 29 excluded. |
+| `mix format --check-formatted` | Exit 0; no output. |
+| `mix credo --strict` | Exit 0; 178 files, 2515 mods/funs, no issues. |
+| `mix dialyzer` | Exit 0; 0 errors, 0 skipped, 0 unnecessary skips. |
+| `git diff --check` | Exit 0; no output. |
+
+| Follow-up gate | Observed result |
+|---|---|
+| `mix test test/jasmin_ex/dlr/application_test.exs` | Exit 0; 9 passed. |
+| `mix test test/jasmin_ex/messaging/rabbit_mq/topic_topology_test.exs` | Exit 0; 8 passed, 4 integration excluded. |
+| `mix test test/jasmin_ex/messaging/rabbit_mq/topic_publisher_test.exs` | Exit 0; 7 passed. |
+| `mix test --only integration test/jasmin_ex/dlr/e2e_test.exs` | Exit 0; 2 passed, broker/StateStore/FakeSMSC/endpoint recovery scenario. |
+| `mix test` | Exit 0; 695 passed (1 doctest, 694 tests), 29 excluded. |
+| `mix format --check-formatted` | Exit 0; no output. |
+| `mix credo --strict` | Exit 0; 178 files, 2515 mods/funs, no issues. |
+| `mix dialyzer` | Exit 0; 0 errors, 0 skipped, 0 unnecessary skips. |
+| `git diff --check` | Exit 0; no output. |
+
+### WU7-B accepted review follow-up at `0010375` (locally verified)
+
+The maintainer authorized two additional local corrections under the existing
+completed WU7-B task. Existing implementation and earlier reliability evidence
+remain intact; edits do not inherit the original review authority.
+
+- [x] Classify the actual RabbitMQ client-wrapped 406 inequivalent queue argument
+      exit as `:incompatible_queue_arguments`, while retaining explicit unsupported
+      delayed retry and broker/transient distinctions. Preserve existing queues;
+      never declare a classic fallback or perform migration.
+- [x] Synchronize the two readiness channel-closure assertions with the channel
+      process's actual `:DOWN`, rather than assuming `Process.exit/2` is synchronous.
+      This is a test reliability correction; no flaky RED is claimed.
+- [x] Run focused, pinned-broker, E2E, full-suite, formatter, Credo, Dialyzer, and
+      diff checks; record exact outcomes and commit tests, source, and tracker as
+      one local correction work unit only if all gates pass.
+
+Observed baseline RED (before this edit): `mix test --only integration
+test/jasmin_ex/messaging/rabbit_mq/topic_topology_test.exs` exited 2 with 3/4
+passing and 9 excluded. At `topic_topology_test.exs:266`, the queue argument
+mismatch arrived as `{{:shutdown, {:server_initiated_close, 406, "...inequivalent
+arg..."}}, {:gen_server, :call, ...}}` and was classified as `{:broker, reason}`.
+The baseline is a real pinned-broker RED for the classification behavior. For the
+test-only closure synchronization, do not manufacture a failing test run.
+
+Focused test RED after adding wrapped-exit cases: `mix test
+test/jasmin_ex/messaging/rabbit_mq/topic_topology_test.exs` exited 2,
+9/10 passed, 4 excluded (seed 195322); the wrapped inequivalent 406 exit was
+returned as `{:broker, reason}`. A single structural match for the AMQP client's
+`{:gen_server, :call, ...}` wrapper delegates to the existing 406 classifier;
+unrelated wrapped transient exits keep their original broker reason. The fake
+readiness client now registers a process monitor before shutdown, so each test
+waits for the matching `:DOWN` with reason `:shutdown` after checking `closed`.
+No test-only race RED was reproduced or asserted.
+
+`mix format` ran before the final checks. The real broker mismatch now passes
+while the existing queue and its durable message remain intact.
+
+| Final correction gate | Observed result |
+|---|---|
+| `mix test test/jasmin_ex/messaging/rabbit_mq/topic_topology_test.exs` | Exit 0; 10 passed, 4 integration excluded (seed 749327). |
+| `mix test --only integration test/jasmin_ex/messaging/rabbit_mq/topic_topology_test.exs` | Exit 0; 4 passed, 10 excluded (seed 554072); real configured queue mismatch retained original queue and message. |
+| `mix test test/jasmin_ex/dlr/application_test.exs` | Exit 0; 9 passed (seed 959999). |
+| `mix test --only integration test/jasmin_ex/dlr/e2e_test.exs` | Exit 0; 2 passed (seed 670171). |
+| `mix test` | Exit 0; 697 passed (1 doctest, 696 tests), 29 excluded (seed 460894). |
+| `mix format --check-formatted` | Exit 0; no output. |
+| `mix credo --strict` | Exit 0; 178 files, 2515 mods/funs, no issues. |
+| `mix dialyzer` | Exit 0; 0 errors, 0 skipped, 0 unnecessary skips. |
+| `git diff --check` | Exit 0; no output before final Markdown evidence update; rerun before commit. |
+
+This new result supersedes only the earlier actual-broker mismatch GREEN claim
+for the intervening pre-fix candidate; prior runtime and review evidence remains
+historical. The correction does not change the original native review authority.
+
+Rollback boundary: revert only the narrow topology classification and its tests,
+the two readiness test assertions and this follow-up evidence; preserve all
+existing WU7-B behavior, `.v1` queues, and durable state. No remote delivery,
+native review, or deferred known-response suggestion belongs to this correction.
+
 ### Focused integration command
 
 ```bash
@@ -473,32 +630,36 @@ preparation is complete.
 
 | Evidence | Status | Exact observation |
 |---|---|---|
-| Progress | Pending | Not started; blocked on delivery choice |
-| RED | Pending | Focused integration command, exit status, and first missing production behavior |
-| GREEN | Pending | Focused integration command, versions, counters, and completed path |
-| REFACTOR | Pending | Format/refactor command and unchanged integration result |
-| Restart proof | Pending | Outage/restart points, recovery observations, and terminal result |
-| Documentation validation | Pending | Review/check command and verified sections |
-| Full suite | Pending | `mix test` result |
-| Formatter | Pending | `mix format --check-formatted` result |
-| Credo | Pending | `mix credo --strict` result |
-| Dialyzer | Pending | `mix dialyzer` result |
-| Authored lines | 0 | Update with additions plus deletions |
-| Work-unit commit | Pending | Conventional commit hash and subject |
+| Progress | WU7-B complete locally; remote delivery not requested | Production path, startup outage, broker and DLR-subtree restart, Valkey outage, broker HTTP retry/exhaustion, queue mismatch preservation, and operator documentation are locally exercised. All full verification gates passed before work-unit commit `aabe81330f55b029c2a720a265d6b0f5dd527f5c`. No push, PR, or native review performed. |
+| RED | Observed for production path | `mix test --only integration test/jasmin_ex/dlr/e2e_test.exs` exited 2, 0/1 passing (seed 824925): application-assembled root started real RabbitMQ and Valkey, POST `/send` returned 200, `DlrMap.fetch_request` found production Redix correlation, and FakeSMSC emitted a `submit_sm` PDU after MT broker delivery. The 8-second assertion for actual fake-endpoint request plus settled HTTP broker queue returned false; current `Dlr.Supervisor` still has no children, so no DLR event consumer or callback can progress. The test-only loopback allow rule is explicit in the test; production injection of it remains pending. This supersedes the earlier scaffold-only 0/1 failure (not valid RED) and the intermediate fixture failures (incorrect Application alias, then undeclared MT test queue). Separately `mix test test/jasmin_ex/messaging/rabbit_mq/topic_topology_test.exs` exited 2, 6/7 passing, 3 excluded: configured 125ms delay was declared as 10000ms. |
+| GREEN | Observed | Callback integration first passed 1/1 after production wiring. Focused application/worker/topology tests passed 22/22, 3 excluded. Configured worker retry RED was 7/8; GREEN 8/8. Orphan-channel shutdown RED was 8/9; GREEN 9/9. Failed QoS channel-close RED was 9/10; GREEN 10/10. HTTP timeout injection RED was 1/2; GREEN 2/2. |
+| REFACTOR | Observed | `mix format` after changes; `mix credo --strict` passed (178 files, no issues); application 7/7, topology 8/8 (4 integration excluded), worker 10/10. |
+| Restart and outage proof | Observed | Integration 2/2 passed (seed 270012): broker stopped before application start → readiness `:disconnected`, zero DLR worker children → same port restored → ready and one consumer per DLR work queue. Full path restarted broker then DLR subtree, checked old channels dead, persisted request and reverse maps still present, fresh consumers and receipt callback. During Valkey stop, an actual lookup `:retry` settlement telemetry event preceded Valkey restart and callback; reverse map survived. |
+| Documentation validation | Complete | `docs/dlr-handling.md` covers enablement, all DLR config defaults, broker inspection, security, failure handling, duplicate caveat, StateStore persistence caveat and non-destructive rollback; reviewed against implementation and the successful 2/2 E2E run. |
+| Full suite | Passed after runtime changes | `mix test` exited 0: 692 passed (1 doctest, 691 tests), 29 excluded; integration is excluded and must be run separately. |
+| Formatter | Passed after final assertion adjustment | `mix format && ... && mix format --check-formatted` exited 0; final tracker edits are Markdown only. |
+| Credo | Passed after runtime changes | `mix credo --strict` exited 0: 178 files, 2509 modules/functions, no issues. |
+| Dialyzer | Passed after runtime changes | `mix dialyzer` exited 0: 0 errors, 0 skipped, 0 unnecessary skips. |
+| Authored lines | Over advisory 400-line heuristic | Immediately before this tracker edit: 763 tracked additions/deletions plus 686 untracked E2E/docs lines = 1449. Runtime test and docs retained; no code-golf or automatic scope split. Recount before commit. |
+| Work-unit commit | Complete | `aabe81330f55b029c2a720a265d6b0f5dd527f5c` — `feat(dlr): prove production callback and recovery`; 14 files, 1368 additions and 81 deletions, including tests and docs. This tracker identity is recorded in a separate local evidence-only commit because a commit cannot include its own hash. |
+
+Runtime profile: pinned `rabbitmq:4.3.4` and `valkey/valkey:9.1.1` (environment overrides unset); E2E DLR options `queue_prefix=jasmin_ex.dlr.e2e.<unique>`, `http_delay_ms=125`, `http_timeout_ms=1234`, lookup delay 10000, lookup additional attempts 2, HTTP additional attempts 3, expiry 86400 seconds. Queues were `<prefix>.lookup.v1`, `<prefix>.http.v1`, `<prefix>.dead.v1`, all quorum with no classic fallback. Lookup/HTTP arguments include `x-delayed-retry-type=all`, delay min=max 10000/125 ms, delivery limits 3/4, dead-letter strategy `at-least-once`; focused declaration assertions cover configurable values. A separate actual-broker mismatch test published one durable message, attempted a conflicting delay declaration, received an inequivalent-argument error, and found the original queue with that one message intact (`mix test --only integration test/jasmin_ex/messaging/rabbit_mq/topic_topology_test.exs`, exit 0, 4 passed, 8 excluded; seed 886737).
+
+FakeSMSC observed `bind_transceiver`, three `submit_sm` requests for level-1 success/retry/exhaustion, a fourth `submit_sm` for level 2 before broker restart, and `deliver_sm_resp` after the receipt; scripted receipt `id:fake-msg-id ... stat:DELIVRD` resolved the stored reverse map. The fake endpoint observed eight POST `/dlr` requests: one `ACK/Jasmin` success, two for one 500→ACK broker retry with identical encoded body, four HTTP 500 responses for the exhausted job (one dead-letter, no HTTP queue messages), and one level-2 `DELIVRD` callback with `ACK/Jasmin` after broker and Valkey recovery. Request/reverse maps and `LookupPlan` completion were read through Redix. The repeated retry callback proves at-least-once behavior; publish-before-plan-checkpoint remains a possible duplicate window, not an exactly-once claim. Consumers were absent before startup readiness and one per queue after ready and after broker recovery; queue inspection was unavailable while the broker was stopped. Valkey outage produced lookup retry telemetry while readiness remained true. The DLR subtree was also terminated and restarted twice; old publisher, topology and lookup channels were verified closed. No permanently idle worker or second consumer set was observed. A callback can arrive before lookup cleanup, so the final correlation deletion is polled rather than assumed instantaneous.
 
 ## Verification evidence ledger
 
 | Gate | WU7-A | WU7-B | Final feature |
 |---|---|---|---|
-| Focused RED | Observed: exit 2, 3/8 passed and 5 failed; compatibility strengthening RED exit 2, 7/8 passed | Pending | N/A; evidence belongs to each task |
-| Focused GREEN | Passed: exit 0, 8/8 | Pending | Pending |
-| Focused REFACTOR | Passed: exit 0, 8/8 | Pending | Pending |
-| Runtime harness | N/A; application contract only | Pending | Pending |
-| Full `mix test` | Passed: 684 tests, 26 excluded | Pending | Pending |
-| Formatter | Passed | Pending | Pending |
-| Credo | Passed after correcting one WU7-A alias-order issue | Pending | Pending |
-| Dialyzer | Passed: 0 errors | Pending | Pending |
-| Rollback reviewed | Complete | Pending | Pending |
+| Focused RED | Observed: exit 2, 3/8 passed and 5 failed; compatibility strengthening RED exit 2, 7/8 passed | Production E2E, topology arguments, injection, failed consume, configured budget, orphan channel and QoS setup failures observed RED | N/A; evidence belongs to each task |
+| Focused GREEN | Passed: exit 0, 8/8 | Focused application 7, topology 8, worker 10 passed; actual broker topology 4 passed | Passed for both work units |
+| Focused REFACTOR | Passed: exit 0, 8/8 | Formatter/Credo passed and focused tests rerun | Passed |
+| Runtime harness | N/A; application contract only | Real RabbitMQ/Valkey/FakeSMSC/endpoint E2E exit 0, 2 passed (seed 418641), broker topology exit 0, 4 passed (seed 886737) | Passed |
+| Full `mix test` | Passed: 684 tests, 26 excluded | Exit 0, 692 passed, 29 excluded (seed 418392) | Passed |
+| Formatter | Passed | `mix format` then `mix format --check-formatted`, exit 0 | Passed |
+| Credo | Passed after correcting one WU7-A alias-order issue | Exit 0, 178 files, no issues | Passed |
+| Dialyzer | Passed: 0 errors | Exit 0, 0 errors | Passed |
+| Rollback reviewed | Complete | Non-destructive DLR-only rollback boundary above and in docs | Complete |
 
 ## Work-unit commit placeholders
 
@@ -507,8 +668,8 @@ tests and docs with the behavior they verify.
 
 | Work unit | Intended outcome | Commit placeholder | Review slice |
 |---|---|---|---|
-| WU7-A | Optional DLR supervisor and application contract | `this commit`: `feat(dlr): add optional application supervision` | Slice 1 targeting `main` |
-| WU7-B | Production recovery proof and operator documentation | Pending: `feat(dlr): prove production recovery and operations` | Slice 2, blocked until WU7-A delivery |
+| WU7-A | Optional DLR supervisor and application contract | `da4c3a6`: `feat(dlr): add optional application supervision (#82)` | Slice 1 merged into `main` |
+| WU7-B | Production recovery proof and operator documentation | `aabe81330f55b029c2a720a265d6b0f5dd527f5c`: `feat(dlr): prove production callback and recovery` | Slice 2 on local `feat/dlr-handling-wu7b`; no PR authorized |
 
 Commit hashes, exact subjects, focused checks, runtime evidence or N/A rationale,
 and rollback boundaries must be recorded before a task is marked complete.
@@ -518,38 +679,42 @@ and rollback boundaries must be recorded before a task is marked complete.
 | Boundary | Forecast | Current authored additions + deletions | Notes |
 |---|---:|---:|---|
 | WU7-A | 180–280 | 306 | 268 additions plus 38 deletions, including tracker evidence; coherent scope retained without code-golf. |
-| WU7-B | 530–840 | 0 | Includes E2E/restart proof and `docs/dlr-handling.md`. |
-| Total WU7 | **710–1,120** | **306** | WU7-B remains blocked; do not optimize for the heuristic. |
+| WU7-B | 530–840 | 1449 in work-unit commit `aabe813` | Real outage/restart scenarios and operator docs exceeded forecast; 400-line heuristic is advisory, do not code-golf. |
+| Total WU7 | **710–1,120** | **306 merged + 1449 WU7-B work-unit** | Evidence-only tracker closure commit does not change runtime scope. |
 
 ## Review assessment placeholders
 
 | Assessment | Current value |
 |---|---|
 | Review-load risk | WU7-A is 306 authored lines and below the 400-line heuristic; broader WU7 remains high by forecast |
-| Review due | WU7-A Slice 1 is ready for delivery assessment; native review was not run |
+| Review due | WU7-A Slice 1 merged after native Claude review; WU7-B candidate `938edad` approved/acknowledged under `review-e1989d51d986e786`. Parent assessed both correction commits `60269b6..4a164af` against the prior reviewed boundary as medium risk, `review_due=false`, `under_budget` (6 paths, 285 changed lines). No review of those corrections has started. |
 | Proposed review order | WU7-A child/config contract → readiness/retry ownership → production injection → E2E/restart proof → operator docs |
-| Smallest honest boundary | WU7-A is a coherent child/config assembly slice; WU7-B remains a separate runtime/recovery/docs slice |
-| Native review lineage | None started; native review is explicitly out of scope for setup |
-| Findings/corrections | Placeholder for reviewer assessment; implementation checks required only an alias-order correction |
-| Final reviewer disposition | Pending |
-| Delivery exception | None; maintainer selected two stacked PR slices with `stacked-to-main` |
+| Smallest honest boundary | WU7-A child/config assembly is merged; WU7-B runtime/recovery/docs is one coherent but over-heuristic unit, accepted without splitting tests/docs away from behavior |
+| Native review lineage | WU7-A approved/acknowledged; WU7-B `review-e1989d51d986e786` approved/acknowledged at candidate `938edad`. Do not reuse old authority for the correction. |
+| Findings/corrections | Three nonblocking warnings accepted for local correction: readiness channel leak on exit, overbroad topology exit classification, and publisher nil-channel shutdown. Known-response publisher test suggestion deferred. |
+| Final reviewer disposition | WU7-B candidate at `938edad` approved/acknowledged; later reliability corrections are unreviewed and below the native review threshold. |
+| Delivery exception | No delivery exception granted or requested; WU7-B exceeds the advisory 400-line review heuristic (1449 authored lines) and remains local. Any future PR sizing decision needs separate authorization. |
 
 ## Tracker progress
 
 | Item | Status | Evidence |
 |---|---|---|
-| Branch synchronization | Complete | `feat/dlr-handling-wu7` created from `main@b980d4ebd7e5f004f2e3cebc657f87e9d9812d78` after fast-forward-only update from `origin/main` |
+| Branch synchronization | Complete | Local `feat/dlr-handling-wu7b` at merged `origin/main@da4c3a6631a6785269b66d8b488ab3b789c7dbb3`; published WU7-A branch untouched |
 | Delegated mapping/preparation | Complete | Route and mapped facts recorded above |
-| Stable top-level tasks | 1 complete, 1 blocked | WU7-A complete; WU7-B blocked until WU7-A delivery |
+| Stable top-level tasks | 2 implemented locally, 1 merged | WU7-A merged as PR #82; WU7-B committed locally and not delivered remotely |
 | Delivery choice | Complete | Two stacked PR slices with `stacked-to-main`; WU7-A targets `main` |
-| Source changes | WU7-A complete | Optional DLR supervisor and application dependency assembly only |
-| Tests | Passed | Focused 8/8; full suite 684 passing with 26 excluded |
-| Documentation | Not started | `docs/dlr-handling.md` belongs to WU7-B |
-| Commits | 2 planned/completed | Planning `256617f`; WU7-A implementation recorded as `this commit` pending commit creation |
-| Remote delivery | None | No push or PR authorized |
-| Native review | None | Explicitly excluded |
+| Source changes | WU7-B implemented and committed locally | Readiness/topology retry, channel cleanup, connector/HTTP injection and broker-owned settlement in `aabe813`; tracker evidence in `914e5d3` |
+| Tests | WU7-B and accepted review follow-up gates passed locally | E2E 2 passed with broker/Valkey outages and terminal budgets, actual broker topology 4 passed after wrapped-exit correction, regular suite 697 passed / 29 excluded; formatter/Credo/Dialyzer/`git diff --check` exit 0 |
+| Documentation | Complete and committed locally | `docs/dlr-handling.md` verified against implementation and integration observations in `aabe813` |
+| Commits | WU7-A merged; WU7-B and reliability corrections committed locally | WU7-A in `origin/main@da4c3a6`; WU7-B `aabe813`, tracker evidence `914e5d3`, reconciliation `938edad`, reliability fixes `60269b6` and `4a164af` |
+| Remote delivery | WU7-A PR #82 merged | Four checks succeeded; no WU7-B push or PR authorized |
+| Native review | WU7-A and WU7-B candidate approved/acknowledged | WU7-B review lineage `review-e1989d51d986e786` reported three nonblocking warnings; accepted local correction verified, no new review in this task |
 
 ## Next step
 
-Deliver WU7-A as Slice 1 targeting `main`. Keep WU7-B blocked until WU7-A merges,
-then rebase the WU7-B branch onto the updated `main` boundary before implementation.
+Local WU7-B is implemented and verified at the reviewed boundary. The accepted
+reliability follow-up is committed and locally verified; the publisher nil-channel
+path was already safe and is now regression-tested. Native assessment of the
+unreviewed correction range is `medium/under_budget`; it did not open a new review.
+Preserve existing `.v1` queues. Push, PR creation, native review, and any
+delivery-strategy exception require separate authorization; none is included here.

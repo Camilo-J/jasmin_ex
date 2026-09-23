@@ -3,6 +3,7 @@ defmodule JasminEx.Dlr.ApplicationTest do
 
   alias JasminEx.Application
   alias JasminEx.Dlr.Config
+  alias JasminEx.Dlr.Readiness
   alias JasminEx.Dlr.Supervisor, as: DlrSupervisor
   alias JasminEx.Messaging.RabbitMQ.Connection
   alias JasminEx.Messaging.RabbitMQ.Supervisor, as: MessagingSupervisor
@@ -17,6 +18,85 @@ defmodule JasminEx.Dlr.ApplicationTest do
     username: "app",
     password: "secret"
   ]
+
+  defmodule ReadinessClient do
+    def open_channel(agent) do
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      ref = Process.monitor(pid)
+      Agent.update(agent, &Map.merge(&1, %{channel_pid: pid, channel_ref: ref}))
+      {:ok, %{pid: pid, agent: agent}}
+    end
+
+    def declare_exchange(_channel, _name, _type, _opts), do: :ok
+
+    def declare_queue(%{agent: agent}, name, _opts) do
+      if Agent.get(agent, &Map.get(&1, :exit_on_declare, false)) do
+        exit(:simulated_disconnect)
+      else
+        {:ok, %{queue: name}}
+      end
+    end
+
+    def bind_queue(_channel, _queue, _exchange, _opts), do: :ok
+
+    def close_channel(%{pid: pid, agent: agent}) do
+      Process.exit(pid, :shutdown)
+      Agent.update(agent, &Map.put(&1, :closed, true))
+      :ok
+    end
+  end
+
+  test "readiness closes a newly opened channel when worker startup exits" do
+    {:ok, agent} = Agent.start_link(fn -> %{closed: false, channel_pid: nil} end)
+
+    connection_server =
+      spawn(fn ->
+        receive do
+          {:"$gen_call", from, :get} -> GenServer.reply(from, {:ok, agent})
+        end
+      end)
+
+    opts = [
+      config: Config.new(enabled: true),
+      connection_server: connection_server,
+      client: ReadinessClient,
+      owner: :missing_dlr_supervisor,
+      publisher: {TestPublisher, :unused},
+      store: {TestStore, :unused},
+      http_client: {TestClient, []}
+    ]
+
+    {:ok, state} = Readiness.init(opts)
+    assert {:noreply, retried} = Readiness.handle_info(:declare, state)
+    assert match?({:broker, _}, retried.error)
+    assert Agent.get(agent, & &1.closed)
+    {channel_pid, ref} = Agent.get(agent, &{&1.channel_pid, &1.channel_ref})
+    assert_receive {:DOWN, ^ref, :process, ^channel_pid, :shutdown}
+  end
+
+  test "readiness closes an opened channel when topology declaration exits" do
+    {:ok, agent} = Agent.start_link(fn -> %{closed: false, exit_on_declare: true} end)
+
+    connection_server =
+      spawn(fn ->
+        receive do
+          {:"$gen_call", from, :get} -> GenServer.reply(from, {:ok, agent})
+        end
+      end)
+
+    {:ok, state} =
+      Readiness.init(
+        config: Config.new(enabled: true),
+        connection_server: connection_server,
+        client: ReadinessClient
+      )
+
+    assert {:noreply, retried} = Readiness.handle_info(:declare, state)
+    assert retried.error == {:broker, :simulated_disconnect}
+    assert Agent.get(agent, & &1.closed)
+    {channel_pid, ref} = Agent.get(agent, &{&1.channel_pid, &1.channel_ref})
+    assert_receive {:DOWN, ^ref, :process, ^channel_pid, :shutdown}
+  end
 
   test "omits DLR supervision when DLR config is absent or disabled" do
     refute Enum.any?(Application.children([]), &dlr_child?/1)
@@ -51,7 +131,49 @@ defmodule JasminEx.Dlr.ApplicationTest do
     assert {StateStore, %{connection: JasminEx.StateStore.Connection}} = dlr_opts[:store]
     assert dlr_opts[:connection_server] == Connection
     assert dlr_opts[:publisher] == {TopicPublisher, TopicPublisher}
+    assert dlr_opts[:messaging_config].host == "broker.example"
+    assert dlr_opts[:http_client] == {JasminEx.Dlr.HttpClient.Mint, []}
     assert Enum.count(children, &dlr_child?/1) == 1
+  end
+
+  test "explicit test-only callback approval reaches the DLR boundary without changing defaults" do
+    client = {JasminEx.Dlr.HttpClient.Mint, [allow: [{"callback.test", {127, 0, 0, 1}}]]}
+
+    assert {DlrSupervisor, opts} =
+             Application.children(
+               messaging: @messaging,
+               dlr: [enabled: true, http_client: client]
+             )
+             |> Enum.find(&dlr_child?/1)
+
+    assert opts[:http_client] == client
+  end
+
+  test "enabled DLR injects both connector receipt and known-response publishers" do
+    connector = [
+      connector_id: "c1",
+      host: ~c"127.0.0.1",
+      port: 2775,
+      system_id: "u",
+      password: "p",
+      system_type: "t",
+      bind_as: :transceiver
+    ]
+
+    assert {ConnectorSupervisor, [configured]} =
+             Application.children(
+               messaging: @messaging,
+               dlr: [enabled: true],
+               smpp_connectors: [connector]
+             )
+             |> Enum.find(fn
+               {module, _opts} -> module == ConnectorSupervisor
+               _ -> false
+             end)
+
+    assert configured[:dlr_enabled] == true
+    assert configured[:dlr_publisher] == {TopicPublisher, TopicPublisher}
+    assert is_function(configured[:dlr_known_publisher], 2)
   end
 
   test "passes only explicit DLR dependency overrides" do

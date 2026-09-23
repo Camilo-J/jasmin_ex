@@ -1,6 +1,7 @@
 defmodule JasminEx.Messaging.RabbitMQ.TopicTopology do
   @moduledoc false
 
+  alias JasminEx.Dlr.Config
   alias JasminEx.Messaging.RabbitMQ.Client
 
   @exchange "messaging"
@@ -28,11 +29,28 @@ defmodule JasminEx.Messaging.RabbitMQ.TopicTopology do
   def declare(channel, opts) when is_list(opts) do
     client = Keyword.get(opts, :client, Client)
     names = names(Keyword.fetch!(opts, :prefix))
+    config = Keyword.get(opts, :config, %Config{})
 
     with :ok <- client.declare_exchange(channel, names.exchange, :topic, durable: true),
          :ok <- client.declare_exchange(channel, names.dlx, :fanout, durable: true),
-         {:ok, _} <- retry_queue(client, channel, names.lookup, lookup_arguments(names.dlx)),
-         {:ok, _} <- retry_queue(client, channel, names.http, http_arguments(names.dlx)),
+         {:ok, _} <-
+           retry_queue(
+             client,
+             channel,
+             names.lookup,
+             retry_arguments(
+               names.dlx,
+               config.lookup_delay_ms,
+               config.lookup_additional_attempts + 1
+             )
+           ),
+         {:ok, _} <-
+           retry_queue(
+             client,
+             channel,
+             names.http,
+             retry_arguments(names.dlx, config.http_delay_ms, config.http_additional_attempts + 1)
+           ),
          {:ok, _} <- client.declare_queue(channel, names.dead, queue_opts(dead_arguments())),
          :ok <- client.bind_queue(channel, names.lookup, names.exchange, routing_key: "dlr.*"),
          :ok <-
@@ -58,7 +76,25 @@ defmodule JasminEx.Messaging.RabbitMQ.TopicTopology do
   defp retry_queue(client, channel, name, args) do
     case client.declare_queue(channel, name, queue_opts(args)) do
       {:ok, _} = ok -> ok
-      {:error, _reason} -> {:error, :delayed_retry_unsupported}
+      {:error, {:inequivalent_arguments, _detail}} -> {:error, :incompatible_queue_arguments}
+      {:error, reason} -> {:error, classify_declaration_failure(reason)}
+    end
+  end
+
+  def classify_declaration_failure(reason) do
+    case reason do
+      {{:shutdown, {:server_initiated_close, 406, _detail}} = close, {:gen_server, :call, _args}} ->
+        classify_declaration_failure(close)
+
+      {:shutdown, {:server_initiated_close, 406, detail}} when is_binary(detail) ->
+        cond do
+          String.contains?(detail, "inequivalent arg") -> :incompatible_queue_arguments
+          String.contains?(detail, "x-delayed-retry") -> :delayed_retry_unsupported
+          true -> {:broker, reason}
+        end
+
+      _ ->
+        {:broker, reason}
     end
   end
 

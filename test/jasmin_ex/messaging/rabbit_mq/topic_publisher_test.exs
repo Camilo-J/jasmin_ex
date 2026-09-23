@@ -174,6 +174,17 @@ defmodule JasminEx.Messaging.RabbitMQ.TopicPublisherTest do
     stop(pub, agent)
   end
 
+  test "shutdown with no channel after connection loss is clean", %{config: config} do
+    agent = Fake.start(%{wait_for_confirms: :channel_down})
+    {:ok, pub} = start(config, agent)
+
+    assert {:ambiguous, :channel_closed} = TopicPublisher.publish(pub, "dlr.deliver_sm", "body")
+    assert :sys.get_state(pub).channel == nil
+    assert :ok = GenServer.stop(pub)
+    assert {:close_channel, 1} in Fake.events(agent)
+    Agent.stop(agent)
+  end
+
   defp start(config, agent) do
     TopicPublisher.start_link(
       config: config,
