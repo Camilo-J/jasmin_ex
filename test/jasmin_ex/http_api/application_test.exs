@@ -2,6 +2,7 @@ defmodule JasminEx.HttpApi.ApplicationTest do
   use ExUnit.Case, async: true
 
   alias JasminEx.Application
+  alias JasminEx.Dlr.Config, as: DlrConfig
   alias JasminEx.HttpApi.Supervisor, as: HttpSupervisor
   alias JasminEx.Smpp.ConnectorSupervisor
   alias JasminEx.Smpp.Server.Supervisor, as: ServerSupervisor
@@ -42,6 +43,28 @@ defmodule JasminEx.HttpApi.ApplicationTest do
            ] = Application.children(http_api: [enabled: true, port: 1401])
 
     assert no_smpp[:config].port == 1401
+    refute Keyword.has_key?(no_smpp, :dlr_store)
+    refute Keyword.has_key?(no_smpp, :dlr_config)
+  end
+
+  test "passes enabled DLR store and config dependencies to HTTP API" do
+    store = {TestStore, :store_context}
+
+    children =
+      Application.children(
+        messaging: [
+          enabled: true,
+          host: "broker.example",
+          username: "app",
+          password: "secret"
+        ],
+        dlr: [enabled: true, store: store],
+        http_api: [enabled: true, port: 0]
+      )
+
+    assert {HttpSupervisor, opts} = List.last(children)
+    assert opts[:dlr_store] == store
+    assert %DlrConfig{enabled: true} = opts[:dlr_config]
   end
 
   defp http_child?({HttpSupervisor, _opts}), do: true
