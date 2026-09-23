@@ -114,7 +114,12 @@ defmodule JasminEx.Messaging.RabbitMQ.TopicTopologyTest do
   end
 
   test "declare fails closed when delayed-retry arguments are rejected" do
-    agent = Fake.start(%{declare_queue: {:error, :precondition_failed}})
+    reason =
+      {:shutdown,
+       {:server_initiated_close, 406,
+        "PRECONDITION_FAILED - unsupported arg 'x-delayed-retry-type' for quorum queue"}}
+
+    agent = Fake.start(%{declare_queue: {:error, reason}})
     channel = Fake.channel(agent)
 
     assert {:error, :delayed_retry_unsupported} =
@@ -124,14 +129,32 @@ defmodule JasminEx.Messaging.RabbitMQ.TopicTopologyTest do
     refute Enum.any?(events, fn event -> classic_declare?(event) end)
   end
 
-  test "declare does not fall back to classic queues on topology failure" do
-    agent = Fake.start(%{declare_queue: {:error, :channel_closed}})
-    channel = Fake.channel(agent)
+  test "returned transient queue failures retain their broker reason without fallback" do
+    for reason <- [:channel_closed, :disconnected, :timeout] do
+      agent = Fake.start(%{declare_queue: {:error, reason}})
 
-    assert {:error, :delayed_retry_unsupported} =
-             TopicTopology.declare(channel, prefix: "jasmin_ex.dlr", client: Fake)
+      assert {:error, {:broker, ^reason}} =
+               TopicTopology.declare(Fake.channel(agent),
+                 prefix: "jasmin_ex.dlr",
+                 client: Fake
+               )
 
-    refute Enum.any?(Fake.events(agent), &classic_declare?/1)
+      events = Fake.events(agent)
+      assert Enum.count(events, &match?({:declare_queue, _, _}, &1)) == 1
+      refute Enum.any?(events, &classic_declare?/1)
+    end
+  end
+
+  test "returned inequivalent queue arguments stay explicit without redeclaration" do
+    agent =
+      Fake.start(%{declare_queue: {:error, {:inequivalent_arguments, "x-delayed-retry-min"}}})
+
+    assert {:error, :incompatible_queue_arguments} =
+             TopicTopology.declare(Fake.channel(agent), prefix: "jasmin_ex.dlr", client: Fake)
+
+    events = Fake.events(agent)
+    assert Enum.count(events, &match?({:declare_queue, _, _}, &1)) == 1
+    refute Enum.any?(events, &classic_declare?/1)
   end
 
   test "durable v1 queue argument mismatch is explicit and does not trigger migration" do

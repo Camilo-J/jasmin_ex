@@ -449,13 +449,15 @@ the original WU7-B implementation evidence. Do not bind or change the old review
 
 - [x] Close a readiness AMQP channel if topology declaration exits after opening it;
       retries must not accumulate orphan channels.
-- [x] Classify transient declaration exits as broker/transient errors, while
+- [x] Classify transient declaration exits and returned errors as broker/transient errors, while
       preserving explicit inequivalent-argument and unsupported quorum delayed-retry
       errors, with no classic fallback or queue deletion.
 - [x] Verify DLR topic publisher shutdown when its channel is nil. The existing
       `close(%{channel: nil})` clause already avoids `ch.pid`; the regression test
       passed before source changes, so no publisher source change was justified.
-- [x] Observe focused RED for changed behavior, then GREEN and REFACTOR; run the exact
+- [x] Record observed RED for changed classification and the earlier readiness
+      injection boundary without claiming an observed readiness leak RED; then
+      GREEN and REFACTOR. Run the exact
       application, topology, publisher, E2E, full suite, formatter, Credo, Dialyzer,
       and `git diff --check` gates before committing the correction.
 
@@ -477,6 +479,31 @@ Publisher baseline GREEN `mix test
 test/jasmin_ex/messaging/rabbit_mq/topic_publisher_test.exs`, exit 0, 7 passed,
 including shutdown with a nil channel after connection loss. No RED is claimed
 for that pre-existing safe behavior. `mix format` ran before final checks.
+
+The parent independently found a missed returned-error branch in `retry_queue/4`
+after commit `60269b6`: `{:error, :channel_closed}` and other returned transients
+still mapped to `:delayed_retry_unsupported`. This is the same accepted
+classification warning, not a new top-level task. A focused test first observed
+RED: `mix test test/jasmin_ex/messaging/rabbit_mq/topic_topology_test.exs`, exit 2,
+8/9 passed, 4 excluded; returned `:channel_closed` was mislabeled unsupported.
+Using the existing exit classifier for returned errors produced GREEN (9 passed,
+4 excluded) for `:channel_closed`, `:disconnected`, `:timeout`, explicit unsupported
+delayed retry, and inequivalent arguments, with one declaration only and no
+classic fallback. `mix format` ran before the repeated checks below. No queue
+deletion or migration was added. The readiness RED remains limited to the
+injection boundary; publisher nil shutdown was already safe on baseline.
+
+| Returned-error follow-up gate | Observed result |
+|---|---|
+| `mix test test/jasmin_ex/messaging/rabbit_mq/topic_topology_test.exs` | Exit 0; 9 passed, 4 integration excluded. |
+| `mix test test/jasmin_ex/dlr/application_test.exs` | Exit 0; 9 passed. |
+| `mix test test/jasmin_ex/messaging/rabbit_mq/topic_publisher_test.exs` | Exit 0; 7 passed. |
+| `mix test --only integration test/jasmin_ex/dlr/e2e_test.exs` | Exit 0; 2 passed. |
+| `mix test` | Exit 0; 696 passed (1 doctest, 695 tests), 29 excluded. |
+| `mix format --check-formatted` | Exit 0; no output. |
+| `mix credo --strict` | Exit 0; 178 files, 2515 mods/funs, no issues. |
+| `mix dialyzer` | Exit 0; 0 errors, 0 skipped, 0 unnecessary skips. |
+| `git diff --check` | Exit 0; no output. |
 
 | Follow-up gate | Observed result |
 |---|---|
@@ -601,7 +628,7 @@ and rollback boundaries must be recorded before a task is marked complete.
 | Assessment | Current value |
 |---|---|
 | Review-load risk | WU7-A is 306 authored lines and below the 400-line heuristic; broader WU7 remains high by forecast |
-| Review due | WU7-A Slice 1 merged after native Claude review; WU7-B candidate `938edad` approved/acknowledged under `review-e1989d51d986e786`. Accepted local reliability follow-up verified; later reassessment belongs to the parent. |
+| Review due | WU7-A Slice 1 merged after native Claude review; WU7-B candidate `938edad` approved/acknowledged under `review-e1989d51d986e786`. Parent assessed correction commit `60269b6` as medium risk, `under_budget` against that prior reviewed boundary; the returned-error correction creates another candidate requiring parent reassessment. |
 | Proposed review order | WU7-A child/config contract → readiness/retry ownership → production injection → E2E/restart proof → operator docs |
 | Smallest honest boundary | WU7-A child/config assembly is merged; WU7-B runtime/recovery/docs is one coherent but over-heuristic unit, accepted without splitting tests/docs away from behavior |
 | Native review lineage | WU7-A approved/acknowledged; WU7-B `review-e1989d51d986e786` approved/acknowledged at candidate `938edad`. Do not reuse old authority for the correction. |

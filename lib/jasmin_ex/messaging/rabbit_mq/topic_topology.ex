@@ -77,7 +77,7 @@ defmodule JasminEx.Messaging.RabbitMQ.TopicTopology do
     case client.declare_queue(channel, name, queue_opts(args)) do
       {:ok, _} = ok -> ok
       {:error, {:inequivalent_arguments, _detail}} -> {:error, :incompatible_queue_arguments}
-      {:error, _reason} -> {:error, :delayed_retry_unsupported}
+      {:error, reason} -> {:error, classify_declaration_failure(reason)}
     end
   end
 
