@@ -8,10 +8,12 @@ defmodule JasminEx.Dlr.RetryPolicy do
   def delay_ms(kind) when is_map_key(@delay_ms, kind), do: @delay_ms[kind]
   def total_attempts(kind), do: additional_attempts(kind) + 1
 
-  def failures(kind, meta) do
+  def failures(kind, meta, additional \\ nil) do
+    additional = additional || additional_attempts(kind)
+
     with {:ok, delivery} <- delivery_count(meta),
          {:ok, acquired} <- acquired_count(meta) do
-      if acquired > total_attempts(kind) * 10 do
+      if acquired > (additional + 1) * 10 do
         {:error, :exhausted}
       else
         {:ok, delivery}
@@ -19,10 +21,14 @@ defmodule JasminEx.Dlr.RetryPolicy do
     end
   end
 
-  def settle(kind, meta, :retry) do
-    case failures(kind, meta) do
+  def settle(kind, meta, outcome, additional \\ nil)
+
+  def settle(kind, meta, :retry, additional) do
+    additional = additional || additional_attempts(kind)
+
+    case failures(kind, meta, additional) do
       {:ok, count} ->
-        if count < additional_attempts(kind),
+        if count < additional,
           do: {:reject, requeue: true},
           else: {:reject, requeue: false}
 
@@ -31,8 +37,8 @@ defmodule JasminEx.Dlr.RetryPolicy do
     end
   end
 
-  def settle(_kind, _meta, :ok), do: :ack
-  def settle(_kind, _meta, :terminal), do: {:reject, requeue: false}
+  def settle(_kind, _meta, :ok, _additional), do: :ack
+  def settle(_kind, _meta, :terminal, _additional), do: {:reject, requeue: false}
 
   defp delivery_count(meta) do
     typed_count(meta, "x-delivery-count", required_on_redelivery?(meta))

@@ -239,7 +239,11 @@ defmodule JasminEx.Smpp.ConnectorSupervisor.Instance do
                Keyword.get(opts, :dlr_enabled, Keyword.get(messaging, :dlr_enabled, false)),
              dlr_outcome_ttl_ms: SettlementJournal.outcome_retention_ms(client_config.dlr_expiry),
              dlr_publisher:
-               Keyword.get(opts, :dlr_publisher, Keyword.get(messaging, :dlr_publisher))
+               Keyword.get(
+                 opts,
+                 :dlr_known_publisher,
+                 Keyword.get(opts, :dlr_publisher, Keyword.get(messaging, :dlr_publisher))
+               )
            ],
            connector_id
          ]},

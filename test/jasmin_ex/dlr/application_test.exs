@@ -51,7 +51,49 @@ defmodule JasminEx.Dlr.ApplicationTest do
     assert {StateStore, %{connection: JasminEx.StateStore.Connection}} = dlr_opts[:store]
     assert dlr_opts[:connection_server] == Connection
     assert dlr_opts[:publisher] == {TopicPublisher, TopicPublisher}
+    assert dlr_opts[:messaging_config].host == "broker.example"
+    assert dlr_opts[:http_client] == {JasminEx.Dlr.HttpClient.Mint, []}
     assert Enum.count(children, &dlr_child?/1) == 1
+  end
+
+  test "explicit test-only callback approval reaches the DLR boundary without changing defaults" do
+    client = {JasminEx.Dlr.HttpClient.Mint, [allow: [{"callback.test", {127, 0, 0, 1}}]]}
+
+    assert {DlrSupervisor, opts} =
+             Application.children(
+               messaging: @messaging,
+               dlr: [enabled: true, http_client: client]
+             )
+             |> Enum.find(&dlr_child?/1)
+
+    assert opts[:http_client] == client
+  end
+
+  test "enabled DLR injects both connector receipt and known-response publishers" do
+    connector = [
+      connector_id: "c1",
+      host: ~c"127.0.0.1",
+      port: 2775,
+      system_id: "u",
+      password: "p",
+      system_type: "t",
+      bind_as: :transceiver
+    ]
+
+    assert {ConnectorSupervisor, [configured]} =
+             Application.children(
+               messaging: @messaging,
+               dlr: [enabled: true],
+               smpp_connectors: [connector]
+             )
+             |> Enum.find(fn
+               {module, _opts} -> module == ConnectorSupervisor
+               _ -> false
+             end)
+
+    assert configured[:dlr_enabled] == true
+    assert configured[:dlr_publisher] == {TopicPublisher, TopicPublisher}
+    assert is_function(configured[:dlr_known_publisher], 2)
   end
 
   test "passes only explicit DLR dependency overrides" do

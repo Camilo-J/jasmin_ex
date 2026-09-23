@@ -33,6 +33,9 @@ defmodule JasminEx.RabbitMQHarness do
     wait!(harness)
   end
 
+  def stop_broker!(harness), do: run!(harness, ["stop", "rabbitmq"])
+  def start_broker!(harness), do: wait!(harness)
+
   def record_durable_restart(harness, observations) when is_map(observations) do
     report =
       JasminEx.RabbitMQMeasurements.record(

@@ -1,6 +1,7 @@
 defmodule JasminEx.Messaging.RabbitMQ.TopicTopologyTest do
   use ExUnit.Case, async: true
 
+  alias JasminEx.Dlr.Config
   alias JasminEx.Messaging.RabbitMQ.TopicTopology
 
   defmodule Fake do
@@ -82,6 +83,36 @@ defmodule JasminEx.Messaging.RabbitMQ.TopicTopologyTest do
     assert arg(args, "x-delayed-retry-type") == nil
   end
 
+  test "configured retry budgets and delays determine declared queue arguments" do
+    agent = Fake.start(%{})
+
+    config =
+      Config.new(
+        enabled: true,
+        lookup_additional_attempts: 4,
+        lookup_delay_ms: 125,
+        http_additional_attempts: 5,
+        http_delay_ms: 250
+      )
+
+    assert :ok =
+             TopicTopology.declare(Fake.channel(agent),
+               prefix: "configured.dlr",
+               client: Fake,
+               config: config
+             )
+
+    queues =
+      for {:declare_queue, name, opts} <- Fake.events(agent),
+          into: %{},
+          do: {name, opts[:arguments]}
+
+    assert arg(queues["configured.dlr.lookup.v1"], "x-delayed-retry-min") == 125
+    assert arg(queues["configured.dlr.lookup.v1"], "x-delivery-limit") == 5
+    assert arg(queues["configured.dlr.http.v1"], "x-delayed-retry-min") == 250
+    assert arg(queues["configured.dlr.http.v1"], "x-delivery-limit") == 6
+  end
+
   test "declare fails closed when delayed-retry arguments are rejected" do
     agent = Fake.start(%{declare_queue: {:error, :precondition_failed}})
     channel = Fake.channel(agent)
@@ -101,6 +132,16 @@ defmodule JasminEx.Messaging.RabbitMQ.TopicTopologyTest do
              TopicTopology.declare(channel, prefix: "jasmin_ex.dlr", client: Fake)
 
     refute Enum.any?(Fake.events(agent), &classic_declare?/1)
+  end
+
+  test "durable v1 queue argument mismatch is explicit and does not trigger migration" do
+    reason =
+      {:shutdown,
+       {:server_initiated_close, 406,
+        "PRECONDITION_FAILED - inequivalent arg 'x-delayed-retry-min' for queue 'configured.dlr.lookup.v1'"}}
+
+    assert TopicTopology.classify_declaration_failure(reason) == :incompatible_queue_arguments
+    assert TopicTopology.classify_declaration_failure(:disconnected) == :delayed_retry_unsupported
   end
 
   defp arg(args, name) do
@@ -124,6 +165,7 @@ defmodule JasminEx.Messaging.RabbitMQ.TopicTopologyIntegrationTest do
 
   @moduletag :integration
 
+  alias JasminEx.Dlr.Config, as: DlrConfig
   alias JasminEx.Messaging.RabbitMQ.{Client, Config, TopicTopology}
   alias JasminEx.RabbitMQHarness
 
@@ -164,6 +206,39 @@ defmodule JasminEx.Messaging.RabbitMQ.TopicTopologyIntegrationTest do
       end
 
     assert match?({:error, _}, result)
+  end
+
+  test "configured argument mismatch retains the original durable quorum queues", %{
+    ch: ch,
+    conn: conn,
+    prefix: prefix
+  } do
+    assert :ok = TopicTopology.declare(ch, prefix: prefix, client: Client)
+    assert :ok = Client.select_confirms(ch)
+
+    assert :ok =
+             Client.publish(ch, "messaging", "dlr.submit_sm_resp", "preserved",
+               mandatory: true,
+               persistent: true
+             )
+
+    assert true = Client.wait_for_confirms(ch, 2_000)
+
+    changed = DlrConfig.new(enabled: true, lookup_delay_ms: 125)
+
+    reason =
+      try do
+        TopicTopology.declare(ch, prefix: prefix, config: changed, client: Client)
+      catch
+        :exit, error -> error
+      end
+
+    assert TopicTopology.classify_declaration_failure(reason) == :incompatible_queue_arguments
+    {:ok, check} = Client.open_channel(conn)
+    names = TopicTopology.names(prefix)
+    assert {:ok, %{message_count: 1}} = Client.declare_queue(check, names.lookup, passive: true)
+    assert {:ok, _} = Client.declare_queue(check, names.http, passive: true)
+    assert {:ok, _} = Client.declare_queue(check, names.dead, passive: true)
   end
 
   test "lookup binds dlr.* and HTTP binds dlr_thrower.http", %{ch: ch, prefix: prefix} do

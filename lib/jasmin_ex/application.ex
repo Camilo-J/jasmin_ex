@@ -6,6 +6,7 @@ defmodule JasminEx.Application do
   use Application
 
   alias JasminEx.Dlr.Config, as: DlrConfig
+  alias JasminEx.Dlr.Event, as: DlrEvent
   alias JasminEx.Dlr.Supervisor, as: DlrSupervisor
   alias JasminEx.HttpApi
   alias JasminEx.Messaging.RabbitMQ.Config, as: MessagingConfig
@@ -31,7 +32,7 @@ defmodule JasminEx.Application do
       [routing_child(Keyword.get(config, :routing, []))] ++
       messaging_children(messaging_options) ++
       dlr_children(dlr_options) ++
-      smpp_children(config) ++
+      smpp_children(config, dlr_options) ++
       smpp_server_children(config) ++
       http_api_children(config, dlr_options)
   end
@@ -109,7 +110,9 @@ defmodule JasminEx.Application do
           store:
             Keyword.get(options, :store, {StateStore, StateStore.context(state_store_config)}),
           connection_server: Keyword.get(options, :connection_server, MessagingConnection),
-          publisher: Keyword.get(options, :publisher, {TopicPublisher, TopicPublisher})
+          publisher: Keyword.get(options, :publisher, {TopicPublisher, TopicPublisher}),
+          messaging_config: MessagingConfig.new!(messaging_options),
+          http_client: Keyword.get(options, :http_client, {JasminEx.Dlr.HttpClient.Mint, []})
         ]
         |> DlrSupervisor.validate_options!()
 
@@ -134,11 +137,65 @@ defmodule JasminEx.Application do
   defp dlr_children([]), do: []
   defp dlr_children(options), do: [{DlrSupervisor, options}]
 
-  defp smpp_children(config) do
+  defp smpp_children(config, dlr_options) do
     case Keyword.get(config, :smpp_connectors, []) do
       [] -> []
-      connectors -> [{ConnectorSupervisor, connectors}]
+      connectors when dlr_options == [] -> [{ConnectorSupervisor, connectors}]
+      connectors -> [{ConnectorSupervisor, inject_connectors(connectors, dlr_options)}]
     end
+  end
+
+  defp inject_connectors(connectors, dlr_options) do
+    publisher = Keyword.fetch!(dlr_options, :publisher)
+    expiry = Keyword.fetch!(dlr_options, :config).dlr_expiry_s
+
+    known_publisher = fn key, payload ->
+      with "dlr.submit_sm_resp" <- key,
+           {:ok, event} <- known_event(payload, expiry),
+           {:ok, encoded} <- DlrEvent.encode(event),
+           {module, context} <- publisher do
+        module.publish(context, key, encoded)
+      else
+        _ -> {:error, :invalid_dlr_event}
+      end
+    end
+
+    inject = fn
+      opts when is_list(opts) ->
+        opts
+        |> Keyword.put_new(:dlr_enabled, true)
+        |> Keyword.put_new(:dlr_expiry, expiry)
+        |> Keyword.put_new(:dlr_publisher, publisher)
+        |> Keyword.put_new(:dlr_known_publisher, known_publisher)
+
+      opts when is_map(opts) ->
+        opts
+        |> Map.put_new(:dlr_enabled, true)
+        |> Map.put_new(:dlr_expiry, expiry)
+        |> Map.put_new(:dlr_publisher, publisher)
+        |> Map.put_new(:dlr_known_publisher, known_publisher)
+    end
+
+    if Keyword.keyword?(connectors), do: inject.(connectors), else: Enum.map(connectors, inject)
+  end
+
+  defp known_event(payload, expiry) do
+    known = :json.decode(payload)
+    now = known["observed_at_ms"]
+
+    {:ok,
+     %{
+       kind: :submit_sm_resp,
+       gateway_id: known["gateway_id"],
+       connector_id: known["connector_id"],
+       attempt: known["attempt"],
+       status: known["status"],
+       raw_smsc_id: known["smsc_id"],
+       observed_at_ms: now,
+       deadline_ms: now + expiry * 1000
+     }}
+  rescue
+    _ -> {:error, :invalid_dlr_event}
   end
 
   defp smpp_server_children(config) do

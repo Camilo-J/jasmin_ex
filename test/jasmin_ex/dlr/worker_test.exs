@@ -7,7 +7,14 @@ defmodule JasminEx.Dlr.WorkerTest do
     def start do
       {:ok, agent} =
         Agent.start_link(fn ->
-          %{events: [], next: 1, pids: %{}, consumers: %{}}
+          %{
+            events: [],
+            next: 1,
+            pids: %{},
+            consumers: %{},
+            fail_first: false,
+            fail_qos_once: false
+          }
         end)
 
       agent
@@ -19,21 +26,28 @@ defmodule JasminEx.Dlr.WorkerTest do
 
     def open_channel(%{agent: agent}) do
       id = Agent.get_and_update(agent, &{&1.next, %{&1 | next: &1.next + 1}})
-      pid = spawn(fn -> Process.sleep(:infinity) end)
-      track(agent, {:open_channel, id})
-      Agent.update(agent, &%{&1 | pids: Map.put(&1.pids, id, pid)})
-      {:ok, %{agent: agent, channel_id: id, pid: pid}}
+      fail? = Agent.get(agent, & &1.fail_first)
+
+      if fail? and id == 1 do
+        track(agent, {:open_failed, id})
+        {:error, :disconnected}
+      else
+        pid = spawn(fn -> Process.sleep(:infinity) end)
+        track(agent, {:open_channel, id})
+        Agent.update(agent, &%{&1 | pids: Map.put(&1.pids, id, pid)})
+        {:ok, %{agent: agent, channel_id: id, pid: pid}}
+      end
     end
 
     def close_channel(%{agent: agent, channel_id: id, pid: pid}) do
-      if Process.alive?(pid), do: Process.exit(pid, :shutdown)
+      if Process.alive?(pid), do: Process.exit(pid, :shutdown), else: exit(:noproc)
       track(agent, {:close_channel, id})
       :ok
     end
 
     def qos(%{agent: agent, channel_id: id}, opts) do
       track(agent, {:qos, id, opts})
-      :ok
+      if Agent.get(agent, & &1.fail_qos_once) and id == 1, do: {:error, :closed}, else: :ok
     end
 
     def consume(%{agent: agent, channel_id: id}, queue, consumer, opts) do
@@ -156,6 +170,116 @@ defmodule JasminEx.Dlr.WorkerTest do
     assert {:qos, 1, [prefetch_count: 1]} = find(events, :qos)
     assert {:ack, 1, 5} = find(events, :ack)
     stop(worker, agent)
+  end
+
+  test "initial connection failure retries and eventually subscribes without restarting the worker" do
+    agent = Fake.start()
+    Agent.update(agent, &%{&1 | fail_first: true})
+
+    {:ok, worker} =
+      Worker.start_link(
+        queue_kind: :lookup,
+        queue: "jasmin_ex.dlr.lookup.v1",
+        processor: fn _, _ -> :ok end,
+        client: Fake,
+        connection: Fake.connection(agent),
+        reconnect_backoff_ms: 25,
+        name: nil
+      )
+
+    assert {:open_failed, 1} in Fake.events(agent)
+    assert eventually(fn -> Enum.any?(Fake.events(agent), &match?({:consume, 2, _, _}, &1)) end)
+    stop(worker, agent)
+  end
+
+  test "a QoS setup failure closes its channel before retrying subscription" do
+    agent = Fake.start()
+    Agent.update(agent, &%{&1 | fail_qos_once: true})
+
+    {:ok, worker} =
+      Worker.start_link(
+        queue_kind: :lookup,
+        queue: "jasmin_ex.dlr.lookup.v1",
+        processor: fn _, _ -> :ok end,
+        client: Fake,
+        connection: Fake.connection(agent),
+        reconnect_backoff_ms: 25,
+        name: nil
+      )
+
+    assert eventually(fn -> Enum.any?(Fake.events(agent), &match?({:consume, 2, _, _}, &1)) end)
+    assert {:close_channel, 1} in Fake.events(agent)
+    refute Process.alive?(Fake.channel_pid(agent, 1))
+    stop(worker, agent)
+  end
+
+  test "configured additional attempts apply to redelivered lookup work" do
+    agent = Fake.start()
+
+    {:ok, worker} =
+      Worker.start_link(
+        queue_kind: :lookup,
+        queue: "jasmin_ex.dlr.lookup.v1",
+        processor: fn _, _ -> :retry end,
+        client: Fake,
+        connection: Fake.connection(agent),
+        additional_attempts: 5,
+        name: nil
+      )
+
+    send_deliver(worker, "dlr.deliver_sm", 8,
+      redelivered: true,
+      headers: [{"x-delivery-count", :long, 3}]
+    )
+
+    assert {:reject, 1, 8, requeue: true} = find(Fake.events(agent), :reject)
+    stop(worker, agent)
+  end
+
+  test "supervisor shutdown closes the worker channel instead of leaving an orphan consumer" do
+    agent = Fake.start()
+    connection = Fake.connection(agent)
+
+    {:ok, supervisor} =
+      Supervisor.start_link(
+        [
+          {Worker,
+           [
+             queue_kind: :lookup,
+             queue: "jasmin_ex.dlr.lookup.v1",
+             processor: fn _, _ -> :ok end,
+             client: Fake,
+             connection: connection,
+             name: nil
+           ]}
+        ],
+        strategy: :one_for_one
+      )
+
+    channel_pid = Fake.channel_pid(agent, 1)
+    assert Process.alive?(channel_pid)
+    :ok = Supervisor.stop(supervisor)
+    refute Process.alive?(channel_pid)
+    Agent.stop(agent)
+  end
+
+  defp eventually(predicate) do
+    deadline = System.monotonic_time(:millisecond) + 1_000
+    await(predicate, deadline)
+  end
+
+  defp await(predicate, deadline) do
+    cond do
+      predicate.() ->
+        true
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        false
+
+      true ->
+        Process.sleep(10)
+        await(predicate, deadline)
+    end
   end
 
   defp start_worker(kind, processor) do
