@@ -188,6 +188,10 @@ defmodule JasminEx.Messaging.RabbitMQ.TopicTopologyTest do
         {:server_initiated_close, 406,
          "PRECONDITION_FAILED - unsupported arg 'x-delayed-retry-type' for quorum queue"}}, call}
 
+    unknown =
+      {{:shutdown,
+        {:server_initiated_close, 406, "PRECONDITION_FAILED - unknown queue condition"}}, call}
+
     transient = {{:shutdown, :connection_closed}, call}
 
     assert TopicTopology.classify_declaration_failure(incompatible) ==
@@ -196,6 +200,7 @@ defmodule JasminEx.Messaging.RabbitMQ.TopicTopologyTest do
     assert TopicTopology.classify_declaration_failure(unsupported) ==
              :delayed_retry_unsupported
 
+    assert TopicTopology.classify_declaration_failure(unknown) == {:broker, unknown}
     assert TopicTopology.classify_declaration_failure(transient) == {:broker, transient}
   end
 
