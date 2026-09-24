@@ -1,0 +1,35 @@
+name: Capability or enhancement
+description: Suggest a new capability or improvement to existing behavior.
+labels: [capability]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem should this solve?
+      description: Describe the use case and the outcome you need.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: Which workflow or behavior should change? Mention any important boundaries you know of.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: What would success look like?
+      description: Describe observable behavior that would meet your need, without prescribing an implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Possible solution
+      description: Optional. Share an approach if you have one; a solution is not required to request a capability.
+  - type: textarea
+    id: context
+    attributes:
+      label: Dependencies or additional context
+      description: Optional. Link related work or describe known constraints.
