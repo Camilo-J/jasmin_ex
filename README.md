@@ -84,6 +84,42 @@ pinned durable/restart harness retains a complete metric baseline.
 
 Operations owns disposition. Retain with no TTL, replay, or automatic purge.
 
+### Envelope v2 (binary-safe queue payload)
+
+Queue encode now writes integer `version` 2. Wire `submit_sm` uses
+`short_message_base64` (standard padded canonical Base64). In-memory
+`submit_sm.short_message` stays a binary. v2 absent or JSON-null
+`data_coding` / `registered_delivery` default to 0. v1 JSON-null and
+`Envelope.new/1` `:null` for those fields stay invalid. This is queue
+serialization only; HTTP coding/hex/size validation and segmentation are
+not part of this change.
+
+A v1 reader rejects v2 with `:unsupported_version` and the worker rejects
+without requeue. Application work-queue declarations have no owned
+dead-letter exchange. Rejection does **not** automatically quarantine the
+message. Consumers that retry or quarantine also produce v2.
+
+#### Quick path
+
+1. Pause ingress and all consumers that read this envelope.
+2. Upgrade every reader before any process publishes v2.
+3. Resume. Queued v1 remains readable; new work, retries, and quarantine
+   evidence are v2.
+
+#### Upgrade and rollback
+
+| Step | Action |
+|---|---|
+| Upgrade | Pause ingress and consumers, deploy readers first, then resume. |
+| Mixed fleet | Do not publish v2 while any v1 reader is still consuming. |
+| Rollback | Isolate and drain v2 first. Never convert arbitrary binary back to v1 text. |
+
+#### Checklist
+
+- [ ] Every consumer understands v2 before the first v2 publish.
+- [ ] Work and quarantine queues are not assumed to dead-letter rejected v2.
+- [ ] Rollback drains v2 instead of downgrading bytes to version-1 strings.
+
 ### Rollback
 
 1. Disable publish and consume (`enabled: false`).
