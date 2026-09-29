@@ -234,6 +234,39 @@ defmodule JasminEx.Messaging.EnvelopeTest do
     assert literal.submit_sm.registered_delivery == 0
   end
 
+  test "v1 extra short_message_base64 stays literal and base64-only v1 is invalid" do
+    both =
+      v1_fixture(%{
+        "short_message" => "aGVsbG8=",
+        "short_message_base64" => Base.encode64(<<0, 255>>)
+      })
+
+    assert {:ok, envelope} = Envelope.decode(both)
+    assert envelope.submit_sm.short_message === "aGVsbG8="
+    refute envelope.submit_sm.short_message === "hello"
+    refute envelope.submit_sm.short_message === <<0, 255>>
+    refute Map.has_key?(envelope.submit_sm, :short_message_base64)
+
+    only_base64 =
+      %{
+        "version" => 1,
+        "gateway_id" => "gateway-1",
+        "connector_id" => "connector-a",
+        "attempt" => 1,
+        "max_attempts" => 3,
+        "enqueued_at" => "2026-08-01T15:00:00Z",
+        "expires_at" => "2026-08-02T15:00:00Z",
+        "submit_sm" => %{
+          "source_addr" => "+12025550100",
+          "destination_addr" => "+12025550101",
+          "short_message_base64" => Base.encode64("hello")
+        }
+      }
+      |> json()
+
+    assert Envelope.decode(only_base64) == {:error, :invalid_envelope}
+  end
+
   test "rejects v1 JSON-null data_coding" do
     assert Envelope.decode(v1_fixture(%{"data_coding" => :null})) ==
              {:error, :invalid_envelope}
