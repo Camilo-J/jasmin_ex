@@ -285,7 +285,7 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     stop(worker, agent)
   end
 
-  test "journals a valid v1 envelope before submit and acks known success", %{config: config} do
+  test "journals a valid envelope before submit and acks known success", %{config: config} do
     {store, _} = journal_store()
     test = self()
 
@@ -562,6 +562,96 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
       refute Enum.any?(events, &match?({:republish, _}, &1))
       stop(worker, agent)
     end
+  end
+
+  test "submits exact decoded binary from a v2 envelope", %{config: config} do
+    {store, _} = journal_store()
+    test = self()
+    message = <<0, 255, 0x1B, 0x14, 0xFF, 0xFE>>
+
+    submit = fn env ->
+      send(test, {:submitted, env})
+      {:ok, "smsc-ok"}
+    end
+
+    {worker, agent} = start_bound(config, "alpha", store: store, submit: submit)
+    payload = v2_payload(message, %{"gateway_id" => "gw-bin"})
+    assert :ok = Fake.deliver(agent, payload)
+    assert ConnectorWorker.inflight(worker) == nil
+    assert_received {:submitted, env}
+    assert env.submit_sm.short_message === message
+    assert env.gateway_id == "gw-bin"
+    assert {:ok, %{state: :dispatching}} = StateStoreJournal.read(store, "gw-bin", 1)
+    assert {:ack, 1, 1} in Fake.events(agent)
+    assert Process.alive?(worker)
+    stop(worker, agent)
+  end
+
+  test "malformed v2 does not submit, journal, or republish and stays alive", %{config: config} do
+    test = self()
+
+    for payload <- [
+          v2_payload("hello", %{"gateway_id" => "gw-bad"}, %{"short_message_base64" => "!!!!"}),
+          v2_payload("hello", %{"gateway_id" => "gw-conflict"}, %{"short_message" => "hello"}),
+          ~s({"version":2,"gateway_id":"gw-missing","connector_id":"alpha"})
+        ] do
+      {store, _} = journal_store()
+
+      {worker, agent} =
+        start_bound(config, "alpha", fn agent ->
+          [
+            store: store,
+            submit: fn env -> send(test, {:submitted, env}) && {:ok, "nope"} end,
+            republish: republish_ok(agent)
+          ]
+        end)
+
+      assert :ok = Fake.deliver(agent, payload)
+      assert ConnectorWorker.inflight(worker) == nil
+      refute_received {:submitted, _}
+      assert StateStoreJournal.read(store, "gw-bad", 1) == :missing
+      assert StateStoreJournal.read(store, "gw-conflict", 1) == :missing
+      assert StateStoreJournal.read(store, "gw-missing", 1) == :missing
+      events = Fake.events(agent)
+      assert {:reject, 1, 1, [requeue: false]} in events
+      refute Enum.any?(events, &match?({:ack, _, _}, &1))
+      refute Enum.any?(events, &match?({:republish, _}, &1))
+      assert Process.alive?(worker)
+      stop(worker, agent)
+    end
+  end
+
+  test "legacy v1 submit keeps original text bytes and retries as v2 bytes", %{config: config} do
+    {store, _} = journal_store()
+    test = self()
+
+    {worker, agent} =
+      start_bound(config, "alpha", fn agent ->
+        [
+          store: store,
+          submit: fn env ->
+            send(test, {:submitted, env})
+            {:error, :disconnected}
+          end,
+          republish: republish_ok(agent)
+        ]
+      end)
+
+    payload =
+      ~s({"version":1,"gateway_id":"gw-v1","connector_id":"alpha","attempt":1,"max_attempts":3,"enqueued_at":"2026-08-01T15:00:00Z","expires_at":"2099-01-01T00:00:00Z","submit_sm":{"source_addr":"+12025550100","destination_addr":"+12025550101","short_message":"aGVsbG8="}})
+
+    assert :ok = Fake.deliver(agent, payload)
+    assert ConnectorWorker.inflight(worker) == nil
+    assert_received {:submitted, env}
+    assert env.submit_sm.short_message === "aGVsbG8="
+    refute env.submit_sm.short_message === "hello"
+    events = Fake.events(agent)
+    assert {:republish, {:retry, next}} = find(events, :republish)
+    assert next.attempt == 2
+    assert next.submit_sm.short_message === "aGVsbG8="
+    assert next.gateway_id == "gw-v1"
+    assert Process.alive?(worker)
+    stop(worker, agent)
   end
 
   test "journal write failure stalls without submit or settlement", %{config: config} do
@@ -1056,6 +1146,30 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     {:ok, envelope} = Envelope.new(attributes)
     {:ok, payload} = Envelope.encode(envelope)
     {envelope, payload}
+  end
+
+  defp v2_payload(message, envelope_overrides, submit_overrides \\ %{}) do
+    submit =
+      %{
+        "source_addr" => "+12025550100",
+        "destination_addr" => "+12025550101",
+        "short_message_base64" => Base.encode64(message)
+      }
+      |> Map.merge(submit_overrides)
+
+    %{
+      "version" => 2,
+      "gateway_id" => "gateway-1",
+      "connector_id" => "alpha",
+      "attempt" => 1,
+      "max_attempts" => 3,
+      "enqueued_at" => "2026-08-01T15:00:00Z",
+      "expires_at" => "2099-01-01T00:00:00Z",
+      "submit_sm" => submit
+    }
+    |> Map.merge(envelope_overrides)
+    |> :json.encode()
+    |> IO.iodata_to_binary()
   end
 
   defp start_pair(config) do
