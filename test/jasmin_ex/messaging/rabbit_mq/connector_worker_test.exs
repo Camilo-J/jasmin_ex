@@ -590,10 +590,19 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
   test "malformed v2 does not submit, journal, or republish and stays alive", %{config: config} do
     test = self()
 
+    {_envelope, encoded} = valid_payload(%{gateway_id: "gw-missing"})
+
+    missing_short_message_base64 =
+      encoded
+      |> :json.decode()
+      |> Map.update!("submit_sm", &Map.delete(&1, "short_message_base64"))
+      |> :json.encode()
+      |> IO.iodata_to_binary()
+
     for payload <- [
           v2_payload("hello", %{"gateway_id" => "gw-bad"}, %{"short_message_base64" => "!!!!"}),
           v2_payload("hello", %{"gateway_id" => "gw-conflict"}, %{"short_message" => "hello"}),
-          ~s({"version":2,"gateway_id":"gw-missing","connector_id":"alpha"})
+          missing_short_message_base64
         ] do
       {store, _} = journal_store()
 
@@ -650,6 +659,20 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     assert next.attempt == 2
     assert next.submit_sm.short_message === "aGVsbG8="
     assert next.gateway_id == "gw-v1"
+    assert next.max_attempts == 3
+
+    # Encoder contract on the captured in-memory retry. The worker does not
+    # encode, and this is not an AMQP transport observation. Adapter
+    # work_queue_test already covers the published wire.
+    assert {:ok, encoded_retry} = Envelope.encode(next)
+    retry_wire = :json.decode(encoded_retry)
+    assert retry_wire["version"] === 2
+    refute Map.has_key?(retry_wire["submit_sm"], "short_message")
+
+    assert retry_wire["submit_sm"]["short_message_base64"] ==
+             Base.encode64("aGVsbG8=")
+
+    refute retry_wire["submit_sm"]["short_message_base64"] == "aGVsbG8="
     assert Process.alive?(worker)
     stop(worker, agent)
   end
