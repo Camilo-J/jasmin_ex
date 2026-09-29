@@ -8,7 +8,10 @@ defmodule JasminEx.Smpp.Client do
     * `status/1` reports the lifecycle state.
     * `send_submit_sm/2` sends a request while bound and returns an accepted,
       rejected, known-not-sent, or unknown outcome from its sequence-matched
-      response lifecycle. Acceptance by the SMSC does not mean handset delivery.
+      response lifecycle. Local body-encode failures return
+      `{:error, {:encode, reason}}` without sending bytes, inserting inflight
+      state, or consuming a sequence number. Acceptance by the SMSC does not
+      mean handset delivery.
     * `unbind/1` closes the session deliberately after an SMPP unbind exchange.
 
   Optional `lifecycle_notify` is a pid or registered atom name that receives
@@ -91,7 +94,11 @@ defmodule JasminEx.Smpp.Client do
 
   @type submit_result ::
           {:ok, String.t()}
-          | {:error, {:submit_rejected, Constants.command_status()} | :disconnected | :unbinding}
+          | {:error,
+             {:submit_rejected, Constants.command_status()}
+             | :disconnected
+             | :unbinding
+             | {:encode, atom()}}
           | {:unknown, submit_unknown_reason()}
 
   @spec send_submit_sm(pid(), Body.SubmitSM.t()) :: submit_result()
@@ -217,21 +224,27 @@ defmodule JasminEx.Smpp.Client do
   end
 
   def bound({:call, from}, {:send_submit_sm, body}, data) do
-    {seq, data} = take_sequence(data)
-    pdu = build_submit_pdu(body, seq)
+    case Body.encode(:submit_sm, body) do
+      {:error, {:encode, _reason} = error} ->
+        {:keep_state, data, [{:reply, from, {:error, error}}]}
 
-    case Transport.send(data.socket, pdu) do
-      :ok ->
-        data = insert_pending(data, seq, :submit_sm, from)
-        {:keep_state, data, [pending_timeout_action(seq, data.config.response_timeout_ms)]}
+      {:ok, body_bin} ->
+        {seq, data} = take_sequence(data)
+        pdu = build_submit_pdu(body_bin, seq)
 
-      {:error, reason} ->
-        :gen_statem.reply(from, {:unknown, {:send_failed, reason}})
+        case Transport.send(data.socket, pdu) do
+          :ok ->
+            data = insert_pending(data, seq, :submit_sm, from)
+            {:keep_state, data, [pending_timeout_action(seq, data.config.response_timeout_ms)]}
 
-        data
-        |> close_socket()
-        |> flush_pending({:unknown, :disconnected})
-        |> arm_reconnect(:bound, :submit_send_failed)
+          {:error, reason} ->
+            :gen_statem.reply(from, {:unknown, {:send_failed, reason}})
+
+            data
+            |> close_socket()
+            |> flush_pending({:unknown, :disconnected})
+            |> arm_reconnect(:bound, :submit_send_failed)
+        end
     end
   end
 
@@ -545,8 +558,7 @@ defmodule JasminEx.Smpp.Client do
     PDU.build(command: command, status: :ESME_ROK, sequence_number: seq, body: body_bin)
   end
 
-  defp build_submit_pdu(body, seq) do
-    {:ok, body_bin} = Body.encode(:submit_sm, body)
+  defp build_submit_pdu(body_bin, seq) do
     PDU.build(command: :submit_sm, status: :ESME_ROK, sequence_number: seq, body: body_bin)
   end
 
