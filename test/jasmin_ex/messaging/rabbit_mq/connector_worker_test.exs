@@ -539,7 +539,7 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     test = self()
 
     for payload <- [
-          ~s({"version":2,"connector_id":"alpha"}),
+          ~s({"version":99,"connector_id":"alpha"}),
           "one"
         ] do
       {store, _} = journal_store()

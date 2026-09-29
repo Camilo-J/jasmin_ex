@@ -1,7 +1,15 @@
 defmodule JasminEx.Messaging.Envelope do
-  @moduledoc "Represents and serializes a queued messaging request."
+  @moduledoc """
+  Represents and serializes a queued messaging request.
 
-  @version 1
+  Encode writes integer version 2. The wire `submit_sm` field is
+  `short_message_base64` (standard padded canonical Base64). The in-memory
+  struct still holds binary `submit_sm.short_message`. Version 1 JSON is
+  decoded as original text bytes and is never Base64-decoded or transcoded.
+  """
+
+  @v1 1
+  @v2 2
   @fields [
     :gateway_id,
     :connector_id,
@@ -31,7 +39,7 @@ defmodule JasminEx.Messaging.Envelope do
     payload =
       envelope
       |> Map.from_struct()
-      |> Map.put(:version, @version)
+      |> Map.put(:version, @v2)
       |> stringify_envelope()
       |> :json.encode()
       |> IO.iodata_to_binary()
@@ -41,7 +49,8 @@ defmodule JasminEx.Messaging.Envelope do
 
   def decode(payload) when is_binary(payload) do
     with {:ok, attributes} <- decode_json(payload),
-         :ok <- validate_version(attributes) do
+         :ok <- validate_version(attributes),
+         {:ok, attributes} <- materialize_submit_sm(attributes) do
       attributes
       |> Map.drop(["version"])
       |> atomize_known_keys()
@@ -60,9 +69,54 @@ defmodule JasminEx.Messaging.Envelope do
     _error -> {:error, :invalid_json}
   end
 
-  defp validate_version(%{"version" => @version}), do: :ok
+  defp validate_version(%{"version" => version}) when version in [@v1, @v2], do: :ok
   defp validate_version(%{"version" => _version}), do: {:error, :unsupported_version}
   defp validate_version(_attributes), do: {:error, :invalid_envelope}
+
+  defp materialize_submit_sm(%{"version" => @v2, "submit_sm" => submit} = attributes)
+       when is_map(submit) do
+    if Map.has_key?(submit, "short_message") do
+      {:error, :invalid_envelope}
+    else
+      case decode_v2_short_message(submit) do
+        {:ok, submit} -> {:ok, Map.put(attributes, "submit_sm", submit)}
+        error -> error
+      end
+    end
+  end
+
+  defp materialize_submit_sm(%{"version" => @v2}), do: {:error, :invalid_envelope}
+  defp materialize_submit_sm(attributes), do: {:ok, attributes}
+
+  defp decode_v2_short_message(submit) do
+    case Map.fetch(submit, "short_message_base64") do
+      {:ok, encoded} when is_binary(encoded) ->
+        case canonical_base64(encoded) do
+          {:ok, bytes} ->
+            {:ok,
+             submit
+             |> Map.delete("short_message_base64")
+             |> Map.put("short_message", bytes)
+             |> absents_v2_json_null()}
+
+          :error ->
+            {:error, :invalid_envelope}
+        end
+
+      _ ->
+        {:error, :invalid_envelope}
+    end
+  end
+
+  defp canonical_base64(encoded) do
+    case Base.decode64(encoded) do
+      {:ok, bytes} ->
+        if Base.encode64(bytes) == encoded, do: {:ok, bytes}, else: :error
+
+      :error ->
+        :error
+    end
+  end
 
   defp reject_unknown_keys(attributes) do
     if Map.keys(attributes) -- @fields == [], do: :ok, else: :error
@@ -122,6 +176,19 @@ defmodule JasminEx.Messaging.Envelope do
 
   defp validate_submit_sm(_submit_sm), do: {:error, :invalid_submit_sm}
 
+  defp absents_v2_json_null(submit) do
+    submit
+    |> replace_v2_json_null("data_coding")
+    |> replace_v2_json_null("registered_delivery")
+  end
+
+  defp replace_v2_json_null(submit, key) do
+    case Map.fetch(submit, key) do
+      {:ok, :null} -> Map.put(submit, key, nil)
+      _ -> submit
+    end
+  end
+
   defp normalize_data_coding(nil), do: {:ok, 0}
 
   defp normalize_data_coding(data_coding) when data_coding in @allowed_data_coding,
@@ -140,8 +207,14 @@ defmodule JasminEx.Messaging.Envelope do
     |> Map.new(fn {key, value} -> {Atom.to_string(key), value} end)
   end
 
-  defp stringify_submit_sm(submit_sm),
-    do: Map.new(submit_sm, fn {key, value} -> {Atom.to_string(key), value} end)
+  defp stringify_submit_sm(submit_sm) do
+    message = Map.fetch!(submit_sm, :short_message)
+
+    submit_sm
+    |> Map.delete(:short_message)
+    |> Map.put(:short_message_base64, Base.encode64(message))
+    |> Map.new(fn {key, value} -> {Atom.to_string(key), value} end)
+  end
 
   defp atomize_known_keys(attributes) do
     Map.new(@fields, fn key -> {key, Map.get(attributes, Atom.to_string(key))} end)
