@@ -8,11 +8,12 @@ defmodule JasminEx.HttpApi.Router do
   alias JasminEx.HttpApi.Metrics
   alias JasminEx.HttpApi.Response
   alias JasminEx.MtSubmitPipeline
+  alias JasminEx.MtSubmitPipeline.Production
   alias JasminEx.Routing
   alias JasminEx.Routing.Routable
 
   @send_keys ~w(username password to from content hex-content coding dlr dlr-url dlr-level dlr-method)
-  @rate_keys ~w(username password to from)
+  @rate_keys ~w(username password to from content hex-content coding)
   @balance_keys ~w(username password)
 
   plug(:match)
@@ -81,7 +82,7 @@ defmodule JasminEx.HttpApi.Router do
   defp rate_request(conn) do
     case read_authenticated_form(conn, @rate_keys) do
       {:ok, conn, user, params} ->
-        {conn, quote_rate(opts(conn).router, user, params)}
+        {conn, quote_rate_request(opts(conn).router, user, params)}
 
       {:error, reason} ->
         {conn, {:error, reason}}
@@ -108,7 +109,25 @@ defmodule JasminEx.HttpApi.Router do
     end
   end
 
-  defp quote_rate(router, user, params) do
+  defp quote_rate_request(router, user, params) do
+    with {:ok, input} <- pipeline_input(user, params),
+         {:ok, content} <- rate_content(params, input) do
+      quote_rate(router, user, params, content)
+    end
+  end
+
+  defp rate_content(params, input) do
+    if Map.has_key?(params, "content") or Map.has_key?(params, "hex-content") do
+      case Production.validate_payload(input) do
+        {:ok, payload} -> {:ok, payload.content}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:ok, ""}
+    end
+  end
+
+  defp quote_rate(router, user, params, content) do
     snapshot = Routing.snapshot(router)
     group = snapshot.groups[user.gid]
 
@@ -119,7 +138,7 @@ defmodule JasminEx.HttpApi.Router do
              group: group,
              source: Map.get(params, "from", ""),
              destination: to,
-             content: "",
+             content: content,
              tags: []
            ) do
       Queries.quote(snapshot, routable)
