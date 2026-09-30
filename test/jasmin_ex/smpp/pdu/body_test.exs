@@ -215,6 +215,83 @@ defmodule JasminEx.Smpp.PDU.BodyTest do
       assert {:ok, decoded} = Body.decode(:submit_sm_resp, bin)
       assert decoded.message_id == "abc123"
     end
+
+    test "accepts a 254-octet short_message including raw bytes" do
+      raw = :binary.copy(<<0xFF, 0x00>>, 127)
+      assert byte_size(raw) == 254
+      body = submit_sm_body(raw)
+
+      assert {:ok, iodata} = Body.encode(:submit_sm, body)
+      bin = IO.iodata_to_binary(iodata)
+      assert :binary.at(bin, byte_size(bin) - 255) == 254
+      assert binary_part(bin, byte_size(bin) - 254, 254) == raw
+      assert {:ok, %Body.SubmitSM{short_message: ^raw}} = Body.decode(:submit_sm, bin)
+    end
+
+    test "rejects a 255-octet short_message without wrapping sm_length" do
+      raw = :binary.copy(<<0xAA>>, 255)
+      body = submit_sm_body(raw)
+
+      assert {:error, {:encode, :short_message_too_long}} = Body.encode(:submit_sm, body)
+    end
+
+    test "rejects a 256-octet short_message without wrapping sm_length" do
+      raw = :binary.copy(<<0xBB>>, 256)
+      body = submit_sm_body(raw)
+
+      assert {:error, {:encode, :short_message_too_long}} = Body.encode(:submit_sm, body)
+    end
+
+    test "accepts an empty binary short_message" do
+      body = submit_sm_body(<<>>)
+
+      assert {:ok, iodata} = Body.encode(:submit_sm, body)
+      bin = IO.iodata_to_binary(iodata)
+      assert :binary.at(bin, byte_size(bin) - 1) == 0
+      assert {:ok, %Body.SubmitSM{short_message: <<>>}} = Body.decode(:submit_sm, bin)
+    end
+
+    test "rejects a nil short_message without converting it to empty bytes" do
+      body = submit_sm_body(nil)
+
+      assert {:error, {:encode, :invalid_short_message}} = Body.encode(:submit_sm, body)
+    end
+
+    test "rejects a false short_message without converting it to empty bytes" do
+      body = submit_sm_body(false)
+
+      assert {:error, {:encode, :invalid_short_message}} = Body.encode(:submit_sm, body)
+    end
+
+    test "rejects a charlist short_message" do
+      body = submit_sm_body(~c"Hi")
+
+      assert {:error, {:encode, :invalid_short_message}} = Body.encode(:submit_sm, body)
+    end
+
+    test "rejects a list short_message" do
+      body = submit_sm_body([0x00, 0xFF])
+
+      assert {:error, {:encode, :invalid_short_message}} = Body.encode(:submit_sm, body)
+    end
+
+    test "rejects an integer short_message" do
+      body = submit_sm_body(1)
+
+      assert {:error, {:encode, :invalid_short_message}} = Body.encode(:submit_sm, body)
+    end
+
+    test "rejects a map short_message" do
+      body = submit_sm_body(%{})
+
+      assert {:error, {:encode, :invalid_short_message}} = Body.encode(:submit_sm, body)
+    end
+
+    test "rejects a non-byte-aligned bitstring short_message" do
+      body = submit_sm_body(<<1::4>>)
+
+      assert {:error, {:encode, :invalid_short_message}} = Body.encode(:submit_sm, body)
+    end
   end
 
   describe "deliver_sm round-trip" do
@@ -327,5 +404,18 @@ defmodule JasminEx.Smpp.PDU.BodyTest do
       assert %Body.GenericNack{} = %Body.GenericNack{}
       assert Constants.command_id_to_int(:bind_transmitter) == {:ok, 0x0000_0002}
     end
+  end
+
+  defp submit_sm_body(short_message) do
+    %Body.SubmitSM{
+      service_type: "",
+      source_addr_ton: :UNKNOWN,
+      source_addr_npi: :UNKNOWN,
+      source_addr: "A",
+      dest_addr_ton: :INTERNATIONAL,
+      dest_addr_npi: :ISDN,
+      destination_addr: "B",
+      short_message: short_message
+    }
   end
 end

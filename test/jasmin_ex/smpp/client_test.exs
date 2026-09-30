@@ -447,6 +447,100 @@ defmodule JasminEx.Smpp.ClientTest do
     end
   end
 
+  describe "local submit_sm encode failure" do
+    test "oversized short_message returns encode error without sending, leaking, or burning a slot" do
+      {:ok, port, smsc} = start_smsc()
+      ref = FakeSMSC.subscribe(smsc)
+      {:ok, client} = start_client(port, heartbeat_ms: 10_000)
+
+      assert :ok = wait_until(fn -> Client.status(client) == :bound end)
+
+      {_state, data} = :sys.get_state(client)
+      sequence_before = data.request_window.next_sequence
+      pending_before = map_size(data.request_window.pending)
+
+      oversized = submit_sm(:binary.copy(<<0xCC>>, 255))
+
+      assert {:error, {:encode, :short_message_too_long}} =
+               Client.send_submit_sm(client, oversized)
+
+      assert Process.alive?(client)
+      assert Client.status(client) == :bound
+
+      {_state, data} = :sys.get_state(client)
+      assert data.request_window.next_sequence == sequence_before
+      assert map_size(data.request_window.pending) == pending_before
+
+      refute_submit_sm_received(ref)
+
+      assert {:ok, "fake-msg-id"} = Client.send_submit_sm(client, submit_sm("ok"))
+      assert Client.status(client) == :bound
+      assert %{ok: ^sequence_before} = await_submit_sequences(ref, %{}, 1)
+
+      stop_pair(smsc, client)
+    end
+
+    test "nil short_message returns encode error without sending, leaking, or burning a slot" do
+      {:ok, port, smsc} = start_smsc()
+      ref = FakeSMSC.subscribe(smsc)
+      {:ok, client} = start_client(port, heartbeat_ms: 10_000)
+
+      assert :ok = wait_until(fn -> Client.status(client) == :bound end)
+
+      {_state, data} = :sys.get_state(client)
+      sequence_before = data.request_window.next_sequence
+      pending_before = map_size(data.request_window.pending)
+
+      assert {:error, {:encode, :invalid_short_message}} =
+               Client.send_submit_sm(client, submit_sm(nil))
+
+      assert Process.alive?(client)
+      assert Client.status(client) == :bound
+
+      {_state, data} = :sys.get_state(client)
+      assert data.request_window.next_sequence == sequence_before
+      assert map_size(data.request_window.pending) == pending_before
+
+      refute_submit_sm_received(ref)
+
+      assert {:ok, "fake-msg-id"} = Client.send_submit_sm(client, submit_sm("ok"))
+      assert Client.status(client) == :bound
+      assert %{ok: ^sequence_before} = await_submit_sequences(ref, %{}, 1)
+
+      stop_pair(smsc, client)
+    end
+
+    test "charlist short_message returns encode error without sending, leaking, or burning a slot" do
+      {:ok, port, smsc} = start_smsc()
+      ref = FakeSMSC.subscribe(smsc)
+      {:ok, client} = start_client(port, heartbeat_ms: 10_000)
+
+      assert :ok = wait_until(fn -> Client.status(client) == :bound end)
+
+      {_state, data} = :sys.get_state(client)
+      sequence_before = data.request_window.next_sequence
+      pending_before = map_size(data.request_window.pending)
+
+      assert {:error, {:encode, :invalid_short_message}} =
+               Client.send_submit_sm(client, submit_sm(~c"Hi"))
+
+      assert Process.alive?(client)
+      assert Client.status(client) == :bound
+
+      {_state, data} = :sys.get_state(client)
+      assert data.request_window.next_sequence == sequence_before
+      assert map_size(data.request_window.pending) == pending_before
+
+      refute_submit_sm_received(ref)
+
+      assert {:ok, "fake-msg-id"} = Client.send_submit_sm(client, submit_sm("ok"))
+      assert Client.status(client) == :bound
+      assert %{ok: ^sequence_before} = await_submit_sequences(ref, %{}, 1)
+
+      stop_pair(smsc, client)
+    end
+  end
+
   describe "unmatched-sequence guard" do
     test "a *_resp with an unknown sequence_number is logged and discarded, session stays :bound" do
       {:ok, port, smsc} = start_smsc()
@@ -547,6 +641,21 @@ defmodule JasminEx.Smpp.ClientTest do
   end
 
   ## helpers
+
+  defp refute_submit_sm_received(ref) do
+    receive do
+      {:fake_smsc_bytes, ^ref, payload} ->
+        case PDU.decode(payload) do
+          {:ok, %PDU{command: :submit_sm}} ->
+            flunk("expected no submit_sm PDU on local encode error")
+
+          _other ->
+            refute_submit_sm_received(ref)
+        end
+    after
+      50 -> :ok
+    end
+  end
 
   defp enquire_link_bytes(command, seq) do
     PDU.build(command: command, status: :ESME_ROK, sequence_number: seq, body: <<>>)

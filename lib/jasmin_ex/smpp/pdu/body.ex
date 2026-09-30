@@ -28,6 +28,14 @@ defmodule JasminEx.Smpp.PDU.Body do
   `Body.encode/2` and `Body.decode/2` operate ONLY on the body bytes —
   the 16-byte header is encoded/decoded by `JasminEx.Smpp.PDU`. The
   full pipeline combines the two.
+
+  `submit_sm` encoding consumes already-encoded `short_message` wire
+  bytes and does not call `PDU.Coding`. Non-binary `short_message`
+  values return `{:error, {:encode, :invalid_short_message}}` at this
+  public boundary before `byte_size` or fallback conversions; empty
+  binary remains valid. The `sm_length` field is one octet, so a
+  binary `short_message` longer than 254 octets returns
+  `{:error, {:encode, :short_message_too_long}}` instead of wrapping.
   """
 
   alias JasminEx.Smpp.PDU.Constants
@@ -189,6 +197,8 @@ defmodule JasminEx.Smpp.PDU.Body do
           | EnquireLink.t()
           | GenericNack.t()
 
+  @max_submit_sm_octets 254
+
   @spec encode(atom(), t()) :: {:ok, iodata()} | {:error, {:encode, atom()}}
   def encode(:bind_transmitter, %Bind{} = b), do: {:ok, encode_bind(b)}
   def encode(:bind_receiver, %Bind{} = b), do: {:ok, encode_bind(b)}
@@ -200,7 +210,7 @@ defmodule JasminEx.Smpp.PDU.Body do
   def encode(:unbind_resp, %Unbind{}), do: {:ok, <<>>}
   def encode(:enquire_link, %EnquireLink{}), do: {:ok, <<>>}
   def encode(:enquire_link_resp, %EnquireLink{}), do: {:ok, <<>>}
-  def encode(:submit_sm, %SubmitSM{} = b), do: encode_submit_sm(b)
+  def encode(:submit_sm, %SubmitSM{} = b), do: encode_bounded_submit_sm(b)
   def encode(:submit_sm_resp, %SubmitSMResp{} = b), do: {:ok, encode_c_octet(b.message_id)}
   def encode(:deliver_sm, %DeliverSM{} = b), do: encode_submit_sm(b)
   def encode(:deliver_sm_resp, %DeliverSMResp{} = b), do: {:ok, encode_c_octet(b.message_id)}
@@ -281,6 +291,20 @@ defmodule JasminEx.Smpp.PDU.Body do
   #
   # 16 mandatory fields: 6 c-octets + 3 u8 + 2 c-octets + 2 u8 + 2 u8 + 1 u8
   # then: sm_length u8 + sm bytes
+
+  defp encode_bounded_submit_sm(%SubmitSM{} = b) do
+    case b.short_message do
+      sm_bytes when is_binary(sm_bytes) ->
+        if byte_size(sm_bytes) > @max_submit_sm_octets do
+          {:error, {:encode, :short_message_too_long}}
+        else
+          encode_submit_sm(b)
+        end
+
+      _invalid ->
+        {:error, {:encode, :invalid_short_message}}
+    end
+  end
 
   defp encode_submit_sm(b) do
     sm_bytes = b.short_message || ""
