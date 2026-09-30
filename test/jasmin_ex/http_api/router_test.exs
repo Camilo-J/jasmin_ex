@@ -199,6 +199,244 @@ defmodule JasminEx.HttpApi.RouterTest do
       assert_error(conn, 503, :missing_publisher)
       assert Routing.snapshot(env.router).reservations == %{}
     end
+
+    test "unrepresentable text is 400 invalid_content with no billing, DLR, or enqueue", %{
+      tmp_dir: tmp_dir
+    } do
+      env = start_http(tmp_dir, dlr: :enabled)
+      before = billing_view(Routing.snapshot(env.router))
+
+      conn =
+        request(
+          env,
+          :post,
+          "/send",
+          Map.merge(send_fields(), %{
+            "content" => "é",
+            "coding" => "1",
+            "dlr" => "yes",
+            "dlr-url" => "http://example.com/dlr"
+          })
+        )
+
+      assert_error(conn, 400, :invalid_content)
+      assert_no_submit(env)
+      assert billing_view(Routing.snapshot(env.router)) == before
+      assert dlr_empty?(env)
+    end
+
+    test "oversized encoded payloads are 400 message_too_long with no side effects", %{
+      tmp_dir: tmp_dir
+    } do
+      env = start_http(tmp_dir)
+
+      gsm =
+        request(
+          env,
+          :post,
+          "/send",
+          Map.put(send_fields(), "content", String.duplicate("a", 255))
+        )
+
+      utf16 =
+        request(
+          env,
+          :post,
+          "/send",
+          Map.merge(send_fields(), %{"content" => String.duplicate("a", 128), "coding" => "8"})
+        )
+
+      gsm_ext =
+        request(
+          env,
+          :post,
+          "/send",
+          Map.merge(send_fields(), %{"content" => String.duplicate("€", 128), "coding" => "0"})
+        )
+
+      assert_error(gsm, 400, :message_too_long)
+      assert_error(utf16, 400, :message_too_long)
+      assert_error(gsm_ext, 400, :message_too_long)
+      assert_no_submit(env)
+    end
+  end
+
+  describe "HTTP encoding" do
+    test "POST /send encodes each supported coding onto the queued envelope", %{tmp_dir: tmp_dir} do
+      cases = [
+        {%{"content" => "hello", "coding" => "0"}, "hello"},
+        {%{"content" => "€", "coding" => "0"}, <<0x1B, 0x65>>},
+        {%{"content" => "Hi", "coding" => "1"}, "Hi"},
+        {%{"hex-content" => "00FF", "coding" => "2"}, <<0x00, 0xFF>>},
+        {%{"content" => "é", "coding" => "3"}, <<0xE9>>},
+        {%{"content" => "Hi", "coding" => "8"}, <<0x00, 0x48, 0x00, 0x69>>}
+      ]
+
+      for {fields, wire} <- cases do
+        env = start_http(tmp_dir, file: "routing-#{Base.encode16(wire)}.json", id: "mid-enc")
+        payload = send_fields() |> Map.delete("content") |> Map.merge(fields)
+        conn = request(env, :post, "/send", payload)
+        assert conn.status == 200, inspect({fields, conn.status, conn.resp_body})
+        [envelope] = FakeQueue.envelopes(env.queue)
+        assert envelope.submit_sm.short_message == wire
+        assert envelope.submit_sm.data_coding == String.to_integer(fields["coding"])
+      end
+    end
+
+    test "raw hex is carried without transcoding and 254 encoded octets are accepted", %{
+      tmp_dir: tmp_dir
+    } do
+      env = start_http(tmp_dir, id: "mid-254")
+      hex = request(env, :post, "/send", hex_fields("00480069", "8"))
+      assert hex.status == 200
+      [ucs2] = FakeQueue.envelopes(env.queue)
+      assert ucs2.submit_sm.short_message == <<0x00, 0x48, 0x00, 0x69>>
+
+      env254 = start_http(tmp_dir, file: "routing-254.json", id: "mid-254b")
+
+      gsm254 =
+        request(
+          env254,
+          :post,
+          "/send",
+          Map.put(send_fields(), "content", String.duplicate("a", 254))
+        )
+
+      assert gsm254.status == 200
+      [envelope] = FakeQueue.envelopes(env254.queue)
+      assert byte_size(envelope.submit_sm.short_message) == 254
+
+      env_ext = start_http(tmp_dir, file: "routing-ext.json", id: "mid-ext")
+
+      euros =
+        request(
+          env_ext,
+          :post,
+          "/send",
+          Map.merge(send_fields(), %{"content" => String.duplicate("€", 127)})
+        )
+
+      assert euros.status == 200
+      [ext] = FakeQueue.envelopes(env_ext.queue)
+      assert byte_size(ext.submit_sm.short_message) == 254
+
+      env_u = start_http(tmp_dir, file: "routing-u.json", id: "mid-u")
+
+      utf =
+        request(
+          env_u,
+          :post,
+          "/send",
+          Map.merge(send_fields(), %{"content" => String.duplicate("a", 127), "coding" => "8"})
+        )
+
+      assert utf.status == 200
+      [u] = FakeQueue.envelopes(env_u.queue)
+      assert byte_size(u.submit_sm.short_message) == 254
+    end
+
+    test "Filter.Content matches original text, not UCS2 wire bytes", %{tmp_dir: tmp_dir} do
+      env = start_http(tmp_dir, content_body: "Hi", id: "mid-filter")
+
+      conn = request(env, :post, "/send", coding8_hi_fields())
+
+      assert conn.status == 200
+      [envelope] = FakeQueue.envelopes(env.queue)
+      assert envelope.submit_sm.short_message == <<0x00, 0x48, 0x00, 0x69>>
+    end
+
+    test "POST /rate Filter.Content matches original text, not UCS2 wire bytes", %{
+      tmp_dir: tmp_dir
+    } do
+      env = start_http(tmp_dir, content_body: "Hi")
+      before = billing_view(Routing.snapshot(env.router))
+
+      # Filter.Content body "Hi" would not match UCS2BE wire <<0x00, 0x48, 0x00, 0x69>>.
+      conn = request(env, :post, "/rate", coding8_hi_fields())
+
+      assert conn.status == 200
+      assert conn.resp_body == "100\n"
+      assert billing_view(Routing.snapshot(env.router)) == before
+      assert_no_submit(env)
+    end
+
+    test "POST /rate validates encoding without billing or enqueue", %{tmp_dir: tmp_dir} do
+      env = start_http(tmp_dir)
+      {:ok, _} = Routing.admit(env.router, admission())
+      before = billing_view(Routing.snapshot(env.router))
+
+      ok =
+        request(env, :post, "/rate", %{
+          "username" => "alice",
+          "password" => "s3cret",
+          "to" => "21200000",
+          "from" => "1616",
+          "content" => "Hi",
+          "coding" => "8"
+        })
+
+      ascii =
+        request(env, :post, "/rate", %{
+          "username" => "alice",
+          "password" => "s3cret",
+          "to" => "21200000",
+          "from" => "1616",
+          "content" => "é",
+          "coding" => "1"
+        })
+
+      long =
+        request(env, :post, "/rate", %{
+          "username" => "alice",
+          "password" => "s3cret",
+          "to" => "21200000",
+          "from" => "1616",
+          "content" => String.duplicate("a", 255)
+        })
+
+      assert ok.status == 200
+      assert ok.resp_body == "100\n"
+      assert_error(ascii, 400, :invalid_content)
+      assert_error(long, 400, :message_too_long)
+      assert billing_view(Routing.snapshot(env.router)) == before
+      assert FakeQueue.envelopes(env.queue) == []
+    end
+
+    test "POST /rate with content or hex quotes without from and does not submit", %{
+      tmp_dir: tmp_dir
+    } do
+      env = start_http(tmp_dir)
+      {:ok, _} = Routing.admit(env.router, admission())
+      before = billing_view(Routing.snapshot(env.router))
+
+      content =
+        request(env, :post, "/rate", %{
+          "username" => "alice",
+          "password" => "s3cret",
+          "to" => "21200000",
+          "content" => "Hi",
+          "coding" => "8"
+        })
+
+      hex =
+        request(env, :post, "/rate", %{
+          "username" => "alice",
+          "password" => "s3cret",
+          "to" => "21200000",
+          "hex-content" => "00480069",
+          "coding" => "8"
+        })
+
+      send_missing_from = request(env, :post, "/send", Map.delete(send_fields(), "from"))
+
+      assert content.status == 200
+      assert content.resp_body == "100\n"
+      assert hex.status == 200
+      assert hex.resp_body == "100\n"
+      assert_error(send_missing_from, 400, :missing_from)
+      assert billing_view(Routing.snapshot(env.router)) == before
+      assert FakeQueue.envelopes(env.queue) == []
+    end
   end
 
   describe "DLR HTTP intake" do
@@ -421,12 +659,22 @@ defmodule JasminEx.HttpApi.RouterTest do
     {:ok, connector} = ConnectorRef.new("smpp-t")
     {:ok, dest} = Filter.Destination.new(address: "21200000")
 
+    filters =
+      case Keyword.get(opts, :content_body) do
+        nil ->
+          [dest]
+
+        body ->
+          {:ok, content} = Filter.Content.new(body: body)
+          [dest, content]
+      end
+
     {:ok, _route} =
       Routing.put_route(router,
         kind: :static,
         order: 10,
         connector: connector,
-        filters: [dest],
+        filters: filters,
         rate_minor: 100,
         precharge_percent: 10
       )
@@ -482,6 +730,23 @@ defmodule JasminEx.HttpApi.RouterTest do
       "from" => "1616",
       "content" => "hello"
     }
+  end
+
+  defp coding8_hi_fields do
+    Map.merge(send_fields(), %{"content" => "Hi", "coding" => "8"})
+  end
+
+  defp hex_fields(hex, coding) do
+    send_fields()
+    |> Map.delete("content")
+    |> Map.merge(%{"hex-content" => hex, "coding" => coding})
+  end
+
+  defp dlr_empty?(env) do
+    case env.opts do
+      %{dlr_store: {HttpDlrStore, table}} -> :ets.info(table, :size) == 0
+      _missing -> true
+    end
   end
 
   defp assert_error(conn, status, reason) do

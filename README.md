@@ -140,7 +140,7 @@ validation and forbid any fitness claim.
 
 ## HTTP send encoding
 
-`POST /send` encodes or validates the short message **before** routing,
+`POST /send` and `POST /rate` encode or validate the short message **before** routing,
 billing, DLR registration, or queue publish. Invalid payloads never
 reserve balance, decrement quota, register a DLR, or enqueue.
 
