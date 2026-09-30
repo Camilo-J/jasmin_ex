@@ -162,7 +162,9 @@ original `content` (UTF-8 text, or hex-decoded bytes) is what
 wire field.
 
 The 254-octet bound is the SMPP `submit_sm` `sm_length` u8 PDU limit, not
-cellular SMS capacity. This change does not segment messages.
+cellular SMS capacity. This change does not segment messages. Local
+FakeQueue plus FakeSMSC tests prove Router -> production -> envelope v2 ->
+Client wire bytes; they are not broker evidence.
 
 Typed HTTP 400 bodies keep the existing `error:<reason>\n` contract:
 
