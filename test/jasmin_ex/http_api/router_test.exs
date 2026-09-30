@@ -335,6 +335,26 @@ defmodule JasminEx.HttpApi.RouterTest do
       assert byte_size(u.submit_sm.short_message) == 254
     end
 
+    test "hex coding 2 accepts 254 octets including NUL and rejects 255", %{tmp_dir: tmp_dir} do
+      wire254 = <<0>> <> :binary.copy(<<0xFF>>, 253)
+      env = start_http(tmp_dir, file: "routing-hex254.json", id: "mid-hex254")
+
+      ok = request(env, :post, "/send", hex_fields(Base.encode16(wire254), "2"))
+
+      assert ok.status == 200
+      [envelope] = FakeQueue.envelopes(env.queue)
+      assert envelope.submit_sm.short_message == wire254
+      assert envelope.submit_sm.data_coding == 2
+
+      env255 = start_http(tmp_dir, file: "routing-hex255.json")
+      wire255 = <<0>> <> :binary.copy(<<0xFF>>, 254)
+
+      too_long = request(env255, :post, "/send", hex_fields(Base.encode16(wire255), "2"))
+
+      assert_error(too_long, 400, :message_too_long)
+      assert_no_submit(env255)
+    end
+
     test "Filter.Content matches original text, not UCS2 wire bytes", %{tmp_dir: tmp_dir} do
       env = start_http(tmp_dir, content_body: "Hi", id: "mid-filter")
 
@@ -358,6 +378,30 @@ defmodule JasminEx.HttpApi.RouterTest do
       assert conn.resp_body == "100\n"
       assert billing_view(Routing.snapshot(env.router)) == before
       assert_no_submit(env)
+    end
+
+    test "POST /rate Filter.Content matches hex-decoded bytes, not UCS2 text", %{
+      tmp_dir: tmp_dir
+    } do
+      hex = hex_fields("00480069", "8")
+
+      matched =
+        start_http(tmp_dir,
+          file: "routing-hex-filter.json",
+          content_body: <<0x00, 0x48, 0x00, 0x69>>
+        )
+
+      missed = start_http(tmp_dir, file: "routing-hex-filter-miss.json", content_body: "Hi")
+      before = billing_view(Routing.snapshot(matched.router))
+
+      conn = request(matched, :post, "/rate", hex)
+
+      assert conn.status == 200
+      assert conn.resp_body == "100\n"
+      assert_error(request(missed, :post, "/rate", hex), 404, :no_route)
+      assert billing_view(Routing.snapshot(matched.router)) == before
+      assert_no_submit(matched)
+      assert_no_submit(missed)
     end
 
     test "POST /rate validates encoding without billing or enqueue", %{tmp_dir: tmp_dir} do
@@ -400,6 +444,43 @@ defmodule JasminEx.HttpApi.RouterTest do
       assert_error(long, 400, :message_too_long)
       assert billing_view(Routing.snapshot(env.router)) == before
       assert FakeQueue.envelopes(env.queue) == []
+    end
+
+    test "invalid HTTP coding is 400 on /send and /rate with no side effects", %{
+      tmp_dir: tmp_dir
+    } do
+      env = start_http(tmp_dir, dlr: :enabled)
+      before = billing_view(Routing.snapshot(env.router))
+
+      send =
+        request(
+          env,
+          :post,
+          "/send",
+          Map.merge(send_fields(), %{
+            "coding" => "99",
+            "dlr" => "yes",
+            "dlr-url" => "http://example.com/dlr"
+          })
+        )
+
+      rate_plain =
+        request(env, :post, "/rate", %{
+          "username" => "alice",
+          "password" => "s3cret",
+          "to" => "21200000",
+          "coding" => "99"
+        })
+
+      rate_content =
+        request(env, :post, "/rate", Map.merge(send_fields(), %{"coding" => "99"}))
+
+      assert_error(send, 400, :invalid_coding)
+      assert_error(rate_plain, 400, :invalid_coding)
+      assert_error(rate_content, 400, :invalid_coding)
+      assert billing_view(Routing.snapshot(env.router)) == before
+      assert dlr_empty?(env)
+      assert_no_submit(env)
     end
 
     test "POST /rate with content or hex quotes without from and does not submit", %{
