@@ -13,9 +13,11 @@ defmodule JasminEx.MtSubmitPipeline.Production do
   alias JasminEx.Routing
   alias JasminEx.Routing.Routable
   alias JasminEx.Routing.RouteTable
+  alias JasminEx.Smpp.PDU.Coding
 
   @allowed_keys MapSet.new([:uid, :to, :from, :content, :hex_content, :coding])
   @allowed_coding [0, 1, 2, 3, 8]
+  @max_encoded_octets 254
   @default_ttl_ms 60_000
   @default_max_attempts 3
 
@@ -36,13 +38,29 @@ defmodule JasminEx.MtSubmitPipeline.Production do
          {:ok, uid} <- require_binary(input, :uid, :missing_uid),
          {:ok, to} <- require_binary(input, :to, :missing_to),
          {:ok, from} <- require_binary(input, :from, :missing_from),
-         {:ok, content} <- resolve_content(input),
-         {:ok, coding} <- resolve_coding(input) do
-      {:ok, %{uid: uid, to: to, from: from, content: content, coding: coding}}
+         {:ok, payload} <- validate_payload(input) do
+      {:ok, Map.merge(payload, %{uid: uid, to: to, from: from})}
     end
   end
 
   def validate(_input), do: {:error, :unknown_field}
+
+  def validate_payload(input) when is_map(input) do
+    payload = Map.take(input, [:content, :hex_content, :coding])
+
+    with {:ok, content} <- resolve_content(payload),
+         {:ok, coding} <- resolve_coding(payload),
+         {:ok, encoded} <- encoded_short_message(payload, content, coding) do
+      {:ok,
+       %{
+         content: content,
+         coding: coding,
+         encoded_short_message: encoded
+       }}
+    end
+  end
+
+  def validate_payload(_input), do: {:error, :unknown_field}
 
   def route(message, router) do
     snapshot = Routing.snapshot(router)
@@ -156,7 +174,7 @@ defmodule JasminEx.MtSubmitPipeline.Production do
     submit = %{
       source_addr: message.from,
       destination_addr: message.to,
-      short_message: message.content,
+      short_message: message.encoded_short_message,
       data_coding: message.coding
     }
 
@@ -262,6 +280,30 @@ defmodule JasminEx.MtSubmitPipeline.Production do
     case Map.get(input, :coding, 0) do
       coding when coding in @allowed_coding -> {:ok, coding}
       _invalid -> {:error, :invalid_coding}
+    end
+  end
+
+  defp encoded_short_message(input, content, coding) do
+    with {:ok, encoded} <- wire_bytes(input, content, coding) do
+      if byte_size(encoded) > @max_encoded_octets do
+        {:error, :message_too_long}
+      else
+        {:ok, encoded}
+      end
+    end
+  end
+
+  defp wire_bytes(input, content, coding) do
+    if filled?(Map.get(input, :hex_content)) do
+      case Coding.decode_short_message(coding, content) do
+        {:ok, _decoded} -> {:ok, content}
+        :error -> {:error, :invalid_content}
+      end
+    else
+      case Coding.encode_short_message(coding, content) do
+        {:ok, encoded} -> {:ok, encoded}
+        :error -> {:error, :invalid_content}
+      end
     end
   end
 

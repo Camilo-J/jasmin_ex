@@ -12,6 +12,8 @@ defmodule JasminEx.HttpApi.Response do
     missing_content: 400,
     ambiguous_content: 400,
     invalid_coding: 400,
+    invalid_content: 400,
+    message_too_long: 400,
     invalid_dlr: 400,
     invalid_dlr_level: 400,
     invalid_dlr_method: 400,

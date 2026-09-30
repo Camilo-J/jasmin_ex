@@ -256,16 +256,149 @@ defmodule JasminEx.MtSubmitPipelineTest do
 
     test "hex content and coding 8 round-trip through the queued envelope", %{tmp_dir: tmp_dir} do
       {router, queue} = start_pipeline(tmp_dir)
+      ucs2_hola = <<0x00, 0x68, 0x00, 0x6F, 0x00, 0x6C, 0x00, 0x61>>
 
       input =
         valid_input()
         |> Map.delete(:content)
-        |> Map.merge(%{hex_content: Base.encode16("hola"), coding: 8})
+        |> Map.merge(%{hex_content: Base.encode16(ucs2_hola), coding: 8})
 
       assert {:ok, "mid-hex"} = MtSubmitPipeline.submit(input, opts(router, queue, "mid-hex"))
       [envelope] = FakeQueue.envelopes(queue)
-      assert envelope.submit_sm.short_message == "hola"
+      assert envelope.submit_sm.short_message == ucs2_hola
       assert envelope.submit_sm.data_coding == 8
+    end
+
+    test "UCS2 text is encoded to UTF-16BE once before enqueue", %{tmp_dir: tmp_dir} do
+      {router, queue} = start_pipeline(tmp_dir)
+      input = Map.merge(valid_input(), %{content: "Hi", coding: 8})
+
+      assert {:ok, "mid-ucs2"} = MtSubmitPipeline.submit(input, opts(router, queue, "mid-ucs2"))
+      [envelope] = FakeQueue.envelopes(queue)
+      assert envelope.submit_sm.short_message == <<0x00, 0x48, 0x00, 0x69>>
+      refute envelope.submit_sm.short_message == "Hi"
+      assert envelope.submit_sm.data_coding == 8
+    end
+
+    test "GSM euro uses the two-octet extension escape on the wire", %{tmp_dir: tmp_dir} do
+      {router, queue} = start_pipeline(tmp_dir)
+      input = Map.merge(valid_input(), %{content: "€", coding: 0})
+
+      assert {:ok, "mid-gsm"} = MtSubmitPipeline.submit(input, opts(router, queue, "mid-gsm"))
+      [envelope] = FakeQueue.envelopes(queue)
+      assert envelope.submit_sm.short_message == <<0x1B, 0x65>>
+    end
+
+    test "Latin-1 text is converted before enqueue", %{tmp_dir: tmp_dir} do
+      {router, queue} = start_pipeline(tmp_dir)
+      input = Map.merge(valid_input(), %{content: "é", coding: 3})
+
+      assert {:ok, "mid-l1"} = MtSubmitPipeline.submit(input, opts(router, queue, "mid-l1"))
+      [envelope] = FakeQueue.envelopes(queue)
+      assert envelope.submit_sm.short_message == <<0xE9>>
+    end
+
+    test "validate keeps original text for routing and a separate encoded field" do
+      assert {:ok, message} =
+               Production.validate(%{
+                 uid: "u1",
+                 to: "21200000",
+                 from: "1616",
+                 content: "Hi",
+                 coding: 8
+               })
+
+      assert message.content == "Hi"
+      assert message.encoded_short_message == <<0x00, 0x48, 0x00, 0x69>>
+    end
+
+    test "payload validation encodes without requiring from" do
+      assert {:ok, payload} = Production.validate_payload(%{content: "Hi", coding: 8})
+      assert payload.content == "Hi"
+      assert payload.encoded_short_message == <<0x00, 0x48, 0x00, 0x69>>
+
+      assert {:error, :missing_from} =
+               Production.validate(%{uid: "u1", to: "21200000", content: "Hi", coding: 8})
+    end
+
+    test "UCS2 wire bytes do not replace Filter.Content matching", %{tmp_dir: tmp_dir} do
+      {router, queue} = start_pipeline(tmp_dir, content_body: "Hi")
+      input = Map.merge(valid_input(), %{content: "Hi", coding: 8})
+
+      assert {:ok, "mid-filter"} =
+               MtSubmitPipeline.submit(input, opts(router, queue, "mid-filter"))
+
+      [envelope] = FakeQueue.envelopes(queue)
+      assert envelope.submit_sm.short_message == <<0x00, 0x48, 0x00, 0x69>>
+    end
+
+    test "ASCII rejects unrepresentable text before routing or billing", %{tmp_dir: tmp_dir} do
+      {router, queue} = start_pipeline(tmp_dir)
+      opts = opts(router, queue, "mid-ascii")
+      input = Map.merge(valid_input(), %{content: "é", coding: 1})
+
+      assert {:error, {:validate, :invalid_content}} = MtSubmitPipeline.submit(input, opts)
+      assert FakeQueue.envelopes(queue) == []
+      assert Routing.snapshot(router).reservations == %{}
+    end
+
+    test "255 encoded GSM octets are message_too_long before billing", %{tmp_dir: tmp_dir} do
+      {router, queue} = start_pipeline(tmp_dir)
+      opts = opts(router, queue, "mid-long")
+      input = Map.put(valid_input(), :content, String.duplicate("a", 255))
+
+      assert {:error, {:validate, :message_too_long}} = MtSubmitPipeline.submit(input, opts)
+      assert FakeQueue.envelopes(queue) == []
+      assert Routing.snapshot(router).reservations == %{}
+    end
+
+    test "254 encoded GSM octets are accepted", %{tmp_dir: tmp_dir} do
+      {router, queue} = start_pipeline(tmp_dir)
+      content = String.duplicate("a", 254)
+
+      assert {:ok, "mid-254"} =
+               MtSubmitPipeline.submit(
+                 Map.put(valid_input(), :content, content),
+                 opts(router, queue, "mid-254")
+               )
+
+      [envelope] = FakeQueue.envelopes(queue)
+      assert byte_size(envelope.submit_sm.short_message) == 254
+    end
+
+    test "hex with invalid UCS2 structure is invalid_content not malformed_hex", %{
+      tmp_dir: tmp_dir
+    } do
+      {router, queue} = start_pipeline(tmp_dir)
+      opts = opts(router, queue, "mid-ucs2-hex")
+
+      odd =
+        valid_input()
+        |> Map.delete(:content)
+        |> Map.merge(%{hex_content: "00", coding: 8})
+
+      unpaired =
+        valid_input()
+        |> Map.delete(:content)
+        |> Map.merge(%{hex_content: "D800", coding: 8})
+
+      assert {:error, {:validate, :invalid_content}} = MtSubmitPipeline.submit(odd, opts)
+      assert {:error, {:validate, :invalid_content}} = MtSubmitPipeline.submit(unpaired, opts)
+      assert FakeQueue.envelopes(queue) == []
+      assert Routing.snapshot(router).reservations == %{}
+    end
+
+    test "hex GSM dangling escape is invalid_content", %{tmp_dir: tmp_dir} do
+      {router, queue} = start_pipeline(tmp_dir)
+      opts = opts(router, queue, "mid-gsm-hex")
+
+      input =
+        valid_input()
+        |> Map.delete(:content)
+        |> Map.merge(%{hex_content: "1B", coding: 0})
+
+      assert {:error, {:validate, :invalid_content}} = MtSubmitPipeline.submit(input, opts)
+      assert FakeQueue.envelopes(queue) == []
     end
 
     test "validation failures are typed, skip later stages, and leak no secrets", %{
@@ -531,12 +664,22 @@ defmodule JasminEx.MtSubmitPipelineTest do
     {:ok, connector} = ConnectorRef.new("smpp-t")
     {:ok, dest} = Filter.Destination.new(address: "21200000")
 
+    filters =
+      case Keyword.get(opts, :content_body) do
+        nil ->
+          [dest]
+
+        body ->
+          {:ok, content} = Filter.Content.new(body: body)
+          [dest, content]
+      end
+
     {:ok, _route} =
       Routing.put_route(router,
         kind: :static,
         order: 10,
         connector: connector,
-        filters: [dest],
+        filters: filters,
         rate_minor: 100,
         precharge_percent: 10
       )
