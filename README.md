@@ -91,8 +91,7 @@ Queue encode now writes integer `version` 2. Wire `submit_sm` uses
 `submit_sm.short_message` stays a binary. v2 absent or JSON-null
 `data_coding` / `registered_delivery` default to 0. v1 JSON-null and
 `Envelope.new/1` `:null` for those fields stay invalid. This is queue
-serialization only; HTTP coding/hex/size validation and segmentation are
-not part of this change.
+serialization only.
 
 A v1 reader rejects v2 with `:unsupported_version` and the worker rejects
 without requeue. Application work-queue declarations have no owned
@@ -138,3 +137,39 @@ Required baseline metrics: connector count, rate, payload, backlog, latency,
 CPU, memory, alarms, confirms, redeliveries, and recovery. The measurement
 helper records those values with the run. Missing metrics remain incomplete
 validation and forbid any fitness claim.
+
+## HTTP send encoding
+
+`POST /send` encodes or validates the short message **before** routing,
+billing, DLR registration, or queue publish. Invalid payloads never
+reserve balance, decrement quota, register a DLR, or enqueue.
+
+Supported HTTP `coding` values are `0`, `1`, `2`, `3`, and `8`:
+
+| coding | Scheme | Text | `hex-content` |
+|---|---|---|---|
+| 0 | GSM 03.38 unpacked | Default alphabet plus `0x1B` escapes | Structural GSM decode only |
+| 1 | IA5 ASCII | Strict 7-bit ASCII | Structural ASCII decode only |
+| 2 | Octet | Raw bytes, including NUL and high bytes | Original bytes, no transform |
+| 3 | Latin-1 | ISO-8859-1 conversion | Structural Latin-1 decode only |
+| 8 | UCS2 | UTF-16BE, including valid supplementary-plane pairs | Structural UTF-16BE decode only |
+
+Text is encoded **once** with `Coding.encode_short_message/2`. Hex is
+decoded once with `Base.decode16/2`; `Coding.decode_short_message/2` is
+structural validation only and never re-encodes or transcodes. The
+original `content` (UTF-8 text, or hex-decoded bytes) is what
+`Filter.Content` sees. The submit envelope carries a separate encoded
+wire field.
+
+The 254-octet bound is the SMPP `submit_sm` `sm_length` u8 PDU limit, not
+cellular SMS capacity. This change does not segment messages.
+
+Typed HTTP 400 bodies keep the existing `error:<reason>\n` contract:
+
+| Reason | When |
+|---|---|
+| `missing_content` | Neither `content` nor `hex-content` is present |
+| `malformed_hex` | `hex-content` is not valid hex |
+| `invalid_coding` | `coding` is not 0, 1, 2, 3, or 8 |
+| `invalid_content` | Text cannot be represented, or hex bytes fail the coding's structure |
+| `message_too_long` | Encoded wire octets exceed 254 |
