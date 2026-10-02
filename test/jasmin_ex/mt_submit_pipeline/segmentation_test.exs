@@ -12,7 +12,7 @@ defmodule JasminEx.MtSubmitPipeline.SegmentationTest do
           {8, repeat(<<0, 65>>, 70)},
           {0, <<>>}
         ] do
-      for options <- [[], [concat: :sar, reference: 65535]] do
+      for options <- [[], [concat: :sar, reference: 65_535]] do
         assert {:ok, %{count: 1, segments: [segment]}} =
                  Segmentation.plan(payload, coding, options)
 
@@ -69,13 +69,13 @@ defmodule JasminEx.MtSubmitPipeline.SegmentationTest do
           {8, repeat(<<0, 65>>, 71), [132, 10]}
         ] do
       assert {:ok, %{count: 2, segments: segments}} =
-               Segmentation.plan(payload, coding, concat: :sar, reference: 65535)
+               Segmentation.plan(payload, coding, concat: :sar, reference: 65_535)
 
       assert Enum.map(segments, &byte_size(&1.short_message)) == sizes
 
       for {segment, index} <- Enum.with_index(segments, 1) do
         assert segment.esm_class == 0
-        assert segment.sar_msg_ref_num == 65535
+        assert segment.sar_msg_ref_num == 65_535
         assert segment.sar_total_segments == 2 and segment.sar_segment_seqnum == index
         assert segment.index == index and segment.count == 2
       end
@@ -192,7 +192,7 @@ defmodule JasminEx.MtSubmitPipeline.SegmentationTest do
           [reference: -1],
           [reference: 256],
           [reference: "1"],
-          [concat: :sar, reference: 65536]
+          [concat: :sar, reference: 65_536]
         ] do
       assert Segmentation.plan("a", 0, options) == {:error, :invalid_reference}
     end

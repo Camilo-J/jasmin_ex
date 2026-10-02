@@ -43,28 +43,12 @@ defmodule JasminEx.MtSubmitPipeline.Segmentation do
   end
 
   defp configuration(options) when is_list(options) do
-    if Keyword.keyword?(options) and
-         Enum.all?(Keyword.keys(options), &(&1 in [:concat, :max_segments, :reference])) and
-         length(Keyword.keys(options)) == length(Enum.uniq(Keyword.keys(options))) do
-      config = %{
+    if known_options?(options) do
+      validate_config(%{
         concat: Keyword.get(options, :concat, :udh),
         max_segments: Keyword.get(options, :max_segments, 5),
         reference: Keyword.get(options, :reference)
-      }
-
-      cond do
-        config.concat not in [:udh, :sar] ->
-          {:error, :invalid_options}
-
-        not is_integer(config.max_segments) or config.max_segments not in 1..255 ->
-          {:error, :invalid_options}
-
-        not is_nil(config.reference) and not valid_reference?(config) ->
-          {:error, :invalid_reference}
-
-        true ->
-          {:ok, config}
-      end
+      })
     else
       {:error, :invalid_options}
     end
@@ -72,8 +56,33 @@ defmodule JasminEx.MtSubmitPipeline.Segmentation do
 
   defp configuration(_options), do: {:error, :invalid_options}
 
+  defp known_options?(options) do
+    Keyword.keyword?(options) and
+      Enum.all?(Keyword.keys(options), &(&1 in [:concat, :max_segments, :reference])) and
+      length(Keyword.keys(options)) == length(Enum.uniq(Keyword.keys(options)))
+  end
+
+  defp validate_config(config) do
+    cond do
+      config.concat not in [:udh, :sar] ->
+        {:error, :invalid_options}
+
+      not valid_max_segments?(config.max_segments) ->
+        {:error, :invalid_options}
+
+      not is_nil(config.reference) and not valid_reference?(config) ->
+        {:error, :invalid_reference}
+
+      true ->
+        {:ok, config}
+    end
+  end
+
+  defp valid_max_segments?(max_segments),
+    do: is_integer(max_segments) and max_segments in 1..255
+
   defp valid_reference?(%{concat: method, reference: reference}) do
-    limit = if method == :udh, do: 255, else: 65535
+    limit = if method == :udh, do: 255, else: 65_535
     is_integer(reference) and reference >= 0 and reference <= limit
   end
 
