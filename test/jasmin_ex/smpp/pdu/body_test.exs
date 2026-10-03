@@ -294,6 +294,53 @@ defmodule JasminEx.Smpp.PDU.BodyTest do
     end
   end
 
+  describe "submit_sm optional parameters" do
+    test "appends SAR and unknown bytes without changing sm_length" do
+      optional =
+        <<0x1403::16, 2::16, 0, 255, 0x020C::16, 2::16, 42::16, 0x020E::16, 1::16, 2, 0x020F::16,
+          1::16, 1>>
+
+      body = Map.put(submit_sm_body("Hi"), :optional_parameters, optional)
+      assert {:ok, plain} = Body.encode(:submit_sm, submit_sm_body("Hi"))
+      assert {:ok, wire} = Body.encode(:submit_sm, body)
+      assert wire == plain <> optional
+      assert {:ok, ^body} = Body.decode(:submit_sm, wire)
+    end
+
+    test "UDHI and raw UDH bytes round-trip without SAR" do
+      body = %{submit_sm_body(<<5, 0, 3, 42, 2, 1, 255>>) | esm_class: 0x40}
+      assert {:ok, wire} = Body.encode(:submit_sm, body)
+      assert {:ok, ^body} = Body.decode(:submit_sm, wire)
+    end
+
+    test "wraps optional validation errors at both submit boundaries only" do
+      assert {:ok, plain} = Body.encode(:submit_sm, submit_sm_body("Hi"))
+      sar = <<0x020C::16, 2::16, 42::16, 0x020E::16, 1::16, 2, 0x020F::16, 1::16, 1>>
+
+      for {optional, reason} <- [
+            {<<1>>, :truncated},
+            {<<0x020C::16, 1::16, 1>>, :invalid_sar_length},
+            {<<0x020E::16, 1::16, 2>>, :incomplete_sar},
+            {sar <> sar, :duplicate_tag}
+          ] do
+        body = Map.put(submit_sm_body("Hi"), :optional_parameters, optional)
+        assert {:error, {:encode, ^reason}} = Body.encode(:submit_sm, body)
+        assert {:error, {:decode, ^reason}} = Body.decode(:submit_sm, plain <> optional)
+        deliver = %Body.DeliverSM{optional_parameters: optional}
+        assert {:ok, wire} = Body.encode(:deliver_sm, deliver)
+        assert {:ok, ^deliver} = Body.decode(:deliver_sm, wire)
+      end
+
+      udhi = Map.put(%{submit_sm_body("Hi") | esm_class: 0x40}, :optional_parameters, sar)
+      assert {:error, {:encode, :sar_with_udhi}} = Body.encode(:submit_sm, udhi)
+      assert {:ok, udhi_wire} = Body.encode(:submit_sm, %{udhi | optional_parameters: <<>>})
+      assert {:error, {:decode, :sar_with_udhi}} = Body.decode(:submit_sm, udhi_wire <> sar)
+
+      assert {:error, {:encode, :invalid_optional_parameters}} =
+               Body.encode(:submit_sm, Map.put(submit_sm_body("Hi"), :optional_parameters, nil))
+    end
+  end
+
   describe "deliver_sm round-trip" do
     test "encodes and decodes a deliver_sm body" do
       body = %Body.DeliverSM{
