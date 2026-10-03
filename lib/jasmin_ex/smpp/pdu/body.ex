@@ -36,9 +36,14 @@ defmodule JasminEx.Smpp.PDU.Body do
   binary remains valid. The `sm_length` field is one octet, so a
   binary `short_message` longer than 254 octets returns
   `{:error, {:encode, :short_message_too_long}}` instead of wrapping.
+
+  SubmitSM optional parameters are binary TLV bytes. Encode/decode validates
+  their structure and SAR semantics while retaining the original bytes.
+  DeliverSM continues to preserve optional bytes without semantic validation.
   """
 
   alias JasminEx.Smpp.PDU.Constants
+  alias JasminEx.Smpp.PDU.Tlv
 
   # ── nested structs ───────────────────────────────────────────────────────
 
@@ -87,7 +92,8 @@ defmodule JasminEx.Smpp.PDU.Body do
               replace_if_present_flag: 0,
               data_coding: :SMSC_DEFAULT_ALPHABET,
               sm_default_msg_id: 0,
-              short_message: ""
+              short_message: "",
+              optional_parameters: <<>>
 
     @type t :: %__MODULE__{
             service_type: String.t(),
@@ -106,7 +112,8 @@ defmodule JasminEx.Smpp.PDU.Body do
             replace_if_present_flag: non_neg_integer(),
             data_coding: atom() | non_neg_integer(),
             sm_default_msg_id: non_neg_integer(),
-            short_message: String.t()
+            short_message: String.t(),
+            optional_parameters: binary()
           }
   end
 
@@ -295,14 +302,21 @@ defmodule JasminEx.Smpp.PDU.Body do
   defp encode_bounded_submit_sm(%SubmitSM{} = b) do
     case b.short_message do
       sm_bytes when is_binary(sm_bytes) ->
-        if byte_size(sm_bytes) > @max_submit_sm_octets do
-          {:error, {:encode, :short_message_too_long}}
-        else
-          encode_submit_sm(b)
-        end
+        encode_bounded_submit_sm_bytes(b, sm_bytes)
 
       _invalid ->
         {:error, {:encode, :invalid_short_message}}
+    end
+  end
+
+  defp encode_bounded_submit_sm_bytes(_b, sm_bytes)
+       when byte_size(sm_bytes) > @max_submit_sm_octets do
+    {:error, {:encode, :short_message_too_long}}
+  end
+
+  defp encode_bounded_submit_sm_bytes(b, _sm_bytes) do
+    with :ok <- validate_optional(:submit_sm, b.optional_parameters, b.esm_class, :encode) do
+      encode_submit_sm(b)
     end
   end
 
@@ -383,24 +397,31 @@ defmodule JasminEx.Smpp.PDU.Body do
     {:error, {:decode, :truncated}}
   end
 
-  # Happy path: extract short_message and keep trailing optional bytes on deliver_sm
+  # Keep optional bytes lossless; only SubmitSM enforces SAR submission semantics.
   defp build_submit_sm(rest, sm_length, shape, fields) do
     <<short_message::binary-size(^sm_length), optional::binary>> = rest
 
-    {:ok,
-     build_submit_struct(
-       shape,
-       fields
-       |> Map.put(:short_message, short_message)
-       |> maybe_optional(shape, optional)
-     )}
+    with :ok <- validate_optional(shape, optional, fields.esm_class, :decode) do
+      {:ok,
+       build_submit_struct(
+         shape,
+         fields
+         |> Map.put(:short_message, short_message)
+         |> Map.put(:optional_parameters, optional)
+       )}
+    end
   end
 
-  defp maybe_optional(fields, :deliver_sm, optional),
-    do: Map.put(fields, :optional_parameters, optional)
+  defp validate_optional(:deliver_sm, _bytes, _esm_class, _direction), do: :ok
 
-  defp maybe_optional(fields, _shape, _optional), do: fields
+  defp validate_optional(:submit_sm, bytes, esm_class, direction) do
+    case Tlv.validate_sar(bytes, esm_class) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {direction, reason}}
+    end
+  end
 
+  defp optional_bytes(%SubmitSM{optional_parameters: bytes}), do: bytes
   defp optional_bytes(%DeliverSM{optional_parameters: bytes}) when is_binary(bytes), do: bytes
   defp optional_bytes(_body), do: <<>>
 
