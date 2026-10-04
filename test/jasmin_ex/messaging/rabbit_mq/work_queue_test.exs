@@ -4,6 +4,7 @@ defmodule JasminEx.Messaging.RabbitMQ.WorkQueueTest do
   alias JasminEx.Messaging.{Envelope, WorkQueue}
   alias JasminEx.Messaging.RabbitMQ.WorkQueue, as: Adapter
   alias JasminEx.Messaging.WorkQueue.Delivery
+  alias JasminEx.Smpp.PDU.Tlv
 
   defmodule FakePublisher do
     def publish(agent, connector_id, payload) do
@@ -170,9 +171,60 @@ defmodule JasminEx.Messaging.RabbitMQ.WorkQueueTest do
     assert retried.expires_at == "2099-01-01T00:00:00Z"
   end
 
-  defp start_queue(publisher \\ FakePublisher, short_message \\ "hello") do
+  test "enqueue, retry, and quarantine preserve optional_parameters" do
+    {:ok, optional} =
+      Tlv.encode(
+        sar_msg_ref_num: 42,
+        sar_total_segments: 2,
+        sar_segment_seqnum: 1
+      )
+
+    {queue, agent, envelope} = start_queue(FakePublisher, "hello", optional)
+    assert envelope.submit_sm.optional_parameters === optional
+    assert :ok = WorkQueue.enqueue(queue, envelope)
+    assert [{:publish, "alpha", payload}] = events(agent)
+    wire = :json.decode(payload)
+    assert wire["version"] === 2
+    refute Map.has_key?(wire["submit_sm"], "optional_parameters")
+    assert wire["submit_sm"]["optional_parameters_base64"] == Base.encode64(optional)
+    assert {:ok, decoded} = Envelope.decode(payload)
+    assert decoded.submit_sm.optional_parameters === optional
+
+    delivery = %Delivery{envelope: envelope, reference: 8}
+    assert :ok = WorkQueue.retry(queue, delivery, %{stage: :pre_write})
+    assert :ok = WorkQueue.quarantine(queue, delivery, %{stage: :post_write, reason: :bind_lost})
+
+    assert [
+             {:publish, "alpha", _enqueued},
+             {:publish, "alpha", retry_payload},
+             {:ack, 8},
+             {:publish, "alpha.quarantine", quarantine_payload},
+             {:ack, 8}
+           ] = events(agent)
+
+    assert {:ok, retried} = Envelope.decode(retry_payload)
+    assert retried.attempt == 2
+    assert retried.submit_sm.optional_parameters === optional
+    assert retried.submit_sm == envelope.submit_sm
+    assert :json.decode(retry_payload)["version"] === 2
+
+    assert {:ok, quarantined} = Envelope.decode(quarantine_payload)
+    assert quarantined.submit_sm.optional_parameters === optional
+    assert quarantined.attempt == 1
+
+    assert :json.decode(quarantine_payload)["evidence"] == %{
+             "reason" => "bind_lost",
+             "stage" => "post_write"
+           }
+  end
+
+  defp start_queue(
+         publisher \\ FakePublisher,
+         short_message \\ "hello",
+         optional_parameters \\ nil
+       ) do
     {:ok, agent} = Agent.start_link(fn -> [] end)
-    {:ok, envelope} = valid_envelope(short_message)
+    {:ok, envelope} = valid_envelope(short_message, optional_parameters)
     {{Adapter, context(agent, publisher)}, agent, envelope}
   end
 
@@ -187,7 +239,18 @@ defmodule JasminEx.Messaging.RabbitMQ.WorkQueueTest do
 
   defp events(agent), do: Agent.get(agent, &Enum.reverse/1)
 
-  defp valid_envelope(short_message) do
+  defp valid_envelope(short_message, optional_parameters) do
+    submit_sm = %{
+      source_addr: "+12025550100",
+      destination_addr: "+12025550101",
+      short_message: short_message
+    }
+
+    submit_sm =
+      if is_nil(optional_parameters),
+        do: submit_sm,
+        else: Map.put(submit_sm, :optional_parameters, optional_parameters)
+
     Envelope.new(%{
       gateway_id: "gw-adapter",
       connector_id: "alpha",
@@ -195,11 +258,7 @@ defmodule JasminEx.Messaging.RabbitMQ.WorkQueueTest do
       max_attempts: 3,
       enqueued_at: "2026-08-01T15:00:00Z",
       expires_at: "2099-01-01T00:00:00Z",
-      submit_sm: %{
-        source_addr: "+12025550100",
-        destination_addr: "+12025550101",
-        short_message: short_message
-      }
+      submit_sm: submit_sm
     })
   end
 end

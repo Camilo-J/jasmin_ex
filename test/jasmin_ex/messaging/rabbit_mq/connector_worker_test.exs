@@ -3,6 +3,7 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
 
   alias JasminEx.Messaging.{Envelope, SettlementJournal, StateStoreJournal}
   alias JasminEx.Messaging.RabbitMQ.{Config, Connection, ConnectorWorker}
+  alias JasminEx.Smpp.PDU.Tlv
 
   @future "2099-01-01T00:00:00Z"
   @past "2020-01-01T00:00:00Z"
@@ -602,6 +603,10 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     for payload <- [
           v2_payload("hello", %{"gateway_id" => "gw-bad"}, %{"short_message_base64" => "!!!!"}),
           v2_payload("hello", %{"gateway_id" => "gw-conflict"}, %{"short_message" => "hello"}),
+          v2_payload("hello", %{"gateway_id" => "gw-opt"}, %{
+            "optional_parameters_base64" => "!!!!"
+          }),
+          v2_payload("hello", %{"gateway_id" => "gw-opt-raw"}, %{"optional_parameters" => "AA=="}),
           missing_short_message_base64
         ] do
       {store, _} = journal_store()
@@ -620,6 +625,8 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
       refute_received {:submitted, _}
       assert StateStoreJournal.read(store, "gw-bad", 1) == :missing
       assert StateStoreJournal.read(store, "gw-conflict", 1) == :missing
+      assert StateStoreJournal.read(store, "gw-opt", 1) == :missing
+      assert StateStoreJournal.read(store, "gw-opt-raw", 1) == :missing
       assert StateStoreJournal.read(store, "gw-missing", 1) == :missing
       events = Fake.events(agent)
       assert {:reject, 1, 1, [requeue: false]} in events
@@ -673,6 +680,65 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
              Base.encode64("aGVsbG8=")
 
     refute retry_wire["submit_sm"]["short_message_base64"] == "aGVsbG8="
+    assert Process.alive?(worker)
+    stop(worker, agent)
+  end
+
+  test "retries preserve optional_parameters from a v2 envelope", %{config: config} do
+    {store, _} = journal_store()
+    test = self()
+
+    {:ok, optional} =
+      Tlv.encode(
+        sar_msg_ref_num: 42,
+        sar_total_segments: 2,
+        sar_segment_seqnum: 1
+      )
+
+    {worker, agent} =
+      start_bound(config, "alpha", fn agent ->
+        [
+          store: store,
+          submit: fn env ->
+            send(test, {:submitted, env})
+            {:error, :disconnected}
+          end,
+          republish: republish_ok(agent)
+        ]
+      end)
+
+    {_envelope, payload} =
+      valid_payload(%{
+        gateway_id: "gw-sar",
+        attempt: 1,
+        max_attempts: 3,
+        expires_at: @future,
+        submit_sm: %{
+          source_addr: "+12025550100",
+          destination_addr: "+12025550101",
+          short_message: "hello",
+          optional_parameters: optional
+        }
+      })
+
+    assert :ok = Fake.deliver(agent, payload)
+    assert ConnectorWorker.inflight(worker) == nil
+    assert_received {:submitted, env}
+    assert env.submit_sm.optional_parameters === optional
+    events = Fake.events(agent)
+    assert {:republish, {:retry, next}} = find(events, :republish)
+    assert next.attempt == 2
+    assert next.submit_sm.optional_parameters === optional
+    assert next.gateway_id == "gw-sar"
+
+    assert {:ok, encoded_retry} = Envelope.encode(next)
+    retry_wire = :json.decode(encoded_retry)
+    assert retry_wire["version"] === 2
+    refute Map.has_key?(retry_wire["submit_sm"], "optional_parameters")
+
+    assert retry_wire["submit_sm"]["optional_parameters_base64"] ==
+             Base.encode64(optional)
+
     assert Process.alive?(worker)
     stop(worker, agent)
   end

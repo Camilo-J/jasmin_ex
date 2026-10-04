@@ -1,9 +1,12 @@
 # SMPP concatenation codec
 
-`SubmitSM.optional_parameters` now carries binary TLV bytes after `short_message`,
-just like `DeliverSM`. Empty optional bytes preserve ordinary SubmitSM wire output.
-This is codec support only: it does not split messages or activate HTTP submission,
-planner integration, queueing, billing, retries, or delivery-receipt aggregation.
+`SubmitSM.optional_parameters` carries binary TLV bytes after `short_message`,
+just like `DeliverSM`. The queue envelope transports those bytes as v2
+`optional_parameters_base64` through retries and quarantine. Empty optional
+bytes keep ordinary SubmitSM and envelope v2 wire output unchanged. HTTP
+remains single-message: this does not split messages or activate HTTP
+multipart submission, planner integration, billing, or delivery-receipt
+aggregation.
 
 ## Encode SAR parameters
 
@@ -20,6 +23,17 @@ The reference is an unsigned 16-bit integer (0–65535); total and sequence are
 unsigned 8-bit integers (1–255). All three parameters must appear together,
 and sequence must not exceed total. SAR parameters cannot accompany UDHI (`0x40`).
 UDH-only messages still round-trip with their existing `esm_class` and payload bytes.
+
+## Queue envelope
+
+In-memory `submit_sm.optional_parameters` is a binary. Encode writes canonical
+padded `optional_parameters_base64` only when those bytes are non-empty. Absent
+v1/v2 fields stay valid. Raw v2 `optional_parameters` and noncanonical Base64
+are rejected. Envelope transport preserves unknown TLV bytes and does not
+repeat PDU SAR validation.
+
+`struct(SubmitSM, envelope.submit_sm)` is the encode boundary. Worker and
+queue retries copy `submit_sm` as a whole.
 
 ## Decode and validation boundaries
 

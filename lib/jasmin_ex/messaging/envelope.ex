@@ -2,10 +2,13 @@ defmodule JasminEx.Messaging.Envelope do
   @moduledoc """
   Represents and serializes a queued messaging request.
 
-  Encode writes integer version 2. The wire `submit_sm` field is
-  `short_message_base64` (standard padded canonical Base64). The in-memory
-  struct still holds binary `submit_sm.short_message`. Version 1 JSON is
-  decoded as original text bytes and is never Base64-decoded or transcoded.
+  Encode writes integer version 2. Wire `submit_sm` uses
+  `short_message_base64` and, when non-empty, `optional_parameters_base64`
+  (standard padded canonical Base64). In-memory `submit_sm.short_message`
+  stays a binary; `submit_sm.optional_parameters` is present only for
+  non-empty bytes. Version 1 JSON is decoded as original text bytes and is
+  never Base64-decoded or transcoded. Envelope transport does not validate
+  SAR or other TLV semantics.
   """
 
   @v1 1
@@ -75,36 +78,59 @@ defmodule JasminEx.Messaging.Envelope do
 
   defp materialize_submit_sm(%{"version" => @v2, "submit_sm" => submit} = attributes)
        when is_map(submit) do
-    if Map.has_key?(submit, "short_message") do
-      {:error, :invalid_envelope}
-    else
-      case decode_v2_short_message(submit) do
-        {:ok, submit} -> {:ok, Map.put(attributes, "submit_sm", submit)}
-        error -> error
-      end
+    with :ok <- reject_v2_raw_fields(submit),
+         {:ok, submit} <- decode_v2_binary_fields(submit) do
+      {:ok, Map.put(attributes, "submit_sm", submit)}
     end
   end
 
   defp materialize_submit_sm(%{"version" => @v2}), do: {:error, :invalid_envelope}
   defp materialize_submit_sm(attributes), do: {:ok, attributes}
 
-  defp decode_v2_short_message(submit) do
-    case Map.fetch(submit, "short_message_base64") do
+  defp reject_v2_raw_fields(submit) do
+    if Map.has_key?(submit, "short_message") or Map.has_key?(submit, "optional_parameters") do
+      {:error, :invalid_envelope}
+    else
+      :ok
+    end
+  end
+
+  defp decode_v2_binary_fields(submit) do
+    with {:ok, submit} <- decode_required_base64(submit, "short_message_base64", "short_message"),
+         {:ok, submit} <-
+           decode_optional_base64(submit, "optional_parameters_base64", "optional_parameters") do
+      {:ok, absents_v2_json_null(submit)}
+    end
+  end
+
+  defp decode_required_base64(submit, from, to) do
+    case Map.fetch(submit, from) do
+      {:ok, encoded} when is_binary(encoded) -> put_decoded_base64(submit, from, to, encoded)
+      _ -> {:error, :invalid_envelope}
+    end
+  end
+
+  defp decode_optional_base64(submit, from, to) do
+    case Map.fetch(submit, from) do
+      :error ->
+        {:ok, submit}
+
       {:ok, encoded} when is_binary(encoded) ->
         case canonical_base64(encoded) do
-          {:ok, bytes} ->
-            {:ok,
-             submit
-             |> Map.delete("short_message_base64")
-             |> Map.put("short_message", bytes)
-             |> absents_v2_json_null()}
-
-          :error ->
-            {:error, :invalid_envelope}
+          {:ok, <<>>} -> {:ok, Map.delete(submit, from)}
+          {:ok, bytes} -> {:ok, submit |> Map.delete(from) |> Map.put(to, bytes)}
+          :error -> {:error, :invalid_envelope}
         end
 
       _ ->
         {:error, :invalid_envelope}
+    end
+  end
+
+  defp put_decoded_base64(submit, from, to, encoded) do
+    case canonical_base64(encoded) do
+      {:ok, bytes} -> {:ok, submit |> Map.delete(from) |> Map.put(to, bytes)}
+      :error -> {:error, :invalid_envelope}
     end
   end
 
@@ -147,7 +173,8 @@ defmodule JasminEx.Messaging.Envelope do
            destination_addr: destination,
            short_message: message,
            data_coding: Map.get(submit_sm, "data_coding"),
-           registered_delivery: Map.get(submit_sm, "registered_delivery")
+           registered_delivery: Map.get(submit_sm, "registered_delivery"),
+           optional_parameters: Map.get(submit_sm, "optional_parameters")
          })
 
   defp validate_submit_sm(
@@ -160,15 +187,18 @@ defmodule JasminEx.Messaging.Envelope do
        when is_binary(source) and is_binary(destination) and is_binary(message) do
     with {:ok, data_coding} <- normalize_data_coding(Map.get(submit_sm, :data_coding)),
          {:ok, registered_delivery} <-
-           normalize_registered_delivery(Map.get(submit_sm, :registered_delivery)) do
-      {:ok,
-       %{
-         source_addr: source,
-         destination_addr: destination,
-         short_message: message,
-         data_coding: data_coding,
-         registered_delivery: registered_delivery
-       }}
+           normalize_registered_delivery(Map.get(submit_sm, :registered_delivery)),
+         {:ok, optional} <-
+           normalize_optional_parameters(Map.get(submit_sm, :optional_parameters)) do
+      submit = %{
+        source_addr: source,
+        destination_addr: destination,
+        short_message: message,
+        data_coding: data_coding,
+        registered_delivery: registered_delivery
+      }
+
+      {:ok, put_optional_parameters(submit, optional)}
     else
       :error -> {:error, :invalid_submit_sm}
     end
@@ -201,6 +231,14 @@ defmodule JasminEx.Messaging.Envelope do
   defp normalize_registered_delivery(1), do: {:ok, 1}
   defp normalize_registered_delivery(_value), do: :error
 
+  defp normalize_optional_parameters(nil), do: {:ok, :absent}
+  defp normalize_optional_parameters(<<>>), do: {:ok, :absent}
+  defp normalize_optional_parameters(bytes) when is_binary(bytes), do: {:ok, bytes}
+  defp normalize_optional_parameters(_bytes), do: :error
+
+  defp put_optional_parameters(submit, :absent), do: submit
+  defp put_optional_parameters(submit, bytes), do: Map.put(submit, :optional_parameters, bytes)
+
   defp stringify_envelope(attributes) do
     attributes
     |> Map.update!(:submit_sm, &stringify_submit_sm/1)
@@ -212,8 +250,19 @@ defmodule JasminEx.Messaging.Envelope do
 
     submit_sm
     |> Map.delete(:short_message)
+    |> encode_optional_parameters()
     |> Map.put(:short_message_base64, Base.encode64(message))
     |> Map.new(fn {key, value} -> {Atom.to_string(key), value} end)
+  end
+
+  defp encode_optional_parameters(submit_sm) do
+    case Map.pop(submit_sm, :optional_parameters) do
+      {bytes, rest} when is_binary(bytes) and byte_size(bytes) > 0 ->
+        Map.put(rest, :optional_parameters_base64, Base.encode64(bytes))
+
+      {_absent, rest} ->
+        rest
+    end
   end
 
   defp atomize_known_keys(attributes) do
