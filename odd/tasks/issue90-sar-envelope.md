@@ -5,10 +5,10 @@ Preserve encoded SMPP optional parameters through queue serialization and retrie
 
 ## Authorized scope and constraints
 User authorized continuing issue 90 locally and fetching origin. Branch: `feat/sar-envelope-90`; base and first reviewed boundary: `032b091743bea88705833f165d435ad34cbb4527`.
-No push, PR, merge, billing/quota changes, HTTP multipart activation, DLR aggregation, northbound or idempotency work. Two retries means three attempts; retain existing retry behavior. Full-cost reservation was previously approved; quota and uncertain settlement require later decisions.
+User authorized push to origin and a PR toward main in Camilo-J/jasmin_ex, using configured Git/GitHub credentials, with non-closing Refs #90 and no labels. No merge, billing/quota changes, HTTP multipart activation, DLR aggregation, northbound or idempotency work. Two retries means three attempts; retain existing retry behavior. Full-cost reservation was previously approved; quota and uncertain settlement require later decisions.
 
 ## Delivery strategy
-`ask-on-risk`; user selected `stacked-to-main` (independent deliveries). Forecast 280–380 authored lines plus this tracking document, generated files excluded. Actual 425 lines retain one coherent transport behavior with its regression tests; no cosmetic reductions. This unit remains independent of later HTTP activation. No remote publication.
+`ask-on-risk`; user selected `stacked-to-main` (independent deliveries). After one honest slicing pass, the user explicitly accepted a 467-line publication exception (419 additions, 48 deletions, including this document). Actual 425 behavior lines retain one coherent transport behavior with its regression tests; no cosmetic reductions. This unit remains independent of later HTTP activation. Do not create unavailable size/type/approval labels.
 
 ## Tasks
 - [x] T1 Preserve binary optional parameters through envelope v2, retry and quarantine paths, with tests and documentation.
@@ -39,4 +39,4 @@ Rollback boundary: envelope optional-parameter transport, accompanying tests and
 Engram mirror: initial write/readback confirmed; current progress mirrored by parent.
 
 ## Next step
-This transport unit is locally committed; no push or PR is authorized. HTTP activation and billing remain pending future units. Resolve remaining quota/uncertain-settlement decisions before those units. Any future PR size exception remains a separate publication decision. Resume native review only through a published fix or documented maintainer-authorized recovery, never unpublished code.
+Publish this transport unit as an independent PR toward main with Refs #90; no merge is authorized. HTTP activation and billing remain pending future units. Resolve remaining quota/uncertain-settlement decisions before those units. Required remote check is ci; a PR is not merge-ready until required checks are observed. Resume native review only through a published fix or documented maintainer-authorized recovery, never unpublished code.
