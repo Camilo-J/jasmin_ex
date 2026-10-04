@@ -11,7 +11,7 @@ No push, PR, merge, billing/quota changes, HTTP multipart activation, DLR aggreg
 `ask-on-risk`; user selected `stacked-to-main` (independent deliveries). Forecast 280–380 authored lines plus this tracking document, generated files excluded. Actual 425 lines retain one coherent transport behavior with its regression tests; no cosmetic reductions. This unit remains independent of later HTTP activation. No remote publication.
 
 ## Tasks
-- [ ] T1 Preserve binary optional parameters through envelope v2, retry and quarantine paths, with tests and documentation.
+- [x] T1 Preserve binary optional parameters through envelope v2, retry and quarantine paths, with tests and documentation.
   - Route: delegated direct; trigger: preparation for writing and multiple non-trivial implementation/test files.
   - Keep version 2 and canonical padded Base64 for wire binary values; absent fields remain backward compatible.
   - Preserve SAR/unknown TLV bytes without duplicating PDU semantic validation.
@@ -28,12 +28,15 @@ Default applicable deterministic test-first policy; no verified global strict-TD
 Runtime harness: deterministic queue/PDU tests, no external broker needed. RDD is on (global); native assessment and candidate consent apply before any native review.
 
 ## Progress and evidence
-Fetch completed; origin/main contains merged planner #101 and SAR codec #102. Branch created from origin/main. Implementation complete; task closure and commit pending.
+Fetch completed; origin/main contains merged planner #101 and SAR codec #102. Branch created from origin/main. Implementation and functional verification complete.
 Observed RED: 9 failing new tests. GREEN: 69 focused tests; full suite 792 passed, 29 excluded; format and strict Credo passed; Dialyzer 0 errors. Parent reran focused tests: 69 passed.
-Candidate authored line count: 425 (377 additions, 48 deletions), excluding this task document. Commit count: 0. Commit: pending final assessment. Chain strategy resolved by user: independent deliveries.
-Initial native assessment: high/unassessable because this task document is untracked; no review started and no approval claimed. Declare the intended task file before assessment/preflight. RDD remains on.
+Behavior authored line count: 425 (377 additions, 48 deletions); work-unit commit including this task document: 464 authored lines. Commit: `7b5a508d390f9caf6cc47877231e6e5c06e2c843`, tree `f9a37d5afb06ec5e71e4abd64ac246e500ea2578`. Chain strategy: user-selected independent deliveries.
+Native assessment after declaring the task file: medium. Review consent granted, but the exact native reviewer task was refused with `binding_mismatch`. No reviewer verdict or receipt exists; the refused slot remains pending and no further reviewer launch is authorized by this closure.
+User selected report and continue. One privacy-scrubbed occurrence comment was confirmed on the existing canonical issue: https://github.com/Gentleman-Programming/gentle-ai/issues/4966#issuecomment-5985705633. No issue-state or label changes. A relevant published fix was not verifiable.
+The exact captured decline invocation succeeded: `action: declined`, `consent: declined_this_candidate`, target matched. Native bound STATUS was re-entered; it still showed the pending slot. Ordinary medium-tier writer verification and parent spot check are the proof of record. No native approval is claimed. RDD remains globally enabled.
+Post-commit assessment against `032b091` reports medium / `slice_budget_reached`; this unchanged candidate was explicitly left unreviewed via the validated native decline. Do not reopen review automatically for delivery.
 Rollback boundary: envelope optional-parameter transport, accompanying tests and docs only.
 Engram mirror: initial write/readback confirmed; current progress mirrored by parent.
 
 ## Next step
-Assess the declared candidate and follow native candidate consent. No publishing is authorized. Record the local commit identity and terminal checks before task closure. HTTP activation and billing remain pending future units. Any future PR size exception remains a separate publication decision.
+This transport unit is locally committed; no push or PR is authorized. HTTP activation and billing remain pending future units. Resolve remaining quota/uncertain-settlement decisions before those units. Any future PR size exception remains a separate publication decision. Resume native review only through a published fix or documented maintainer-authorized recovery, never unpublished code.
