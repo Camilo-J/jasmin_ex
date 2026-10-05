@@ -78,6 +78,70 @@ defmodule JasminEx.Routing.BillingTest do
     assert state.reservations == %{}
   end
 
+  test "insufficient total balance for N segments leaves state unchanged" do
+    {state, admission} =
+      fixture(balance_minor: 299, submit_quota: 5, rate_minor: 100, segment_count: 3)
+
+    before = state
+    assert {:error, :insufficient_balance} = State.admit(state, admission, clock())
+    assert state == before
+    assert state.users["u1"].balance_minor == 299
+    assert state.users["u1"].submit_quota == 5
+    assert state.reservations == %{}
+  end
+
+  test "insufficient N quota leaves state unchanged" do
+    {state, admission} =
+      fixture(balance_minor: 500, submit_quota: 2, rate_minor: 100, segment_count: 3)
+
+    before = state
+    assert {:error, :insufficient_quota} = State.admit(state, admission, clock())
+    assert state == before
+    assert state.users["u1"].submit_quota == 2
+    assert state.users["u1"].balance_minor == 500
+    assert state.reservations == %{}
+  end
+
+  test "admitted N-segment totals debit unit times N and N quota" do
+    {state, admission} =
+      fixture(
+        balance_minor: 50,
+        submit_quota: 5,
+        rate_minor: 3,
+        precharge_percent: 50,
+        segment_count: 3
+      )
+
+    assert {:ok, next} = State.admit(state, admission, clock())
+    user = next.users["u1"]
+    reservation = next.reservations["bill-1"]
+    assert user.balance_minor == 41
+    assert user.submit_quota == 2
+    assert reservation.captured_minor == 3
+    assert reservation.reserved_minor == 6
+    assert reservation.refundable_minor == 6
+    assert state.users["u1"].balance_minor == 50
+    assert state.users["u1"].submit_quota == 5
+  end
+
+  test "zero-priced N-segment bills still debit N quota" do
+    {state, admission} =
+      fixture(
+        balance_minor: 500,
+        submit_quota: 5,
+        rate_minor: 0,
+        precharge_percent: 10,
+        segment_count: 4
+      )
+
+    assert {:ok, next} = State.admit(state, admission, clock())
+    reservation = next.reservations["bill-1"]
+    assert next.users["u1"].balance_minor == 500
+    assert next.users["u1"].submit_quota == 1
+    assert reservation.captured_minor == 0
+    assert reservation.reserved_minor == 0
+  end
+
   test "unlimited nil balance and quota skip debit" do
     {state, admission} = fixture(balance_minor: nil, submit_quota: nil)
     assert {:ok, next} = State.admit(state, admission, clock())
@@ -713,11 +777,23 @@ defmodule JasminEx.Routing.BillingTest do
   defp admission(opts) do
     {:ok, bill} =
       Bill.new(
-        bill_id: Keyword.get(opts, :bill_id, "bill-1"),
-        uid: Keyword.get(opts, :uid, "u1"),
-        route_order: Keyword.get(opts, :route_order, 10),
-        rate_minor: Keyword.get(opts, :rate_minor, 100),
-        precharge_percent: Keyword.get(opts, :precharge_percent, 10)
+        [
+          bill_id: "bill-1",
+          uid: "u1",
+          route_order: 10,
+          rate_minor: 100,
+          precharge_percent: 10
+        ]
+        |> Keyword.merge(
+          Keyword.take(opts, [
+            :bill_id,
+            :uid,
+            :route_order,
+            :rate_minor,
+            :precharge_percent,
+            :segment_count
+          ])
+        )
       )
 
     {:ok, admission} = Admission.new(bill: bill, ttl_ms: Keyword.get(opts, :ttl_ms, 1_000))
@@ -755,11 +831,14 @@ defmodule JasminEx.Routing.BillingTest do
 
     {:ok, bill} =
       Bill.new(
-        bill_id: Keyword.get(opts, :bill_id, "bill-1"),
-        uid: "u1",
-        route_order: 10,
-        rate_minor: route.rate_minor,
-        precharge_percent: route.precharge_percent
+        [
+          bill_id: Keyword.get(opts, :bill_id, "bill-1"),
+          uid: "u1",
+          route_order: 10,
+          rate_minor: route.rate_minor,
+          precharge_percent: route.precharge_percent
+        ]
+        |> Keyword.merge(Keyword.take(opts, [:segment_count]))
       )
 
     {:ok, admission} = Admission.new(bill: bill, ttl_ms: Keyword.get(opts, :ttl_ms, 1_000))

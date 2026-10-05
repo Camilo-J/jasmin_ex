@@ -2,6 +2,8 @@
 
 `JasminEx.MtSubmitPipeline.Segmentation.plan/3` plans already-encoded SMS bytes without transport, randomness, billing, or queue side effects. **HTTP multipart submission is not active.** Existing HTTP/PDU limits and wire behavior are unchanged.
 
+`JasminEx.Billing.Bill.new/1` optionally accepts `segment_count` as an integer `1..255`. Omit it to keep the existing single-segment bill. `rate_minor` is still the per-segment unit price; the constructed bill stores `unit * N` as total `rate_minor` and `N` as `quota_debit`. Rounding splits the unit rate first, then multiplies precharge and remainder by `N`. Explicit `nil` or any other invalid count returns `{:error, :invalid_segment_count}`. A total past signed int64 returns `{:error, :amount_overflow}`. Count `255` is the representational protocol bound; the HTTP planner's configurable user max (default `5`) is unchanged. This constructor does not activate HTTP multipart billing.
+
 ## API
 
 ```elixir

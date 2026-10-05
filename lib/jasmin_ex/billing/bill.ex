@@ -3,7 +3,8 @@ defmodule JasminEx.Billing.Bill do
 
   @max_int64 9_223_372_036_854_775_807
   @max_id_bytes 128
-  @quota_debit 1
+  @max_segment_count 255
+  @default_segment_count 1
 
   @enforce_keys [
     :bill_id,
@@ -25,7 +26,7 @@ defmodule JasminEx.Billing.Bill do
           precharge_percent: 0..100,
           precharge_minor: non_neg_integer(),
           remainder_minor: non_neg_integer(),
-          quota_debit: 1
+          quota_debit: 1..255
         }
 
   @spec new(term()) ::
@@ -36,14 +37,17 @@ defmodule JasminEx.Billing.Bill do
              | :invalid_route
              | :invalid_amount
              | :amount_overflow
-             | :invalid_percentage}
+             | :invalid_percentage
+             | :invalid_segment_count}
   def new(attrs) when is_list(attrs) do
     with {:ok, bill_id} <- validate_id(Keyword.get(attrs, :bill_id), :invalid_bill_id),
          {:ok, uid} <- validate_id(Keyword.get(attrs, :uid), :invalid_uid),
          {:ok, route_order} <- validate_route_order(Keyword.get(attrs, :route_order)),
-         {:ok, rate_minor} <- validate_rate(Keyword.get(attrs, :rate_minor)),
-         {:ok, percent} <- validate_percent(Keyword.get(attrs, :precharge_percent)) do
-      {precharge_minor, remainder_minor} = split(rate_minor, percent)
+         {:ok, unit_rate} <- validate_rate(Keyword.get(attrs, :rate_minor)),
+         {:ok, percent} <- validate_percent(Keyword.get(attrs, :precharge_percent)),
+         {:ok, segment_count} <- validate_segment_count(Keyword.fetch(attrs, :segment_count)),
+         {:ok, rate_minor} <- scale_amount(unit_rate, segment_count) do
+      {unit_precharge, unit_remainder} = split(unit_rate, percent)
 
       {:ok,
        %__MODULE__{
@@ -52,9 +56,9 @@ defmodule JasminEx.Billing.Bill do
          route_order: route_order,
          rate_minor: rate_minor,
          precharge_percent: percent,
-         precharge_minor: precharge_minor,
-         remainder_minor: remainder_minor,
-         quota_debit: @quota_debit
+         precharge_minor: unit_precharge * segment_count,
+         remainder_minor: unit_remainder * segment_count,
+         quota_debit: segment_count
        }}
     end
   end
@@ -85,6 +89,19 @@ defmodule JasminEx.Billing.Bill do
     do: {:ok, percent}
 
   defp validate_percent(_percent), do: {:error, :invalid_percentage}
+
+  defp validate_segment_count(:error), do: {:ok, @default_segment_count}
+
+  defp validate_segment_count({:ok, count})
+       when is_integer(count) and count >= 1 and count <= @max_segment_count,
+       do: {:ok, count}
+
+  defp validate_segment_count(_count), do: {:error, :invalid_segment_count}
+
+  defp scale_amount(unit_rate, segment_count) do
+    total = unit_rate * segment_count
+    if total > @max_int64, do: {:error, :amount_overflow}, else: {:ok, total}
+  end
 
   defp split(rate_minor, percent) do
     precharge_minor = div(rate_minor * percent, 100)
