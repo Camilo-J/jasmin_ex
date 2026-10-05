@@ -5,7 +5,7 @@ Preserve SubmitSM `esm_class` through envelope serialization, queue retries and 
 
 ## Authorized scope and constraints
 User authorized local continuation and a fresh origin fetch using configured Git credentials. Branch: `feat/udh-envelope-90`; base and first reviewed boundary: `da79a9d20552a3b9e90128a4a3ef7829675ae119` (merged PR #103).
-No push, PR, merge, HTTP activation, billing/quota changes, DLR aggregation, northbound or idempotency work. Preserve single-message compatibility and SAR transport. UDH is the previously approved default; SAR remains configurable. Full-cost reservation and segment-first price/rounding are approved; quota and partial/uncertain settlement remain unresolved future decisions.
+User authorized push to origin and a PR toward main in Camilo-J/jasmin_ex, using configured Git/GitHub credentials, with non-closing Refs #90 and no labels. No merge, HTTP activation, billing/quota changes, DLR aggregation, northbound or idempotency work. Preserve single-message compatibility and SAR transport. UDH is the previously approved default; SAR remains configurable. Full-cost reservation and segment-first price/rounding are approved; quota and partial/uncertain settlement remain unresolved future decisions.
 
 ## Delivery strategy
 Independent deliveries (`stacked-to-main`), inherited from issue 90. Forecast 150–250 authored behavior/test/doc lines plus this task document. The previous 467-line publication exception applied only to PR #103. Ask before a new oversized delivery; never shrink tests or documentation cosmetically.
@@ -31,9 +31,9 @@ Runtime boundary: deterministic queue/PDU tests without an external broker. Nati
 Fresh origin/main fetch confirmed merged PR #103 (`da79a9d`); branch created from that commit. Implementation and functional verification are complete. RDD: on (global), installed build 4.0.0.
 Observed RED: 7 new tests failed with `KeyError` because `esm_class` was dropped. GREEN: 76 focused tests. Writer reported full suite 799 passed, 29 excluded; format and strict Credo passed; Dialyzer 0 errors. Parent independently reran the focused tests: 76 passed, and read back `envelope.ex`.
 Behavior diff before this task-document update: 338 additions, 12 deletions. Absent, v2 JSON-null, and `0` stay off the in-memory map and ordinary v2 wire. Envelope does not validate UDHI/SAR coexistence; PDU encode still rejects that combination. Worker and supervisor were not changed.
-Work-unit commit: `7b19e4921272e5c31f5a739d7b794368bb7291ac` (377 additions, 12 deletions; 389 authored lines including this document). Native assessment against `da79a9d`: medium, `review_due` false, reason `under_budget`. No review was started and no approval is claimed. The reviewed boundary remains `da79a9d` until a later commit reaches the delivery budget or is high risk.
+Work-unit commit: `7b19e4921272e5c31f5a739d7b794368bb7291ac` (377 additions, 12 deletions; 389 authored lines including this document). Native assessment against `da79a9d`: medium, `review_due` false, reason `under_budget`. The user then explicitly requested review. Consent was granted and lineage `review-f9add1a649533546` started, but the exact provider task was refused before reviewer execution with `binding_mismatch`. The user stopped the defect handoff, then authorized publication. No reviewer result or native approval exists.
 Rollback boundary: `esm_class` envelope transport and its tests/docs only.
 Engram mirror: closing evidence mirrored and read back by the parent.
 
 ## Next step
-UDHI transport is locally committed and under the review budget. No push or PR is authorized. HTTP multipart and billing remain later units; quota and uncertain settlement still need decisions before those units.
+Publish this transport unit as an independent PR toward main with Refs #90. Required remote check is `ci`; the PR is not merge-ready until that check is observed. HTTP multipart and billing remain later units; quota and uncertain settlement still need decisions before those units.
