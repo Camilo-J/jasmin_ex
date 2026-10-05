@@ -1,6 +1,7 @@
 defmodule JasminEx.Messaging.EnvelopeTest do
   use ExUnit.Case, async: true
   alias JasminEx.Messaging.Envelope
+  alias JasminEx.Smpp.PDU.{Body, Tlv}
 
   test "rejects unsupported versions without creating atoms from JSON values" do
     atom_name = "untrusted_connector_#{System.unique_integer([:positive])}"
@@ -321,6 +322,16 @@ defmodule JasminEx.Messaging.EnvelopeTest do
       v2_fixture(%{"short_message_base64" => "-w=="}),
       v2_fixture(%{"short_message" => "hello"}),
       v2_fixture(%{"short_message" => "hello", "short_message_base64" => "aGVsbG8="}),
+      v2_fixture(%{"optional_parameters_base64" => :null}),
+      v2_fixture(%{"optional_parameters_base64" => 1}),
+      v2_fixture(%{"optional_parameters_base64" => "!!!!"}),
+      v2_fixture(%{"optional_parameters_base64" => "aGVsbG8"}),
+      v2_fixture(%{"optional_parameters_base64" => "aGVsbG8=\n"}),
+      v2_fixture(%{"optional_parameters" => "AA=="}),
+      v2_fixture(%{
+        "optional_parameters" => "AA==",
+        "optional_parameters_base64" => Base.encode64(<<1, 2>>)
+      }),
       ~s({"gateway_id":"gateway-1"}),
       "not-json",
       ~s({"version":2,"connector_id":"#{atom_name}"})
@@ -355,6 +366,119 @@ defmodule JasminEx.Messaging.EnvelopeTest do
     refute Map.has_key?(Map.from_struct(envelope), :evidence)
   end
 
+  test "round-trips binary optional_parameters through v2 canonical Base64" do
+    optional = sar_optional()
+    attributes = valid_attributes(data_coding: 0, optional_parameters: optional)
+
+    assert {:ok, envelope} = Envelope.new(attributes)
+    assert envelope.submit_sm.optional_parameters === optional
+    refute Map.has_key?(envelope.submit_sm, :optional_parameters_base64)
+
+    assert {:ok, encoded} = Envelope.encode(envelope)
+    wire = :json.decode(encoded)
+    assert wire["version"] === 2
+    refute Map.has_key?(wire["submit_sm"], "optional_parameters")
+    assert wire["submit_sm"]["optional_parameters_base64"] == Base.encode64(optional)
+
+    assert {:ok, decoded} = Envelope.decode(encoded)
+    assert decoded.submit_sm.optional_parameters === optional
+    assert decoded == envelope
+  end
+
+  test "omits empty optional_parameters so ordinary v2 wire stays unchanged" do
+    assert {:ok, bare} = Envelope.new(valid_attributes(data_coding: 0))
+
+    assert {:ok, empty} =
+             Envelope.new(valid_attributes(data_coding: 0, optional_parameters: <<>>))
+
+    refute Map.has_key?(bare.submit_sm, :optional_parameters)
+    refute Map.has_key?(empty.submit_sm, :optional_parameters)
+
+    assert {:ok, encoded} = Envelope.encode(bare)
+    assert {:ok, ^encoded} = Envelope.encode(empty)
+    wire = :json.decode(encoded)
+    refute Map.has_key?(wire["submit_sm"], "optional_parameters")
+    refute Map.has_key?(wire["submit_sm"], "optional_parameters_base64")
+
+    assert {:ok, decoded} = Envelope.decode(v2_fixture(%{"optional_parameters_base64" => ""}))
+    refute Map.has_key?(decoded.submit_sm, :optional_parameters)
+  end
+
+  test "v1 and v2 missing optional_parameters stay valid without the field" do
+    assert {:ok, v1} = Envelope.decode(v1_fixture(%{"short_message" => "hello"}))
+    refute Map.has_key?(v1.submit_sm, :optional_parameters)
+
+    assert {:ok, v2} = Envelope.decode(v2_fixture())
+    refute Map.has_key?(v2.submit_sm, :optional_parameters)
+  end
+
+  test "string-key submit_sm copies optional_parameters" do
+    optional = sar_optional()
+
+    attributes = %{
+      gateway_id: "gateway-1",
+      connector_id: "connector-a",
+      attempt: 1,
+      max_attempts: 3,
+      enqueued_at: "2026-08-01T15:00:00Z",
+      expires_at: "2026-08-02T15:00:00Z",
+      submit_sm: %{
+        "source_addr" => "+12025550100",
+        "destination_addr" => "+12025550101",
+        "short_message" => "hello",
+        "optional_parameters" => optional
+      }
+    }
+
+    assert {:ok, envelope} = Envelope.new(attributes)
+    assert envelope.submit_sm.optional_parameters === optional
+  end
+
+  test "rejects non-binary optional_parameters in new/1" do
+    for value <- [:null, 1, true, [], %{}, {:sar_msg_ref_num, 42}] do
+      attributes = valid_attributes(data_coding: 0, optional_parameters: value)
+      assert Envelope.new(attributes) == {:error, :invalid_envelope}
+    end
+  end
+
+  test "preserves unknown and truncated TLV bytes without PDU validation" do
+    unknown = <<0x1403::16, 2::16, 0, 255>>
+    truncated = <<1>>
+
+    for optional <- [unknown, truncated] do
+      attributes = valid_attributes(data_coding: 0, optional_parameters: optional)
+      assert {:ok, envelope} = Envelope.new(attributes)
+      assert envelope.submit_sm.optional_parameters === optional
+      assert {:ok, encoded} = Envelope.encode(envelope)
+      assert {:ok, decoded} = Envelope.decode(encoded)
+      assert decoded.submit_sm.optional_parameters === optional
+    end
+  end
+
+  test "retry rebuild and SubmitSM encode preserve SAR optional parameters" do
+    optional = sar_optional()
+    attributes = valid_attributes(data_coding: 0, optional_parameters: optional)
+    assert {:ok, envelope} = Envelope.new(attributes)
+
+    retried = %{
+      gateway_id: envelope.gateway_id,
+      connector_id: envelope.connector_id,
+      attempt: 2,
+      max_attempts: envelope.max_attempts,
+      enqueued_at: envelope.enqueued_at,
+      expires_at: envelope.expires_at,
+      submit_sm: envelope.submit_sm
+    }
+
+    assert {:ok, next} = Envelope.new(retried)
+    assert next.submit_sm.optional_parameters === optional
+
+    body = struct(Body.SubmitSM, next.submit_sm)
+    assert {:ok, wire} = Body.encode(:submit_sm, body)
+    assert {:ok, decoded} = Body.decode(:submit_sm, wire)
+    assert decoded.optional_parameters === optional
+  end
+
   defp valid_attributes(overrides) do
     data_coding = Keyword.fetch!(overrides, :data_coding)
     message = Keyword.get(overrides, :short_message, "hello")
@@ -370,6 +494,12 @@ defmodule JasminEx.Messaging.EnvelopeTest do
       case Keyword.get(overrides, :registered_delivery) do
         nil -> submit_sm
         value -> Map.put(submit_sm, :registered_delivery, value)
+      end
+
+    submit_sm =
+      case Keyword.get(overrides, :optional_parameters) do
+        nil -> submit_sm
+        value -> Map.put(submit_sm, :optional_parameters, value)
       end
 
     %{
@@ -450,4 +580,11 @@ defmodule JasminEx.Messaging.EnvelopeTest do
   end
 
   defp json(value), do: value |> :json.encode() |> IO.iodata_to_binary()
+
+  defp sar_optional do
+    {:ok, bytes} =
+      Tlv.encode(sar_msg_ref_num: 42, sar_total_segments: 2, sar_segment_seqnum: 1)
+
+    bytes
+  end
 end

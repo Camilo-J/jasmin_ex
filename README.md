@@ -88,10 +88,14 @@ Operations owns disposition. Retain with no TTL, replay, or automatic purge.
 
 Queue encode now writes integer `version` 2. Wire `submit_sm` uses
 `short_message_base64` (standard padded canonical Base64). In-memory
-`submit_sm.short_message` stays a binary. v2 absent or JSON-null
-`data_coding` / `registered_delivery` default to 0. v1 JSON-null and
-`Envelope.new/1` `:null` for those fields stay invalid. This is queue
-serialization only.
+`submit_sm.short_message` stays a binary. Non-empty
+`submit_sm.optional_parameters` are written as canonical padded
+`optional_parameters_base64`; absent or empty optional bytes omit the
+wire field so ordinary v2 payloads stay unchanged. Raw v2
+`optional_parameters` is rejected. Envelope transport does not validate
+SAR/TLV semantics. v2 absent or JSON-null `data_coding` /
+`registered_delivery` default to 0. v1 JSON-null and `Envelope.new/1`
+`:null` for those fields stay invalid. This is queue serialization only.
 
 A v1 reader rejects v2 with `:unsupported_version` and the worker rejects
 without requeue. Application work-queue declarations have no owned
