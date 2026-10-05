@@ -31,9 +31,9 @@ Runtime boundary: deterministic queue/PDU tests without an external broker. Nati
 Fresh origin/main fetch confirmed merged PR #103 (`da79a9d`); branch created from that commit. Implementation and functional verification are complete. RDD: on (global), installed build 4.0.0.
 Observed RED: 7 new tests failed with `KeyError` because `esm_class` was dropped. GREEN: 76 focused tests. Writer reported full suite 799 passed, 29 excluded; format and strict Credo passed; Dialyzer 0 errors. Parent independently reran the focused tests: 76 passed, and read back `envelope.ex`.
 Behavior diff before this task-document update: 338 additions, 12 deletions. Absent, v2 JSON-null, and `0` stay off the in-memory map and ordinary v2 wire. Envelope does not validate UDHI/SAR coexistence; PDU encode still rejects that combination. Worker and supervisor were not changed.
-Commit identity: pending the work-unit commit that includes this evidence. Native assessment/review: pending that commit. No native approval is claimed.
+Work-unit commit: `7b19e4921272e5c31f5a739d7b794368bb7291ac` (377 additions, 12 deletions; 389 authored lines including this document). Native assessment against `da79a9d`: medium, `review_due` false, reason `under_budget`. No review was started and no approval is claimed. The reviewed boundary remains `da79a9d` until a later commit reaches the delivery budget or is high risk.
 Rollback boundary: `esm_class` envelope transport and its tests/docs only.
-Engram mirror: parent updates and readback after this evidence write.
+Engram mirror: closing evidence mirrored and read back by the parent.
 
 ## Next step
-Create the local work-unit commit, assess it with `--agent opencode`, and follow native consent if review is due. No push or PR is authorized. HTTP multipart and billing remain later units.
+UDHI transport is locally committed and under the review budget. No push or PR is authorized. HTTP multipart and billing remain later units; quota and uncertain settlement still need decisions before those units.
