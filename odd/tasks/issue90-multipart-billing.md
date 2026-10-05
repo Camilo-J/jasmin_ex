@@ -27,14 +27,15 @@ Default applicable test-first policy; no verified project-wide strict-TDD settin
 - `mix test` — 812 passed (1 doctest, 811 tests), 29 excluded (`:compatibility`, `:integration`)
 - `mix dialyzer` — pass, Total errors: 0
 Runtime harness: N/A, this unit exercises the Bill constructor and deterministic in-process admission without activating HTTP or external broker work.
-RDD: on (global); native assessment/review is pending for this unit. No known baseline check failures.
+RDD: on (global). Committed-only native assessment: medium, `review_due: false`, reason `under_budget`; no reviewer run or native approval exists. No known baseline check failures.
 
 ## Progress
 T1 implemented locally; parent independently reran the focused suite: 70 passed. HTTP multipart remains inactive.
 Constructor: optional `segment_count` 1..255 (default 1 when omitted); explicit nil and other invalid values return `:invalid_segment_count`; `rate_minor` input is per-segment; stored `rate_minor` is `unit * N`; `quota_debit` is N; split unit first then multiply by N (unit 3 / 50% / N 3 -> total 9, precharge 3, remainder 6). Admission unchanged; existing `State.admit/3` already debits stored totals.
 Git diff (tracked sources, excluding this task file): 5 files, 253 insertions, 19 deletions. No commit, review, or Engram-mirror success claimed here.
+Work-unit commit: `1842a0e` (`feat(billing): account for multipart segments`), 293 additions and 19 deletions, 312 authored lines including this document. Functional checks complete; the medium slice stays pending below the native review budget.
 First reviewed boundary: `896a02099e075f17aad2c14535f3593cb8a037ae`.
 Initial worktree assessment was unassessable because this task file was untracked; no low-risk inference was made. The committed-only assessment will cover the complete work unit, including this document.
 
 ## Next step
-Parent owns local work-unit commit and native candidate assessment. HTTP multipart remains inactive.
+Publish this independent billing prerequisite only after explicit user authorization, or continue with a separately scoped multipart transport/settlement unit. HTTP multipart remains inactive; DLR identity/callback behavior and uncertainty recovery need their own contract before activation.
