@@ -4,7 +4,7 @@ defmodule JasminEx.Messaging.RabbitMQ.WorkQueueTest do
   alias JasminEx.Messaging.{Envelope, WorkQueue}
   alias JasminEx.Messaging.RabbitMQ.WorkQueue, as: Adapter
   alias JasminEx.Messaging.WorkQueue.Delivery
-  alias JasminEx.Smpp.PDU.Tlv
+  alias JasminEx.Smpp.PDU.{Body, Tlv}
 
   defmodule FakePublisher do
     def publish(agent, connector_id, payload) do
@@ -210,6 +210,74 @@ defmodule JasminEx.Messaging.RabbitMQ.WorkQueueTest do
 
     assert {:ok, quarantined} = Envelope.decode(quarantine_payload)
     assert quarantined.submit_sm.optional_parameters === optional
+    assert quarantined.attempt == 1
+
+    assert :json.decode(quarantine_payload)["evidence"] == %{
+             "reason" => "bind_lost",
+             "stage" => "post_write"
+           }
+  end
+
+  test "enqueue, retry, and quarantine preserve esm_class and UDH bytes" do
+    message = <<5, 0, 3, 42, 2, 1, 255>>
+
+    {:ok, envelope} =
+      Envelope.new(%{
+        gateway_id: "gw-adapter",
+        connector_id: "alpha",
+        attempt: 1,
+        max_attempts: 3,
+        enqueued_at: "2026-08-01T15:00:00Z",
+        expires_at: "2099-01-01T00:00:00Z",
+        submit_sm: %{
+          source_addr: "+12025550100",
+          destination_addr: "+12025550101",
+          short_message: message,
+          esm_class: 0x40
+        }
+      })
+
+    {queue, agent, _fresh} = start_queue()
+    assert envelope.submit_sm.esm_class == 0x40
+    assert envelope.submit_sm.short_message === message
+    assert :ok = WorkQueue.enqueue(queue, envelope)
+    assert [{:publish, "alpha", payload}] = events(agent)
+    wire = :json.decode(payload)
+    assert wire["version"] === 2
+    assert wire["submit_sm"]["esm_class"] == 0x40
+    assert wire["submit_sm"]["short_message_base64"] == Base.encode64(message)
+    assert {:ok, decoded} = Envelope.decode(payload)
+    assert decoded.submit_sm.esm_class == 0x40
+    assert decoded.submit_sm.short_message === message
+
+    body = struct(Body.SubmitSM, decoded.submit_sm)
+    assert {:ok, pdu} = Body.encode(:submit_sm, body)
+    assert {:ok, decoded_body} = Body.decode(:submit_sm, pdu)
+    assert decoded_body.esm_class == 0x40
+    assert decoded_body.short_message === message
+
+    delivery = %Delivery{envelope: envelope, reference: 8}
+    assert :ok = WorkQueue.retry(queue, delivery, %{stage: :pre_write})
+    assert :ok = WorkQueue.quarantine(queue, delivery, %{stage: :post_write, reason: :bind_lost})
+
+    assert [
+             {:publish, "alpha", _enqueued},
+             {:publish, "alpha", retry_payload},
+             {:ack, 8},
+             {:publish, "alpha.quarantine", quarantine_payload},
+             {:ack, 8}
+           ] = events(agent)
+
+    assert {:ok, retried} = Envelope.decode(retry_payload)
+    assert retried.attempt == 2
+    assert retried.submit_sm.esm_class == 0x40
+    assert retried.submit_sm.short_message === message
+    assert retried.submit_sm == envelope.submit_sm
+    assert :json.decode(retry_payload)["version"] === 2
+
+    assert {:ok, quarantined} = Envelope.decode(quarantine_payload)
+    assert quarantined.submit_sm.esm_class == 0x40
+    assert quarantined.submit_sm.short_message === message
     assert quarantined.attempt == 1
 
     assert :json.decode(quarantine_payload)["evidence"] == %{

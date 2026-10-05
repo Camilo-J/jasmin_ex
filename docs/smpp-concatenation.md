@@ -2,11 +2,11 @@
 
 `SubmitSM.optional_parameters` carries binary TLV bytes after `short_message`,
 just like `DeliverSM`. The queue envelope transports those bytes as v2
-`optional_parameters_base64` through retries and quarantine. Empty optional
-bytes keep ordinary SubmitSM and envelope v2 wire output unchanged. HTTP
-remains single-message: this does not split messages or activate HTTP
-multipart submission, planner integration, billing, or delivery-receipt
-aggregation.
+`optional_parameters_base64`, and one-octet `esm_class` including UDHI `0x40`,
+through retries and quarantine. Empty optional bytes and default `esm_class` `0`
+keep ordinary SubmitSM and envelope v2 wire output unchanged. HTTP remains
+single-message: this does not split messages or activate HTTP multipart
+submission, planner integration, billing, or delivery-receipt aggregation.
 
 ## Encode SAR parameters
 
@@ -32,8 +32,11 @@ v1/v2 fields stay valid. Raw v2 `optional_parameters` and noncanonical Base64
 are rejected. Envelope transport preserves unknown TLV bytes and does not
 repeat PDU SAR validation.
 
-`struct(SubmitSM, envelope.submit_sm)` is the encode boundary. Worker and
-queue retries copy `submit_sm` as a whole.
+In-memory `submit_sm.esm_class` is an integer 1–255 when present. Absent, v2
+JSON-null, and `0` stay off the map and ordinary v2 wire; SubmitSM defaults
+`esm_class` to `0`. Atom and string keys are copied. Envelope transport does
+not validate UDHI or SAR coexistence. `struct(SubmitSM, envelope.submit_sm)`
+remains the encode boundary. Worker and queue retries copy `submit_sm` as a whole.
 
 ## Decode and validation boundaries
 

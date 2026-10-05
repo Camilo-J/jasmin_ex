@@ -743,6 +743,60 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     stop(worker, agent)
   end
 
+  test "retries preserve esm_class and UDH short_message from a v2 envelope", %{config: config} do
+    {store, _} = journal_store()
+    test = self()
+    message = <<5, 0, 3, 42, 2, 1, 255>>
+
+    {worker, agent} =
+      start_bound(config, "alpha", fn agent ->
+        [
+          store: store,
+          submit: fn env ->
+            send(test, {:submitted, env})
+            {:error, :disconnected}
+          end,
+          republish: republish_ok(agent)
+        ]
+      end)
+
+    {_envelope, payload} =
+      valid_payload(%{
+        gateway_id: "gw-udh",
+        attempt: 1,
+        max_attempts: 3,
+        expires_at: @future,
+        submit_sm: %{
+          source_addr: "+12025550100",
+          destination_addr: "+12025550101",
+          short_message: message,
+          esm_class: 0x40
+        }
+      })
+
+    assert :ok = Fake.deliver(agent, payload)
+    assert ConnectorWorker.inflight(worker) == nil
+    assert_received {:submitted, env}
+    assert env.submit_sm.esm_class == 0x40
+    assert env.submit_sm.short_message === message
+    events = Fake.events(agent)
+    assert {:republish, {:retry, next}} = find(events, :republish)
+    assert next.attempt == 2
+    assert next.submit_sm.esm_class == 0x40
+    assert next.submit_sm.short_message === message
+    assert next.gateway_id == "gw-udh"
+
+    assert {:ok, encoded_retry} = Envelope.encode(next)
+    retry_wire = :json.decode(encoded_retry)
+    assert retry_wire["version"] === 2
+    assert retry_wire["submit_sm"]["esm_class"] == 0x40
+
+    assert retry_wire["submit_sm"]["short_message_base64"] == Base.encode64(message)
+
+    assert Process.alive?(worker)
+    stop(worker, agent)
+  end
+
   test "journal write failure stalls without submit or settlement", %{config: config} do
     test = self()
 
