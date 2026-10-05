@@ -6,9 +6,11 @@ defmodule JasminEx.Messaging.Envelope do
   `short_message_base64` and, when non-empty, `optional_parameters_base64`
   (standard padded canonical Base64). In-memory `submit_sm.short_message`
   stays a binary; `submit_sm.optional_parameters` is present only for
-  non-empty bytes. Version 1 JSON is decoded as original text bytes and is
-  never Base64-decoded or transcoded. Envelope transport does not validate
-  SAR or other TLV semantics.
+  non-empty bytes. One-octet `esm_class` (0–255, including UDHI `0x40`) is
+  copied from atom and string keys; absent, v2 JSON-null, and `0` stay off
+  in-memory `submit_sm` and ordinary v2 wire. Version 1 JSON is decoded as
+  original text bytes and is never Base64-decoded or transcoded. Envelope
+  transport does not validate SAR, UDHI, or other PDU semantics.
   """
 
   @v1 1
@@ -174,6 +176,7 @@ defmodule JasminEx.Messaging.Envelope do
            short_message: message,
            data_coding: Map.get(submit_sm, "data_coding"),
            registered_delivery: Map.get(submit_sm, "registered_delivery"),
+           esm_class: Map.get(submit_sm, "esm_class"),
            optional_parameters: Map.get(submit_sm, "optional_parameters")
          })
 
@@ -188,6 +191,7 @@ defmodule JasminEx.Messaging.Envelope do
     with {:ok, data_coding} <- normalize_data_coding(Map.get(submit_sm, :data_coding)),
          {:ok, registered_delivery} <-
            normalize_registered_delivery(Map.get(submit_sm, :registered_delivery)),
+         {:ok, esm_class} <- normalize_esm_class(Map.get(submit_sm, :esm_class)),
          {:ok, optional} <-
            normalize_optional_parameters(Map.get(submit_sm, :optional_parameters)) do
       submit = %{
@@ -198,7 +202,7 @@ defmodule JasminEx.Messaging.Envelope do
         registered_delivery: registered_delivery
       }
 
-      {:ok, put_optional_parameters(submit, optional)}
+      {:ok, submit |> put_esm_class(esm_class) |> put_optional_parameters(optional)}
     else
       :error -> {:error, :invalid_submit_sm}
     end
@@ -210,6 +214,7 @@ defmodule JasminEx.Messaging.Envelope do
     submit
     |> replace_v2_json_null("data_coding")
     |> replace_v2_json_null("registered_delivery")
+    |> replace_v2_json_null("esm_class")
   end
 
   defp replace_v2_json_null(submit, key) do
@@ -231,10 +236,21 @@ defmodule JasminEx.Messaging.Envelope do
   defp normalize_registered_delivery(1), do: {:ok, 1}
   defp normalize_registered_delivery(_value), do: :error
 
+  defp normalize_esm_class(nil), do: {:ok, 0}
+
+  defp normalize_esm_class(esm_class)
+       when is_integer(esm_class) and esm_class >= 0 and esm_class <= 255,
+       do: {:ok, esm_class}
+
+  defp normalize_esm_class(_esm_class), do: :error
+
   defp normalize_optional_parameters(nil), do: {:ok, :absent}
   defp normalize_optional_parameters(<<>>), do: {:ok, :absent}
   defp normalize_optional_parameters(bytes) when is_binary(bytes), do: {:ok, bytes}
   defp normalize_optional_parameters(_bytes), do: :error
+
+  defp put_esm_class(submit, 0), do: submit
+  defp put_esm_class(submit, esm_class), do: Map.put(submit, :esm_class, esm_class)
 
   defp put_optional_parameters(submit, :absent), do: submit
   defp put_optional_parameters(submit, bytes), do: Map.put(submit, :optional_parameters, bytes)
@@ -251,9 +267,13 @@ defmodule JasminEx.Messaging.Envelope do
     submit_sm
     |> Map.delete(:short_message)
     |> encode_optional_parameters()
+    |> encode_esm_class()
     |> Map.put(:short_message_base64, Base.encode64(message))
     |> Map.new(fn {key, value} -> {Atom.to_string(key), value} end)
   end
+
+  defp encode_esm_class(%{esm_class: 0} = submit_sm), do: Map.delete(submit_sm, :esm_class)
+  defp encode_esm_class(submit_sm), do: submit_sm
 
   defp encode_optional_parameters(submit_sm) do
     case Map.pop(submit_sm, :optional_parameters) do

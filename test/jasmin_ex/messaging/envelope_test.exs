@@ -479,6 +479,179 @@ defmodule JasminEx.Messaging.EnvelopeTest do
     assert decoded.optional_parameters === optional
   end
 
+  test "preserves UDHI esm_class and UDH bytes through encode, retry, and SubmitSM" do
+    message = udh_short_message()
+    attributes = valid_attributes(data_coding: 0, short_message: message, esm_class: 0x40)
+    assert {:ok, envelope} = Envelope.new(attributes)
+    assert envelope.submit_sm.esm_class == 0x40
+    assert envelope.submit_sm.short_message === message
+
+    assert {:ok, encoded} = Envelope.encode(envelope)
+    wire = :json.decode(encoded)
+    assert wire["version"] === 2
+    assert wire["submit_sm"]["esm_class"] == 0x40
+    assert wire["submit_sm"]["short_message_base64"] == Base.encode64(message)
+
+    assert {:ok, decoded} = Envelope.decode(encoded)
+    assert decoded.submit_sm.esm_class == 0x40
+    assert decoded.submit_sm.short_message === message
+    assert decoded == envelope
+
+    retried = %{
+      gateway_id: envelope.gateway_id,
+      connector_id: envelope.connector_id,
+      attempt: 2,
+      max_attempts: envelope.max_attempts,
+      enqueued_at: envelope.enqueued_at,
+      expires_at: envelope.expires_at,
+      submit_sm: envelope.submit_sm
+    }
+
+    assert {:ok, next} = Envelope.new(retried)
+    assert next.submit_sm.esm_class == 0x40
+    assert next.submit_sm.short_message === message
+
+    body = struct(Body.SubmitSM, next.submit_sm)
+    assert body.esm_class == 0x40
+    assert {:ok, pdu} = Body.encode(:submit_sm, body)
+    assert {:ok, decoded_body} = Body.decode(:submit_sm, pdu)
+    assert decoded_body.esm_class == 0x40
+    assert decoded_body.short_message === message
+  end
+
+  test "omitted, explicit 0, and v2 JSON-null esm_class default to 0" do
+    assert {:ok, omitted} = Envelope.new(valid_attributes(data_coding: 0))
+    refute Map.has_key?(omitted.submit_sm, :esm_class)
+    assert struct(Body.SubmitSM, omitted.submit_sm).esm_class == 0
+
+    assert {:ok, zero} = Envelope.new(valid_attributes(data_coding: 0, esm_class: 0))
+    refute Map.has_key?(zero.submit_sm, :esm_class)
+    assert struct(Body.SubmitSM, zero.submit_sm).esm_class == 0
+
+    string_keys = %{
+      gateway_id: "gateway-1",
+      connector_id: "connector-a",
+      attempt: 1,
+      max_attempts: 3,
+      enqueued_at: "2026-08-01T15:00:00Z",
+      expires_at: "2026-08-02T15:00:00Z",
+      submit_sm: %{
+        "source_addr" => "+12025550100",
+        "destination_addr" => "+12025550101",
+        "short_message" => "hello"
+      }
+    }
+
+    assert {:ok, from_string} = Envelope.new(string_keys)
+    refute Map.has_key?(from_string.submit_sm, :esm_class)
+    assert struct(Body.SubmitSM, from_string.submit_sm).esm_class == 0
+
+    assert {:ok, encoded} = Envelope.encode(omitted)
+    assert {:ok, ^encoded} = Envelope.encode(zero)
+    wire = :json.decode(encoded)
+    refute Map.has_key?(wire["submit_sm"], "esm_class")
+
+    assert {:ok, decoded} = Envelope.decode(encoded)
+    refute Map.has_key?(decoded.submit_sm, :esm_class)
+    assert struct(Body.SubmitSM, decoded.submit_sm).esm_class == 0
+
+    assert {:ok, nulled} = Envelope.decode(v2_fixture(%{"esm_class" => :null}))
+    refute Map.has_key?(nulled.submit_sm, :esm_class)
+    assert struct(Body.SubmitSM, nulled.submit_sm).esm_class == 0
+
+    assert {:ok, v1} = Envelope.decode(v1_fixture(%{"short_message" => "hello"}))
+    refute Map.has_key?(v1.submit_sm, :esm_class)
+    assert struct(Body.SubmitSM, v1.submit_sm).esm_class == 0
+  end
+
+  test "string-key submit_sm copies esm_class" do
+    message = udh_short_message()
+
+    attributes = %{
+      gateway_id: "gateway-1",
+      connector_id: "connector-a",
+      attempt: 1,
+      max_attempts: 3,
+      enqueued_at: "2026-08-01T15:00:00Z",
+      expires_at: "2026-08-02T15:00:00Z",
+      submit_sm: %{
+        "source_addr" => "+12025550100",
+        "destination_addr" => "+12025550101",
+        "short_message" => message,
+        "esm_class" => 0x40
+      }
+    }
+
+    assert {:ok, envelope} = Envelope.new(attributes)
+    assert envelope.submit_sm.esm_class == 0x40
+    assert envelope.submit_sm.short_message === message
+  end
+
+  test "accepts one-octet esm_class and rejects invalid values" do
+    assert {:ok, zero} = Envelope.new(valid_attributes(data_coding: 0, esm_class: 0))
+    refute Map.has_key?(zero.submit_sm, :esm_class)
+    assert {:ok, encoded_zero} = Envelope.encode(zero)
+    refute Map.has_key?(:json.decode(encoded_zero)["submit_sm"], "esm_class")
+    assert {:ok, decoded_zero} = Envelope.decode(encoded_zero)
+    refute Map.has_key?(decoded_zero.submit_sm, :esm_class)
+    assert struct(Body.SubmitSM, decoded_zero.submit_sm).esm_class == 0
+
+    for esm_class <- [1, 0x40, 255] do
+      assert {:ok, envelope} =
+               Envelope.new(valid_attributes(data_coding: 0, esm_class: esm_class))
+
+      assert envelope.submit_sm.esm_class == esm_class
+      assert {:ok, encoded} = Envelope.encode(envelope)
+      assert {:ok, decoded} = Envelope.decode(encoded)
+      assert decoded.submit_sm.esm_class == esm_class
+    end
+
+    for value <- [-1, 256, 64.0, :null, true, "64", <<64>>, [], %{}] do
+      assert Envelope.new(valid_attributes(data_coding: 0, esm_class: value)) ==
+               {:error, :invalid_envelope}
+    end
+
+    assert Envelope.decode(v1_fixture(%{"esm_class" => :null})) == {:error, :invalid_envelope}
+    assert Envelope.decode(v2_fixture(%{"esm_class" => 256})) == {:error, :invalid_envelope}
+    assert Envelope.decode(v2_fixture(%{"esm_class" => "64"})) == {:error, :invalid_envelope}
+
+    v1_literal =
+      v1_fixture(%{
+        "short_message" => "aGVsbG8=",
+        "esm_class" => 0x40
+      })
+
+    assert {:ok, v1} = Envelope.decode(v1_literal)
+    assert v1.submit_sm.short_message === "aGVsbG8="
+    refute v1.submit_sm.short_message === "hello"
+    assert v1.submit_sm.esm_class == 0x40
+  end
+
+  test "envelope transports UDHI with SAR bytes; SubmitSM encode owns sar_with_udhi" do
+    optional = sar_optional()
+    message = udh_short_message()
+
+    attributes =
+      valid_attributes(
+        data_coding: 0,
+        short_message: message,
+        esm_class: 0x40,
+        optional_parameters: optional
+      )
+
+    assert {:ok, envelope} = Envelope.new(attributes)
+    assert envelope.submit_sm.esm_class == 0x40
+    assert envelope.submit_sm.optional_parameters === optional
+    assert {:ok, encoded} = Envelope.encode(envelope)
+    assert {:ok, decoded} = Envelope.decode(encoded)
+    assert decoded.submit_sm.esm_class == 0x40
+    assert decoded.submit_sm.optional_parameters === optional
+    assert decoded.submit_sm.short_message === message
+
+    body = struct(Body.SubmitSM, decoded.submit_sm)
+    assert {:error, {:encode, :sar_with_udhi}} = Body.encode(:submit_sm, body)
+  end
+
   defp valid_attributes(overrides) do
     data_coding = Keyword.fetch!(overrides, :data_coding)
     message = Keyword.get(overrides, :short_message, "hello")
@@ -500,6 +673,12 @@ defmodule JasminEx.Messaging.EnvelopeTest do
       case Keyword.get(overrides, :optional_parameters) do
         nil -> submit_sm
         value -> Map.put(submit_sm, :optional_parameters, value)
+      end
+
+    submit_sm =
+      case Keyword.get(overrides, :esm_class) do
+        nil -> submit_sm
+        value -> Map.put(submit_sm, :esm_class, value)
       end
 
     %{
@@ -587,4 +766,6 @@ defmodule JasminEx.Messaging.EnvelopeTest do
 
     bytes
   end
+
+  defp udh_short_message, do: <<5, 0, 3, 42, 2, 1, 255>>
 end
