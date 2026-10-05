@@ -145,6 +145,24 @@ defmodule JasminEx.Billing.ContractsTest do
                {0, 250, 250}
     end
 
+    test "opens a reservation from multiplied per-segment totals without HTTP activation" do
+      clock = FakeClock.new(wall_ms: 1_000, monotonic_ms: 10)
+
+      assert {:ok, bill} =
+               Bill.new(valid_attrs(rate_minor: 3, precharge_percent: 50, segment_count: 3))
+
+      assert {:ok, fingerprint} = Fingerprint.compute(bill)
+      assert {:ok, admission} = Admission.new(bill: bill, ttl_ms: 500)
+      assert {:ok, reservation} = Reservation.open(admission, {FakeClock, clock})
+      assert bill.quota_debit == 3
+      assert reservation.fingerprint == fingerprint
+
+      assert {reservation.captured_minor, reservation.reserved_minor,
+              reservation.refundable_minor} == {3, 6, 6}
+
+      refute {reservation.captured_minor, reservation.reserved_minor} == {4, 5}
+    end
+
     test "rejects invalid TTL and overflow deadlines" do
       assert {:ok, bill} = Bill.new(valid_attrs())
       assert Admission.new(bill: bill, ttl_ms: -1) == {:error, :invalid_ttl}

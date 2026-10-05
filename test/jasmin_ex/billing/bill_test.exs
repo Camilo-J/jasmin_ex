@@ -84,6 +84,124 @@ defmodule JasminEx.Billing.BillTest do
     end
   end
 
+  describe "segment count" do
+    test "absent count and explicit 1 are equivalent including fingerprint" do
+      assert {:ok, absent} = Bill.new(valid_attrs())
+      assert {:ok, explicit} = Bill.new(valid_attrs(segment_count: 1))
+
+      assert {absent.rate_minor, absent.precharge_minor, absent.remainder_minor,
+              absent.quota_debit} == {100, 10, 90, 1}
+
+      assert {explicit.rate_minor, explicit.precharge_minor, explicit.remainder_minor,
+              explicit.quota_debit} ==
+               {absent.rate_minor, absent.precharge_minor, absent.remainder_minor,
+                absent.quota_debit}
+
+      assert {:ok, %Fingerprint{version: 1, digest: digest}} = Fingerprint.compute(absent)
+      assert {:ok, %Fingerprint{version: 1, digest: ^digest}} = Fingerprint.compute(explicit)
+      assert digest == expected_digest(absent)
+    end
+
+    test "rejects invalid supplied segment counts including explicit nil" do
+      assert Bill.new(valid_attrs(segment_count: nil)) == {:error, :invalid_segment_count}
+      assert Bill.new(valid_attrs(segment_count: 0)) == {:error, :invalid_segment_count}
+      assert Bill.new(valid_attrs(segment_count: 256)) == {:error, :invalid_segment_count}
+      assert Bill.new(valid_attrs(segment_count: -1)) == {:error, :invalid_segment_count}
+      assert Bill.new(valid_attrs(segment_count: 1.0)) == {:error, :invalid_segment_count}
+      assert Bill.new(valid_attrs(segment_count: "1")) == {:error, :invalid_segment_count}
+      assert Bill.new(valid_attrs(segment_count: :one)) == {:error, :invalid_segment_count}
+    end
+
+    test "splits the unit rate first then multiplies precharge and remainder by N" do
+      assert {:ok, bill} =
+               Bill.new(valid_attrs(rate_minor: 3, precharge_percent: 50, segment_count: 3))
+
+      assert bill.rate_minor == 9
+      assert bill.precharge_minor == 3
+      assert bill.remainder_minor == 6
+      assert bill.quota_debit == 3
+      refute {bill.precharge_minor, bill.remainder_minor} == {4, 5}
+    end
+
+    test "accepts protocol bound 255 independently of the HTTP planner max of 5" do
+      assert {:ok, bill} =
+               Bill.new(valid_attrs(rate_minor: 2, precharge_percent: 10, segment_count: 255))
+
+      assert bill.rate_minor == 510
+      assert bill.precharge_minor == 0
+      assert bill.remainder_minor == 510
+      assert bill.quota_debit == 255
+    end
+
+    test "zero-priced bills still debit N quota" do
+      assert {:ok, bill} =
+               Bill.new(valid_attrs(rate_minor: 0, precharge_percent: 50, segment_count: 7))
+
+      assert bill.rate_minor == 0
+      assert bill.precharge_minor == 0
+      assert bill.remainder_minor == 0
+      assert bill.quota_debit == 7
+    end
+
+    test "rejects total overflow and accepts the exact int64 total maximum" do
+      assert Bill.new(valid_attrs(rate_minor: @max_int64, segment_count: 2)) ==
+               {:error, :amount_overflow}
+
+      unit = div(@max_int64, 2)
+
+      assert {:ok, bill} =
+               Bill.new(valid_attrs(rate_minor: unit, precharge_percent: 0, segment_count: 2))
+
+      assert bill.rate_minor == unit * 2
+      assert bill.quota_debit == 2
+
+      assert Bill.new(valid_attrs(rate_minor: unit + 1, precharge_percent: 0, segment_count: 2)) ==
+               {:error, :amount_overflow}
+
+      max_unit_255 = div(@max_int64, 255)
+
+      assert {:ok, max_n} =
+               Bill.new(
+                 valid_attrs(rate_minor: max_unit_255, precharge_percent: 0, segment_count: 255)
+               )
+
+      assert max_n.rate_minor == max_unit_255 * 255
+      assert max_n.quota_debit == 255
+
+      assert Bill.new(
+               valid_attrs(
+                 rate_minor: max_unit_255 + 1,
+                 precharge_percent: 0,
+                 segment_count: 255
+               )
+             ) == {:error, :amount_overflow}
+    end
+
+    test "percentage and amount errors remain independent of a valid count" do
+      assert Bill.new(valid_attrs(precharge_percent: -1, segment_count: 3)) ==
+               {:error, :invalid_percentage}
+
+      assert Bill.new(valid_attrs(precharge_percent: 101, segment_count: 3)) ==
+               {:error, :invalid_percentage}
+
+      assert Bill.new(valid_attrs(rate_minor: -1, segment_count: 3)) == {:error, :invalid_amount}
+    end
+
+    test "fingerprint version stays 1 and digest changes when N changes stored totals" do
+      assert {:ok, one} = Bill.new(valid_attrs(rate_minor: 10, precharge_percent: 10))
+
+      assert {:ok, three} =
+               Bill.new(valid_attrs(rate_minor: 10, precharge_percent: 10, segment_count: 3))
+
+      assert {:ok, %Fingerprint{version: 1} = one_fp} = Fingerprint.compute(one)
+      assert {:ok, %Fingerprint{version: 1} = three_fp} = Fingerprint.compute(three)
+      refute one_fp.digest == three_fp.digest
+      assert three.rate_minor == 30
+      assert three.quota_debit == 3
+      assert three_fp.digest == expected_digest(three)
+    end
+  end
+
   describe "fingerprint" do
     test "hashes length-prefixed economics and excludes bill_id" do
       assert {:ok, left} = Bill.new(valid_attrs(bill_id: "bill-a"))
