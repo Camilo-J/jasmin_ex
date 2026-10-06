@@ -8,6 +8,11 @@ keep ordinary SubmitSM and envelope v2 wire output unchanged. HTTP remains
 single-message: this does not split messages or activate HTTP multipart
 submission, planner integration, billing, or delivery-receipt aggregation.
 
+Envelopes without segment metadata still encode as version 2 with identical
+bytes; the `segment` field is omitted. Present, valid segment metadata encodes
+as version 3 so older readers fail closed instead of dropping the billing bind.
+Segment metadata is unused until retry transport lands.
+
 ## Encode SAR parameters
 
 ```elixir
@@ -37,6 +42,21 @@ JSON-null, and `0` stay off the map and ordinary v2 wire; SubmitSM defaults
 `esm_class` to `0`. Atom and string keys are copied. Envelope transport does
 not validate UDHI or SAR coexistence. `struct(SubmitSM, envelope.submit_sm)`
 remains the encode boundary. Worker and queue retries copy `submit_sm` as a whole.
+
+Optional in-memory `segment` is a plain map, not a fingerprint struct:
+
+| Field | Rule |
+|-------|------|
+| `bill_id` | Nonempty parent Router/HTTP id, distinct from child `gateway_id` |
+| `index`, `count` | Integers 1–255, `index <= count` |
+| `fingerprint_version` | Integer `1` |
+| `fingerprint_digest_base64` | Canonical padded Base64 of exactly 32 bytes |
+
+Callers allocate the unique child `gateway_id`; this transport does not.
+Version 1/2 payloads that include `segment` (including null) are invalid.
+Version 3 requires a complete segment map and the same v2 binary `submit_sm`
+fields. Segment metadata is unused until retry transport lands. A segment
+index is never an attempt.
 
 ## Decode and validation boundaries
 
