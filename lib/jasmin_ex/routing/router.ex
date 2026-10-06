@@ -222,6 +222,7 @@ defmodule JasminEx.Routing.Router do
     case State.expire_due(state, clock()) do
       {:ok, _state, 0} -> {:unchanged, {:ok, 0}}
       {:ok, next, count} -> {:ok, next, count}
+      {:error, reason} -> {:error, reason}
     end
   end
 

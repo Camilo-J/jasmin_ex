@@ -28,6 +28,7 @@ defmodule JasminEx.Routing.BillingTest do
   alias JasminEx.Billing.FakeClock
   alias JasminEx.Billing.Fingerprint
   alias JasminEx.Billing.Reservation
+  alias JasminEx.Billing.SegmentLedger
   alias JasminEx.Billing.Settlement
   alias JasminEx.Billing.Tombstone
   alias JasminEx.Routing
@@ -407,6 +408,22 @@ defmodule JasminEx.Routing.BillingTest do
       assert expired.tombstones["bill-2"].state == :expired
     end
 
+    test "expiry overflow is typed and leaves the whole due batch unchanged" do
+      overflow = 9_223_372_036_854_775_807
+      {state, first} = fixture(ttl_ms: 0, submit_quota: 5, precharge_percent: 100)
+      assert {:ok, open} = State.admit(state, first, clock())
+      second = admission(bill_id: "bill-2", ttl_ms: 0, precharge_percent: 0)
+      assert {:ok, open} = State.admit(open, second, clock())
+      {:ok, hot, _} = State.set_balance(open, "u1", overflow)
+      before = hot
+
+      assert {:error, :amount_overflow} = State.expire_due(hot, clock())
+      assert hot == before
+      assert map_size(hot.reservations) == 2
+      assert hot.tombstones == %{}
+      assert hot.users["u1"].balance_minor == overflow
+    end
+
     test "late ACK, duplicates, and conflicting identity leave ledger unchanged" do
       {state, admission} = fixture(ttl_ms: 0)
       assert {:ok, open} = State.admit(state, admission, clock())
@@ -568,6 +585,21 @@ defmodule JasminEx.Routing.BillingTest do
 
       assert_router_unchanged(router, config, after_exp, payload)
     end
+
+    test "router expiry overflow does not credit or persist a partial batch", %{tmp_dir: tmp_dir} do
+      overflow = 9_223_372_036_854_775_807
+      {router, config, first} = start_admitting_router(tmp_dir, ttl_ms: 0, precharge_percent: 100)
+      assert {:ok, _} = Routing.admit(router, first)
+      second = admission(bill_id: "bill-2", ttl_ms: 0, precharge_percent: 0)
+      assert {:ok, _} = Routing.admit(router, second)
+      assert {:ok, _} = Routing.set_balance(router, "u1", overflow)
+      before = Routing.snapshot(router)
+      payload = File.read!(config.snapshot_path)
+
+      assert {:error, :amount_overflow} = Routing.expire_due(router)
+      assert_router_unchanged(router, config, before, payload)
+      assert map_size(before.reservations) == 2
+    end
   end
 
   describe "administration" do
@@ -653,6 +685,214 @@ defmodule JasminEx.Routing.BillingTest do
       refute Process.whereis(JasminEx.Messaging.RabbitMQ.Supervisor)
       refute Process.whereis(JasminEx.Messaging.RabbitMQ.Connection)
       assert Process.alive?(router)
+    end
+  end
+
+  describe "segment settlement" do
+    @describetag :settle
+
+    test "mode at admission protects expiry before outcomes and while uncertain" do
+      {state, due} =
+        fixture(ttl_ms: 0, segment_count: 3, submit_quota: 5, balance_minor: 500)
+
+      assert {:ok, open} = State.admit_segments(state, due, clock())
+      reservation = open.reservations["bill-1"]
+      assert %SegmentLedger{count: 3, outcomes: %{}} = reservation.ledger
+      before = open
+      assert {:ok, ^before, 0} = State.expire_due(open, clock())
+
+      assert {:ok, pending} =
+               State.settle_segment(
+                 open,
+                 due.bill.bill_id,
+                 reservation.fingerprint,
+                 2,
+                 :uncertain
+               )
+
+      assert pending.users["u1"].balance_minor == 200
+      assert pending.users["u1"].submit_quota == 2
+      assert pending.reservations["bill-1"].refundable_minor == 270
+      assert pending.reservations["bill-1"].ledger.outcomes[2] == :uncertain
+      assert {:ok, ^pending, 0} = State.expire_due(pending, clock())
+
+      legacy = admission(bill_id: "bill-legacy", ttl_ms: 0)
+      assert {:ok, mixed} = State.admit(pending, legacy, clock())
+      assert {:ok, next, 1} = State.expire_due(mixed, clock())
+      assert next.tombstones["bill-legacy"].state == :expired
+      assert next.reservations["bill-1"].ledger.outcomes[2] == :uncertain
+      assert next.users["u1"].balance_minor == 190
+    end
+
+    test "no_response is uncertain with no refund and global settle cannot bypass" do
+      {state, admission} = fixture(segment_count: 3, submit_quota: 5)
+      assert {:ok, open} = State.admit_segments(state, admission, clock())
+      fingerprint = open.reservations["bill-1"].fingerprint
+      before = open
+
+      assert {:error, :billing_conflict} = State.settle(open, settle_cmd(admission, :ok))
+      assert {:error, :billing_conflict} = State.settle(open, settle_cmd(admission, :non_ok))
+      assert open == before
+
+      assert {:ok, pending} =
+               State.settle_segment(open, admission.bill.bill_id, fingerprint, 1, :uncertain)
+
+      assert pending.users["u1"].balance_minor == 200
+      assert pending.users["u1"].submit_quota == 2
+      assert pending.reservations["bill-1"].refundable_minor == 270
+      assert {:error, :billing_conflict} = State.settle(pending, settle_cmd(admission, :non_ok))
+    end
+
+    test "reject refunds full unit plus quota; accept removes remainder only" do
+      {state, admission} = fixture(segment_count: 3, submit_quota: 5, precharge_percent: 50)
+      assert {:ok, open} = State.admit_segments(state, admission, clock())
+      fingerprint = open.reservations["bill-1"].fingerprint
+      assert open.users["u1"].balance_minor == 200
+
+      assert {open.reservations["bill-1"].captured_minor,
+              open.reservations["bill-1"].reserved_minor} ==
+               {150, 150}
+
+      assert {:ok, rejected} =
+               State.settle_segment(open, admission.bill.bill_id, fingerprint, 1, :rejected)
+
+      assert rejected.users["u1"].balance_minor == 300
+      assert rejected.users["u1"].submit_quota == 3
+      assert rejected.reservations["bill-1"].refundable_minor == 100
+      assert rejected.reservations["bill-1"].ledger.outcomes[1] == :rejected
+
+      assert {:ok, accepted} =
+               State.settle_segment(rejected, admission.bill.bill_id, fingerprint, 2, :accepted)
+
+      assert accepted.users["u1"].balance_minor == 300
+      assert accepted.users["u1"].submit_quota == 3
+      assert accepted.reservations["bill-1"].refundable_minor == 50
+      assert accepted.reservations["bill-1"].ledger.outcomes[2] == :accepted
+    end
+
+    test "zero-cost rejection credits quota only and can close with zero extra credit" do
+      {state, admission} =
+        fixture(rate_minor: 0, segment_count: 2, submit_quota: 5, precharge_percent: 50)
+
+      assert {:ok, open} = State.admit_segments(state, admission, clock())
+      fingerprint = open.reservations["bill-1"].fingerprint
+      assert open.users["u1"].balance_minor == 500
+      assert open.users["u1"].submit_quota == 3
+
+      assert {:ok, rejected} =
+               State.settle_segment(open, admission.bill.bill_id, fingerprint, 1, :rejected)
+
+      assert rejected.users["u1"].balance_minor == 500
+      assert rejected.users["u1"].submit_quota == 4
+      assert rejected.reservations["bill-1"].refundable_minor == 0
+
+      assert {:ok, closed} =
+               State.settle_segment(rejected, admission.bill.bill_id, fingerprint, 2, :accepted)
+
+      assert closed.reservations == %{}
+      assert closed.tombstones["bill-1"].state == :settled_non_ok
+      assert closed.users["u1"].balance_minor == 500
+      assert closed.users["u1"].submit_quota == 4
+
+      assert {:ok, :late_ignored} =
+               State.settle_segment(closed, admission.bill.bill_id, fingerprint, 1, :rejected)
+
+      assert closed.users["u1"].submit_quota == 4
+    end
+
+    test "malformed identity, index, and outcome fail closed" do
+      {state, admission} = fixture(segment_count: 3, submit_quota: 5)
+      assert {:ok, open} = State.admit_segments(state, admission, clock())
+      fingerprint = open.reservations["bill-1"].fingerprint
+      bill_id = admission.bill.bill_id
+      before = open
+
+      assert State.settle_segment(open, :not_an_id, fingerprint, 1, :rejected) ==
+               {:error, :invalid_bill_id}
+
+      assert State.settle_segment(open, bill_id, :not_a_fingerprint, 1, :rejected) ==
+               {:error, :billing_conflict}
+
+      assert State.settle_segment(open, bill_id, fingerprint, 0, :rejected) ==
+               {:error, :invalid_index}
+
+      assert State.settle_segment(open, bill_id, fingerprint, 4, :rejected) ==
+               {:error, :invalid_index}
+
+      assert State.settle_segment(open, bill_id, fingerprint, 1, :ok) ==
+               {:error, :invalid_outcome}
+
+      assert State.settle_segment(open, bill_id, fingerprint, 1, "rejected") ==
+               {:error, :invalid_outcome}
+
+      assert open == before
+    end
+
+    test "legacy reservations reject segment replay and new mode rejects legacy settle" do
+      {state, admission} = fixture()
+      assert {:ok, legacy} = State.admit(state, admission, clock())
+      fingerprint = legacy.reservations["bill-1"].fingerprint
+      before = legacy
+
+      assert State.settle_segment(legacy, admission.bill.bill_id, fingerprint, 1, :rejected) ==
+               {:error, :billing_conflict}
+
+      assert legacy == before
+      assert legacy.reservations["bill-1"].ledger == nil
+    end
+
+    test "balance and quota overflow roll back ledger and account together" do
+      overflow = 9_223_372_036_854_775_807
+      {state, admission} = fixture(segment_count: 2, submit_quota: 5)
+      assert {:ok, open} = State.admit_segments(state, admission, clock())
+      fingerprint = open.reservations["bill-1"].fingerprint
+      bill_id = admission.bill.bill_id
+      {:ok, hot, _} = State.set_balance(open, "u1", overflow)
+      before = hot
+
+      assert State.settle_segment(hot, bill_id, fingerprint, 1, :rejected) ==
+               {:error, :amount_overflow}
+
+      assert hot == before
+      assert hot.reservations[bill_id].ledger.outcomes == %{}
+      assert hot.users["u1"].balance_minor == overflow
+
+      {:ok, quota_hot, _} = State.set_quota(open, "u1", overflow)
+      before_quota = quota_hot
+
+      assert State.settle_segment(quota_hot, bill_id, fingerprint, 1, :rejected) ==
+               {:error, :amount_overflow}
+
+      assert quota_hot == before_quota
+      assert quota_hot.reservations[bill_id].ledger.outcomes == %{}
+      assert quota_hot.users["u1"].submit_quota == overflow
+    end
+
+    test "uncertainty resolves to rejected or accepted with remainder taken once" do
+      {state, admission} = fixture(segment_count: 3, submit_quota: 5, precharge_percent: 50)
+      assert {:ok, open} = State.admit_segments(state, admission, clock())
+      fingerprint = open.reservations["bill-1"].fingerprint
+      bill_id = admission.bill.bill_id
+
+      assert {:ok, pending} = State.settle_segment(open, bill_id, fingerprint, 1, :uncertain)
+      assert pending.users["u1"].balance_minor == 200
+      assert pending.reservations[bill_id].refundable_minor == 150
+
+      assert {:ok, rejected} = State.settle_segment(pending, bill_id, fingerprint, 1, :rejected)
+      assert rejected.users["u1"].balance_minor == 300
+      assert rejected.users["u1"].submit_quota == 3
+      assert rejected.reservations[bill_id].refundable_minor == 100
+      assert rejected.reservations[bill_id].ledger.outcomes[1] == :rejected
+
+      assert {:ok, pending_two} = State.settle_segment(open, bill_id, fingerprint, 2, :uncertain)
+
+      assert {:ok, accepted} =
+               State.settle_segment(pending_two, bill_id, fingerprint, 2, :accepted)
+
+      assert accepted.users["u1"].balance_minor == 200
+      assert accepted.users["u1"].submit_quota == 2
+      assert accepted.reservations[bill_id].refundable_minor == 100
+      assert accepted.reservations[bill_id].ledger.outcomes[2] == :accepted
     end
   end
 
@@ -742,7 +982,8 @@ defmodule JasminEx.Routing.BillingTest do
         precharge_percent: 10
       )
 
-    {router, config, admission([])}
+    {router, config,
+     admission(Keyword.take(opts, [:bill_id, :rate_minor, :ttl_ms, :precharge_percent]))}
   end
 
   defp assert_router_typed_error(tmp_dir, reason, admission) do

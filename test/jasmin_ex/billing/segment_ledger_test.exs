@@ -279,6 +279,26 @@ defmodule JasminEx.Billing.SegmentLedgerTest do
       assert SegmentLedger.record(rejected, bill.bill_id, fingerprint, 2, :rejected) ==
                {:error, :invalid_index}
     end
+
+    test "terminal?/1 is true only when every index is accepted or rejected" do
+      {bill, fingerprint, ledger} = open_ledger(segment_count: 2)
+      refute SegmentLedger.terminal?(ledger)
+
+      assert {:ok, accepted, _} =
+               SegmentLedger.record(ledger, bill.bill_id, fingerprint, 1, :accepted)
+
+      refute SegmentLedger.terminal?(accepted)
+
+      assert {:ok, pending, _} =
+               SegmentLedger.record(accepted, bill.bill_id, fingerprint, 2, :uncertain)
+
+      refute SegmentLedger.terminal?(pending)
+
+      assert {:ok, done, _} =
+               SegmentLedger.record(accepted, bill.bill_id, fingerprint, 2, :rejected)
+
+      assert SegmentLedger.terminal?(done)
+    end
   end
 
   defp open_ledger(overrides \\ []) do
