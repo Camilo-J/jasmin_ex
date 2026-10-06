@@ -286,6 +286,107 @@ defmodule JasminEx.Messaging.RabbitMQ.WorkQueueTest do
            }
   end
 
+  test "retry and quarantine preserve version 3 segment metadata" do
+    message = <<5, 0, 3, 42, 2, 1, 255>>
+
+    {:ok, optional} =
+      Tlv.encode(sar_msg_ref_num: 42, sar_total_segments: 2, sar_segment_seqnum: 1)
+
+    segment = %{
+      bill_id: "bill-parent",
+      index: 1,
+      count: 2,
+      fingerprint_version: 1,
+      fingerprint_digest_base64: Base.encode64(:binary.copy(<<1>>, 32))
+    }
+
+    {:ok, envelope} =
+      Envelope.new(%{
+        gateway_id: "gw-child",
+        connector_id: "alpha",
+        attempt: 1,
+        max_attempts: 3,
+        enqueued_at: "2026-08-01T15:00:00Z",
+        expires_at: "2099-01-01T00:00:00Z",
+        segment: segment,
+        submit_sm: %{
+          source_addr: "+12025550100",
+          destination_addr: "+12025550101",
+          short_message: message,
+          esm_class: 0x40,
+          optional_parameters: optional
+        }
+      })
+
+    {queue, agent, _fresh} = start_queue()
+    assert :ok = WorkQueue.enqueue(queue, envelope)
+    assert [{:publish, "alpha", payload}] = events(agent)
+    wire = :json.decode(payload)
+    assert wire["version"] === 3
+    assert wire["segment"]["bill_id"] == "bill-parent"
+    assert wire["gateway_id"] == "gw-child"
+    refute Map.has_key?(wire["submit_sm"], "short_message")
+    assert {:ok, decoded} = Envelope.decode(payload)
+    assert decoded.segment == segment
+    assert decoded.gateway_id == "gw-child"
+
+    delivery = %Delivery{envelope: envelope, reference: 8}
+    assert :ok = WorkQueue.retry(queue, delivery, %{stage: :pre_write})
+    assert :ok = WorkQueue.quarantine(queue, delivery, %{stage: :post_write, reason: :bind_lost})
+
+    assert [
+             {:publish, "alpha", _enqueued},
+             {:publish, "alpha", retry_payload},
+             {:ack, 8},
+             {:publish, "alpha.quarantine", quarantine_payload},
+             {:ack, 8}
+           ] = events(agent)
+
+    assert {:ok, retried} = Envelope.decode(retry_payload)
+    assert retried.attempt == 2
+    assert retried.gateway_id == "gw-child"
+    assert retried.segment == segment
+    assert retried.segment.index == 1
+    assert retried.attempt != retried.segment.index
+    assert retried.submit_sm.esm_class == 0x40
+    assert retried.submit_sm.optional_parameters === optional
+    assert retried.submit_sm.short_message === message
+    assert :json.decode(retry_payload)["version"] === 3
+
+    assert {:ok, quarantined} = Envelope.decode(quarantine_payload)
+    assert quarantined.segment == segment
+    assert quarantined.attempt == 1
+    assert quarantined.gateway_id == "gw-child"
+    assert :json.decode(quarantine_payload)["version"] === 3
+
+    assert :json.decode(quarantine_payload)["evidence"] == %{
+             "reason" => "bind_lost",
+             "stage" => "post_write"
+           }
+  end
+
+  test "retry overflow returns invalid_envelope without raising" do
+    {:ok, envelope} =
+      Envelope.new(%{
+        gateway_id: "gw-adapter",
+        connector_id: "alpha",
+        attempt: 3,
+        max_attempts: 3,
+        enqueued_at: "2026-08-01T15:00:00Z",
+        expires_at: "2099-01-01T00:00:00Z",
+        submit_sm: %{
+          source_addr: "+12025550100",
+          destination_addr: "+12025550101",
+          short_message: "hello"
+        }
+      })
+
+    {queue, agent, _fresh} = start_queue()
+    delivery = %Delivery{envelope: envelope, reference: 1}
+    assert WorkQueue.retry(queue, delivery, %{stage: :pre_write}) == {:error, :invalid_envelope}
+    assert events(agent) == []
+  end
+
   defp start_queue(
          publisher \\ FakePublisher,
          short_message \\ "hello",

@@ -797,6 +797,129 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     stop(worker, agent)
   end
 
+  test "retries preserve segment bind, child gateway_id, and submit bytes", %{config: config} do
+    {store, _} = journal_store()
+    test = self()
+    message = <<5, 0, 3, 42, 2, 1, 255>>
+
+    {:ok, optional} =
+      Tlv.encode(sar_msg_ref_num: 42, sar_total_segments: 2, sar_segment_seqnum: 1)
+
+    segment = %{
+      bill_id: "bill-parent",
+      index: 1,
+      count: 2,
+      fingerprint_version: 1,
+      fingerprint_digest_base64: Base.encode64(:binary.copy(<<1>>, 32))
+    }
+
+    {worker, agent} =
+      start_bound(config, "alpha", fn agent ->
+        [
+          store: store,
+          submit: fn env ->
+            send(test, {:submitted, env})
+            {:error, :disconnected}
+          end,
+          republish: republish_ok(agent)
+        ]
+      end)
+
+    {_envelope, payload} =
+      valid_payload(%{
+        gateway_id: "gw-child",
+        attempt: 1,
+        max_attempts: 3,
+        expires_at: @future,
+        segment: segment,
+        submit_sm: %{
+          source_addr: "+12025550100",
+          destination_addr: "+12025550101",
+          short_message: message,
+          esm_class: 0x40,
+          optional_parameters: optional
+        }
+      })
+
+    assert :ok = Fake.deliver(agent, payload)
+    assert ConnectorWorker.inflight(worker) == nil
+    assert_received {:submitted, env}
+    assert env.gateway_id == "gw-child"
+    assert env.segment == segment
+    assert env.submit_sm.esm_class == 0x40
+    assert env.submit_sm.optional_parameters === optional
+    assert env.submit_sm.short_message === message
+    events = Fake.events(agent)
+    assert {:republish, {:retry, next}} = find(events, :republish)
+    assert next.attempt == 2
+    assert next.gateway_id == "gw-child"
+    assert next.segment == segment
+    assert next.segment.index == 1
+    assert next.attempt != next.segment.index
+    assert next.submit_sm.esm_class == 0x40
+    assert next.submit_sm.optional_parameters === optional
+    assert next.submit_sm.short_message === message
+
+    assert {:ok, encoded_retry} = Envelope.encode(next)
+    retry_wire = :json.decode(encoded_retry)
+    assert retry_wire["version"] === 3
+    assert retry_wire["segment"]["bill_id"] == "bill-parent"
+    assert retry_wire["gateway_id"] == "gw-child"
+    assert Process.alive?(worker)
+    stop(worker, agent)
+  end
+
+  test "quarantine preserves version 3 segment metadata and overflow does not crash", %{
+    config: config
+  } do
+    {store, _} = journal_store()
+    test = self()
+
+    segment = %{
+      bill_id: "bill-parent",
+      index: 2,
+      count: 2,
+      fingerprint_version: 1,
+      fingerprint_digest_base64: Base.encode64(:binary.copy(<<1>>, 32))
+    }
+
+    {worker, agent} =
+      start_bound(config, "alpha", fn agent ->
+        [
+          store: store,
+          submit: fn env ->
+            send(test, {:submitted, env})
+            {:error, :disconnected}
+          end,
+          republish: republish_ok(agent)
+        ]
+      end)
+
+    {_envelope, payload} =
+      valid_payload(%{
+        gateway_id: "gw-child",
+        attempt: 3,
+        max_attempts: 3,
+        expires_at: @future,
+        segment: segment
+      })
+
+    assert :ok = Fake.deliver(agent, payload)
+    assert ConnectorWorker.inflight(worker) == nil
+    assert_received {:submitted, env}
+    assert env.segment == segment
+    events = Fake.events(agent)
+    assert {:republish, {:quarantine, quarantined, evidence}} = find(events, :republish)
+    assert quarantined.gateway_id == "gw-child"
+    assert quarantined.attempt == 3
+    assert quarantined.segment == segment
+    assert quarantined.segment.index == 2
+    assert evidence.stage == :pre_write
+    refute Enum.any?(events, &match?({:republish, {:retry, _}}, &1))
+    assert Process.alive?(worker)
+    stop(worker, agent)
+  end
+
   test "journal write failure stalls without submit or settlement", %{config: config} do
     test = self()
 

@@ -353,17 +353,7 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
     end
   end
 
-  defp increment(envelope) do
-    Envelope.new(%{
-      gateway_id: envelope.gateway_id,
-      connector_id: envelope.connector_id,
-      attempt: envelope.attempt + 1,
-      max_attempts: envelope.max_attempts,
-      enqueued_at: envelope.enqueued_at,
-      expires_at: envelope.expires_at,
-      submit_sm: envelope.submit_sm
-    })
-  end
+  defp increment(envelope), do: Envelope.retry(envelope)
 
   defp retryable?(envelope),
     do: envelope.attempt < envelope.max_attempts and not expired?(envelope)

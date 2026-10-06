@@ -15,8 +15,8 @@ defmodule JasminEx.Messaging.Envelope do
   transport does not validate SAR, UDHI, or other PDU semantics.
 
   Segment `bill_id` is the parent Router/HTTP identity. `gateway_id` is the
-  child journal key; callers must allocate a unique child id. Segment metadata
-  is unused until retry transport lands. A segment index is never an attempt.
+  child journal key; callers must allocate a unique child id. Retry increments
+  `attempt` only and never treats a segment index as an attempt.
   """
 
   @v1 1
@@ -56,6 +56,16 @@ defmodule JasminEx.Messaging.Envelope do
   end
 
   def new(_attributes), do: {:error, :invalid_envelope}
+
+  def retry(%__MODULE__{} = envelope) do
+    envelope
+    |> Map.from_struct()
+    |> Map.update!(:attempt, &(&1 + 1))
+    |> drop_nil_segment()
+    |> new()
+  end
+
+  def retry(_envelope), do: {:error, :invalid_envelope}
 
   def encode(%__MODULE__{} = envelope) do
     case envelope.segment do
@@ -251,6 +261,9 @@ defmodule JasminEx.Messaging.Envelope do
   end
 
   defp fingerprint_digest(_encoded), do: :error
+
+  defp drop_nil_segment(%{segment: nil} = attributes), do: Map.delete(attributes, :segment)
+  defp drop_nil_segment(attributes), do: attributes
 
   defp encode_legacy(envelope) do
     envelope

@@ -817,6 +817,57 @@ defmodule JasminEx.Messaging.EnvelopeTest do
     assert Envelope.encode(colliding) == {:error, :invalid_envelope}
   end
 
+  test "retry increments attempt only and preserves child id, bind, and submit_sm" do
+    optional = sar_optional()
+    message = udh_short_message()
+
+    attributes =
+      valid_attributes(
+        data_coding: 0,
+        short_message: message,
+        esm_class: 0x40,
+        optional_parameters: optional
+      )
+      |> Map.put(:segment, valid_segment())
+      |> Map.put(:gateway_id, "gateway-child")
+
+    assert {:ok, envelope} = Envelope.new(attributes)
+    assert {:ok, next} = Envelope.retry(envelope)
+    assert next.attempt == 2
+    assert next.max_attempts == 3
+    assert next.gateway_id == "gateway-child"
+    assert next.connector_id == envelope.connector_id
+    assert next.enqueued_at == envelope.enqueued_at
+    assert next.expires_at == envelope.expires_at
+    assert next.segment == envelope.segment
+    assert next.segment.index == 1
+    assert next.attempt != next.segment.index
+    assert next.submit_sm == envelope.submit_sm
+    assert next.submit_sm.esm_class == 0x40
+    assert next.submit_sm.optional_parameters === optional
+    assert next.submit_sm.short_message === message
+  end
+
+  test "retry of a legacy envelope stays version 2 and omits segment" do
+    assert {:ok, envelope} = Envelope.new(valid_attributes(data_coding: 0))
+    assert {:ok, next} = Envelope.retry(envelope)
+    assert next.attempt == 2
+    assert next.segment == nil
+    assert {:ok, encoded} = Envelope.encode(next)
+    wire = :json.decode(encoded)
+    assert wire["version"] === 2
+    refute Map.has_key?(wire, "segment")
+  end
+
+  test "retry at max attempts returns the existing invalid envelope contract" do
+    attributes =
+      valid_attributes(data_coding: 0) |> Map.put(:attempt, 3) |> Map.put(:max_attempts, 3)
+
+    assert {:ok, envelope} = Envelope.new(attributes)
+    assert Envelope.retry(envelope) == {:error, :invalid_envelope}
+    assert Envelope.retry(:not_an_envelope) == {:error, :invalid_envelope}
+  end
+
   test "envelope transports UDHI with SAR bytes; SubmitSM encode owns sar_with_udhi" do
     optional = sar_optional()
     message = udh_short_message()
