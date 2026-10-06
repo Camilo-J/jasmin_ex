@@ -84,6 +84,84 @@ defmodule JasminEx.Routing.BillingSnapshotTest do
     assert state.reservations["bill-1"].monotonic_deadline_ms == 550
   end
 
+  test "v2 and v4 extra ledger keys are ignored as legacy", %{tmp_dir: dir} do
+    extras = Map.put(open_res(), "ledger", segment_ledger())
+    assert {:ok, v2_state} = Snapshot.restore(write!(dir, %{v2() | "reservations" => [extras]}))
+    assert v2_state.reservations["bill-1"].ledger == nil
+
+    assert {:ok, v4_state} = Snapshot.restore(write!(dir, %{v4() | "reservations" => [extras]}))
+    assert v4_state.reservations["bill-1"].ledger == nil
+  end
+
+  test "v5 ledger round-trip retains identity, count, and outcomes", %{tmp_dir: dir} do
+    config = write!(dir, billed_v5())
+    assert %{"version" => 5} = config.snapshot_path |> File.read!() |> :json.decode()
+    assert {:ok, state} = Snapshot.restore(config)
+    open = state.reservations["bill-1"]
+    assert open.ledger.bill_id == "bill-1"
+    assert open.ledger.count == 1
+    assert open.ledger.unit_price == 100
+    assert open.ledger.outcomes == %{1 => :rejected}
+    assert open.refundable_minor == 0
+    assert :ok = Snapshot.write(state, config)
+    assert {:ok, again} = Snapshot.restore(config)
+    assert again.reservations["bill-1"].fingerprint == open.fingerprint
+    assert again.reservations["bill-1"].ledger.outcomes == %{1 => :rejected}
+  end
+
+  test "malformed v5 ledger and incoherent money fail closed", %{tmp_dir: dir} do
+    Enum.each(
+      [
+        %{v5() | "reservations" => [Map.put(open_res(), "ledger", "nope")]},
+        %{
+          v5()
+          | "reservations" => [Map.put(open_res(), "ledger", %{segment_ledger() | "count" => 0})]
+        },
+        %{
+          v5()
+          | "reservations" => [
+              Map.put(open_res(), "ledger", %{segment_ledger() | "bill_id" => "other"})
+            ]
+        },
+        %{
+          v5()
+          | "reservations" => [
+              Map.put(open_res(), "ledger", %{segment_ledger() | "unit_price" => -1})
+            ]
+        },
+        %{
+          v5()
+          | "reservations" => [
+              Map.put(open_res(), "ledger", %{
+                segment_ledger()
+                | "outcomes" => [%{"index" => 1, "outcome" => "nope"}]
+              })
+            ]
+        },
+        %{
+          v5()
+          | "reservations" => [
+              Map.put(open_res(), "ledger", %{
+                segment_ledger()
+                | "outcomes" => [%{"index" => 2, "outcome" => "rejected"}]
+              })
+            ]
+        },
+        %{
+          v5()
+          | "reservations" => [
+              Map.put(open_res(), "ledger", %{
+                segment_ledger()
+                | "outcomes" => [%{"index" => 1, "outcome" => "rejected"}]
+              })
+              |> Map.put("refundable_minor", 90)
+            ]
+        }
+      ],
+      &assert_closed(dir, &1)
+    )
+  end
+
   defp clock, do: {FakeClock, FakeClock.new(wall_ms: 1_000, monotonic_ms: 10)}
 
   defp cfg(dir, clock \\ clock()),
@@ -138,5 +216,56 @@ defmodule JasminEx.Routing.BillingSnapshotTest do
 
   defp bad_digest(digest) do
     %{v2() | "reservations" => [Map.put(open_res(), "fingerprint", %{@fp | "digest" => digest})]}
+  end
+
+  defp v4 do
+    user =
+      Map.merge(hd(v2()["users"]), %{
+        "smpp_credential" => :null,
+        "max_bindings" => 0,
+        "set_dlr_level" => true,
+        "http_set_dlr_method" => true
+      })
+
+    Map.merge(v2(), %{"version" => 4, "users" => [user]})
+  end
+
+  defp v5 do
+    user =
+      Map.merge(hd(v2()["users"]), %{
+        "smpp_credential" => :null,
+        "max_bindings" => 0,
+        "set_dlr_level" => true,
+        "http_set_dlr_method" => true
+      })
+
+    Map.merge(v2(), %{"version" => 5, "users" => [user]})
+  end
+
+  defp billed_v5 do
+    reservation =
+      open_res()
+      |> Map.put("refundable_minor", 0)
+      |> Map.put("ignored", true)
+      |> Map.put("ledger", %{
+        segment_ledger()
+        | "outcomes" => [%{"index" => 1, "outcome" => "rejected"}]
+      })
+
+    v5()
+    |> put_in(["users", Access.at(0), "balance_minor"], 300)
+    |> put_in(["users", Access.at(0), "submit_quota"], 1)
+    |> Map.put("reservations", [reservation])
+    |> Map.put("tombstones", [stone()])
+  end
+
+  defp segment_ledger do
+    %{
+      "bill_id" => "bill-1",
+      "fingerprint" => @fp,
+      "unit_price" => 100,
+      "count" => 1,
+      "outcomes" => []
+    }
   end
 end

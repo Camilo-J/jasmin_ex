@@ -1,7 +1,7 @@
 defmodule JasminEx.Routing.Snapshot do
   @moduledoc false
 
-  alias JasminEx.Billing.{Clock, Fingerprint, Reservation, Tombstone}
+  alias JasminEx.Billing.{Clock, Fingerprint, Reservation, SegmentLedger, Tombstone}
 
   alias JasminEx.Routing.{
     Config,
@@ -63,7 +63,7 @@ defmodule JasminEx.Routing.Snapshot do
 
   defp encode(state) do
     %{
-      "version" => 4,
+      "version" => 5,
       "revision" => state.revision,
       "groups" =>
         Enum.map(Map.values(state.groups), &%{"gid" => &1.gid, "enabled" => &1.enabled}),
@@ -131,7 +131,7 @@ defmodule JasminEx.Routing.Snapshot do
     _error -> {:error, :invalid_json}
   end
 
-  defp version(%{"version" => version}) when version in [1, 2, 3, 4], do: :ok
+  defp version(%{"version" => version}) when version in [1, 2, 3, 4, 5], do: :ok
   defp version(%{"version" => _version}), do: {:error, :unsupported_version}
   defp version(_map), do: {:error, :invalid_json}
 
@@ -165,13 +165,14 @@ defmodule JasminEx.Routing.Snapshot do
          },
          clock
        )
-       when version in [2, 3, 4] and is_integer(rev) and rev >= 0 and is_list(groups) and
+       when version in [2, 3, 4, 5] and is_integer(rev) and rev >= 0 and is_list(groups) and
               is_list(users) and is_list(routes) and is_list(reservations) and
               is_list(tombstones) do
     with {:ok, state} <- reduce_state(State.new(), groups, &load_group/2),
          {:ok, state} <- reduce_state(state, users, user_loader(version)),
          {:ok, state} <- reduce_state(state, routes, &load_route_v2/2),
-         {:ok, state} <- reduce_state(state, reservations, &load_reservation(&1, &2, clock)),
+         {:ok, state} <-
+           reduce_state(state, reservations, &load_reservation(&1, &2, clock, version)),
          {:ok, state} <- reduce_state(state, tombstones, &load_tombstone/2),
          do: {:ok, %{state | revision: rev}}
   end
@@ -181,6 +182,7 @@ defmodule JasminEx.Routing.Snapshot do
   defp user_loader(2), do: &load_user_v2/2
   defp user_loader(3), do: &load_user_v3/2
   defp user_loader(4), do: &load_user_v4/2
+  defp user_loader(5), do: &load_user_v4/2
 
   defp reduce_state(state, items, fun) do
     Enum.reduce_while(items, {:ok, state}, fn item, {:ok, acc} ->
@@ -295,7 +297,7 @@ defmodule JasminEx.Routing.Snapshot do
   defp decode_filter(_attrs), do: {:error, :invalid_state}
 
   defp encode_reservation(%Reservation{} = reservation) do
-    %{
+    encoded = %{
       "bill_id" => reservation.bill_id,
       "uid" => reservation.uid,
       "fingerprint" => encode_fingerprint(reservation.fingerprint),
@@ -305,7 +307,31 @@ defmodule JasminEx.Routing.Snapshot do
       "refundable_minor" => reservation.refundable_minor,
       "wall_deadline_ms" => reservation.wall_deadline_ms
     }
+
+    case reservation.ledger do
+      %SegmentLedger{} = ledger -> Map.put(encoded, "ledger", encode_ledger(ledger))
+      _other -> encoded
+    end
   end
+
+  defp encode_ledger(%SegmentLedger{} = ledger) do
+    %{
+      "bill_id" => ledger.bill_id,
+      "fingerprint" => encode_fingerprint(ledger.fingerprint),
+      "unit_price" => ledger.unit_price,
+      "count" => ledger.count,
+      "outcomes" =>
+        ledger.outcomes
+        |> Enum.sort_by(&elem(&1, 0))
+        |> Enum.map(fn {index, outcome} ->
+          %{"index" => index, "outcome" => encode_segment_outcome(outcome)}
+        end)
+    }
+  end
+
+  defp encode_segment_outcome(:accepted), do: "accepted"
+  defp encode_segment_outcome(:rejected), do: "rejected"
+  defp encode_segment_outcome(:uncertain), do: "uncertain"
 
   defp encode_tombstone(%Tombstone{} = stone) do
     %{
@@ -388,7 +414,7 @@ defmodule JasminEx.Routing.Snapshot do
 
   defp load_route_v2(_state, _attrs), do: {:error, :invalid_state}
 
-  defp load_reservation(state, %{"state" => "open", "uid" => uid} = attrs, clock) do
+  defp load_reservation(state, %{"state" => "open", "uid" => uid} = attrs, clock, version) do
     with {:ok, bill_id} <- decode_bill_id(attrs["bill_id"]),
          true <- Map.has_key?(state.users, uid) and unique_bill?(state, bill_id),
          {:ok, fingerprint} <- decode_fingerprint(attrs["fingerprint"]),
@@ -396,26 +422,137 @@ defmodule JasminEx.Routing.Snapshot do
          {:ok, reserved} <- decode_amount(attrs["reserved_minor"]),
          {:ok, refundable} <- decode_amount(attrs["refundable_minor"]),
          {:ok, wall} <- decode_int64(attrs["wall_deadline_ms"]),
-         {:ok, monotonic} <- rehydrate_monotonic(wall, clock) do
-      reservation = %Reservation{
-        bill_id: bill_id,
-        uid: uid,
-        fingerprint: fingerprint,
-        state: :open,
-        captured_minor: captured,
-        reserved_minor: reserved,
-        refundable_minor: refundable,
-        wall_deadline_ms: wall,
-        monotonic_deadline_ms: monotonic
-      }
-
+         {:ok, monotonic} <- rehydrate_monotonic(wall, clock),
+         {:ok, ledger} <- decode_reservation_ledger(attrs, version),
+         {:ok, reservation} <-
+           bind_ledger(
+             %Reservation{
+               bill_id: bill_id,
+               uid: uid,
+               fingerprint: fingerprint,
+               state: :open,
+               captured_minor: captured,
+               reserved_minor: reserved,
+               refundable_minor: refundable,
+               wall_deadline_ms: wall,
+               monotonic_deadline_ms: monotonic
+             },
+             ledger
+           ) do
       {:ok, %{state | reservations: Map.put(state.reservations, bill_id, reservation)}}
     else
       _error -> {:error, :invalid_state}
     end
   end
 
-  defp load_reservation(_state, _attrs, _clock), do: {:error, :invalid_state}
+  defp load_reservation(_state, _attrs, _clock, _version), do: {:error, :invalid_state}
+
+  defp decode_reservation_ledger(_attrs, version) when version in [2, 3, 4], do: {:ok, nil}
+  defp decode_reservation_ledger(attrs, 5), do: decode_ledger(Map.get(attrs, "ledger"))
+  defp decode_reservation_ledger(_attrs, _version), do: {:error, :invalid_state}
+
+  defp decode_ledger(nil), do: {:ok, nil}
+  defp decode_ledger(:null), do: {:ok, nil}
+
+  defp decode_ledger(%{
+         "bill_id" => bill_id,
+         "fingerprint" => fingerprint,
+         "unit_price" => unit_price,
+         "count" => count,
+         "outcomes" => outcomes
+       }) do
+    with {:ok, bill_id} <- decode_bill_id(bill_id),
+         {:ok, fingerprint} <- decode_fingerprint(fingerprint),
+         {:ok, unit_price} <- decode_amount(unit_price),
+         {:ok, count} <- decode_count(count),
+         {:ok, outcomes} <- decode_outcomes(outcomes, count) do
+      {:ok,
+       %SegmentLedger{
+         bill_id: bill_id,
+         fingerprint: fingerprint,
+         unit_price: unit_price,
+         count: count,
+         outcomes: outcomes
+       }}
+    else
+      _error -> {:error, :invalid_state}
+    end
+  end
+
+  defp decode_ledger(_attrs), do: {:error, :invalid_state}
+
+  defp decode_count(count) when is_integer(count) and count >= 1 and count <= 255,
+    do: {:ok, count}
+
+  defp decode_count(_count), do: {:error, :invalid_state}
+
+  defp decode_outcomes(outcomes, count) when is_list(outcomes) do
+    Enum.reduce_while(outcomes, {:ok, %{}}, fn item, {:ok, acc} ->
+      case decode_outcome_entry(item, count, acc) do
+        {:ok, acc} -> {:cont, {:ok, acc}}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp decode_outcomes(_outcomes, _count), do: {:error, :invalid_state}
+
+  defp decode_outcome_entry(%{"index" => index, "outcome" => outcome}, count, acc)
+       when is_integer(index) and index >= 1 and index <= count and not is_map_key(acc, index) do
+    case decode_segment_outcome(outcome) do
+      {:ok, decoded} -> {:ok, Map.put(acc, index, decoded)}
+      error -> error
+    end
+  end
+
+  defp decode_outcome_entry(_item, _count, _acc), do: {:error, :invalid_state}
+
+  defp decode_segment_outcome("accepted"), do: {:ok, :accepted}
+  defp decode_segment_outcome("rejected"), do: {:ok, :rejected}
+  defp decode_segment_outcome("uncertain"), do: {:ok, :uncertain}
+  defp decode_segment_outcome(_outcome), do: {:error, :invalid_state}
+
+  defp bind_ledger(reservation, nil), do: {:ok, reservation}
+
+  defp bind_ledger(reservation, %SegmentLedger{} = ledger) do
+    with :ok <- match_ledger_identity(reservation, ledger),
+         :ok <- match_ledger_money(reservation, ledger) do
+      {:ok, %{reservation | ledger: ledger}}
+    end
+  end
+
+  defp match_ledger_identity(
+         %Reservation{bill_id: bill_id, fingerprint: fingerprint},
+         %SegmentLedger{bill_id: bill_id, fingerprint: fingerprint}
+       ),
+       do: :ok
+
+  defp match_ledger_identity(_reservation, _ledger), do: {:error, :invalid_state}
+
+  defp match_ledger_money(
+         reservation,
+         %SegmentLedger{count: count, unit_price: unit_price} = ledger
+       ) do
+    total = unit_price * count
+    expected = div(reservation.reserved_minor, count) * pending_count(ledger)
+    divisible? = rem(reservation.reserved_minor, count) == 0
+    captured_ok? = rem(reservation.captured_minor, count) == 0
+    rate_ok? = total == reservation.captured_minor + reservation.reserved_minor
+
+    if divisible? and captured_ok? and rate_ok? and total <= @max_int64 and
+         reservation.refundable_minor == expected do
+      :ok
+    else
+      {:error, :invalid_state}
+    end
+  end
+
+  defp pending_count(%SegmentLedger{count: count, outcomes: outcomes}) do
+    terminal =
+      Enum.count(outcomes, fn {_index, outcome} -> outcome in [:accepted, :rejected] end)
+
+    count - terminal
+  end
 
   defp load_tombstone(state, %{
          "bill_id" => bill_id,
