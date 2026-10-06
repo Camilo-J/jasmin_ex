@@ -5,6 +5,7 @@ defmodule JasminEx.Routing.BillingTest.InjectedOps do
   alias JasminEx.Routing.FileOps
 
   def fail_dir!(dir), do: :persistent_term.put({__MODULE__, dir}, true)
+  def clear_dir!(dir), do: :persistent_term.erase({__MODULE__, dir})
   def mkdir_p(path), do: FileOps.mkdir_p(path)
   def chmod(path, mode), do: FileOps.chmod(path, mode)
   def read(path), do: FileOps.read(path)
@@ -868,6 +869,149 @@ defmodule JasminEx.Routing.BillingTest do
       assert quota_hot.users["u1"].submit_quota == overflow
     end
 
+    @describetag :tmp_dir
+
+    test "router restart keeps identity; duplicates no-op and conflicts stay put", %{
+      tmp_dir: tmp_dir
+    } do
+      {router, config, admission} =
+        start_admitting_router(tmp_dir, segment_count: 3, submit_quota: 5)
+
+      assert {:ok, %Reservation{ledger: %SegmentLedger{count: 3}}} =
+               Routing.admit_segments(router, admission)
+
+      fingerprint = Routing.snapshot(router).reservations["bill-1"].fingerprint
+
+      assert {:ok, %Reservation{ledger: %SegmentLedger{outcomes: %{1 => :rejected}}}} =
+               Routing.settle_segment(router, admission.bill.bill_id, fingerprint, 1, :rejected)
+
+      after_reject = Routing.snapshot(router)
+      assert after_reject.users["u1"].balance_minor == 300
+      assert after_reject.users["u1"].submit_quota == 3
+      :ok = stop_supervised(Router)
+      router = start_supervised!({Router, config: config})
+      restored = Routing.snapshot(router)
+      assert restored.reservations["bill-1"].fingerprint == fingerprint
+      assert restored.reservations["bill-1"].ledger.outcomes[1] == :rejected
+
+      assert {:ok, :duplicate} =
+               Routing.settle_segment(router, admission.bill.bill_id, fingerprint, 1, :rejected)
+
+      assert Routing.snapshot(router).revision == restored.revision
+      assert Routing.snapshot(router).users["u1"].balance_minor == 300
+
+      assert {:error, :conflicting_settlement} =
+               Routing.settle_segment(router, admission.bill.bill_id, fingerprint, 1, :accepted)
+
+      after_conflict = Routing.snapshot(router)
+      assert after_conflict.revision == restored.revision
+      assert after_conflict.users["u1"].balance_minor == 300
+      assert after_conflict.reservations["bill-1"].ledger.outcomes[1] == :rejected
+
+      assert {:error, :billing_conflict} = Routing.admit(router, admission)
+
+      assert {:ok, :duplicate, %Bill{}, %Fingerprint{}} =
+               Routing.admit_segments(router, admission)
+
+      assert Process.alive?(router)
+    end
+
+    test "concurrent same-index settlement credits once", %{tmp_dir: tmp_dir} do
+      {router, _config, admission} =
+        start_admitting_router(tmp_dir, segment_count: 3, submit_quota: 5)
+
+      assert {:ok, reservation} = Routing.admit_segments(router, admission)
+      before = Routing.snapshot(router)
+      fingerprint = reservation.fingerprint
+      bill_id = admission.bill.bill_id
+
+      results =
+        1..2
+        |> Enum.map(fn _ ->
+          Task.async(fn -> Routing.settle_segment(router, bill_id, fingerprint, 1, :rejected) end)
+        end)
+        |> Task.await_many()
+
+      assert Enum.count(results, &match?({:ok, %Reservation{}}, &1)) == 1
+      assert Enum.count(results, &match?({:ok, :duplicate}, &1)) == 1
+      published = Routing.snapshot(router)
+      assert published.revision == before.revision + 1
+      assert published.users["u1"].balance_minor == 300
+      assert published.users["u1"].submit_quota == 3
+      assert published.reservations[bill_id].ledger.outcomes[1] == :rejected
+      assert Process.alive?(router)
+    end
+
+    test "snapshot_failed rolls back then a retry credits once", %{tmp_dir: tmp_dir} do
+      {router, config, admission} =
+        start_admitting_router(tmp_dir,
+          segment_count: 3,
+          submit_quota: 5,
+          file_ops: __MODULE__.InjectedOps
+        )
+
+      assert {:ok, reservation} = Routing.admit_segments(router, admission)
+      before = Routing.snapshot(router)
+      payload = File.read!(config.snapshot_path)
+      dir = Path.dirname(config.snapshot_path)
+      __MODULE__.InjectedOps.fail_dir!(dir)
+
+      on_exit(fn -> __MODULE__.InjectedOps.clear_dir!(dir) end)
+
+      assert {:error, :snapshot_failed} =
+               Routing.settle_segment(
+                 router,
+                 admission.bill.bill_id,
+                 reservation.fingerprint,
+                 1,
+                 :rejected
+               )
+
+      assert_router_unchanged(router, config, before, payload)
+      __MODULE__.InjectedOps.clear_dir!(dir)
+
+      assert {:ok, %Reservation{ledger: %SegmentLedger{outcomes: %{1 => :rejected}}}} =
+               Routing.settle_segment(
+                 router,
+                 admission.bill.bill_id,
+                 reservation.fingerprint,
+                 1,
+                 :rejected
+               )
+
+      published = Routing.snapshot(router)
+      assert published.revision == before.revision + 1
+      assert published.users["u1"].balance_minor == 300
+      assert published.users["u1"].submit_quota == 3
+      assert Process.alive?(router)
+    end
+
+    test "mismatched admission replay is rejected instead of converting mode", %{tmp_dir: tmp_dir} do
+      {router, config, admission} = start_admitting_router(tmp_dir)
+      assert {:ok, %Reservation{ledger: nil}} = Routing.admit(router, admission)
+      before = Routing.snapshot(router)
+      payload = File.read!(config.snapshot_path)
+
+      assert {:error, :billing_conflict} = Routing.admit_segments(router, admission)
+      assert_router_unchanged(router, config, before, payload)
+      :ok = stop_supervised(Router)
+
+      {router, config, segmented} =
+        start_admitting_router(tmp_dir,
+          segment_count: 2,
+          submit_quota: 5,
+          snapshot_name: "routing-seg.json"
+        )
+
+      assert {:ok, %Reservation{ledger: %SegmentLedger{}}} =
+               Routing.admit_segments(router, segmented)
+
+      before = Routing.snapshot(router)
+      payload = File.read!(config.snapshot_path)
+      assert {:error, :billing_conflict} = Routing.admit(router, segmented)
+      assert_router_unchanged(router, config, before, payload)
+    end
+
     test "uncertainty resolves to rejected or accepted with remainder taken once" do
       {state, admission} = fixture(segment_count: 3, submit_quota: 5, precharge_percent: 50)
       assert {:ok, open} = State.admit_segments(state, admission, clock())
@@ -893,6 +1037,104 @@ defmodule JasminEx.Routing.BillingTest do
       assert accepted.users["u1"].submit_quota == 2
       assert accepted.reservations[bill_id].refundable_minor == 100
       assert accepted.reservations[bill_id].ledger.outcomes[2] == :accepted
+    end
+
+    test "distinct-index concurrent settles each refund once", %{tmp_dir: tmp_dir} do
+      {router, _config, admission} =
+        start_admitting_router(tmp_dir, segment_count: 3, submit_quota: 5)
+
+      assert {:ok, reservation} = Routing.admit_segments(router, admission)
+      before = Routing.snapshot(router)
+      fingerprint = reservation.fingerprint
+      bill_id = admission.bill.bill_id
+
+      results =
+        [1, 2]
+        |> Enum.map(fn index ->
+          Task.async(fn ->
+            Routing.settle_segment(router, bill_id, fingerprint, index, :rejected)
+          end)
+        end)
+        |> Task.await_many()
+
+      assert Enum.all?(results, &match?({:ok, %Reservation{}}, &1))
+      published = Routing.snapshot(router)
+      assert published.revision == before.revision + 2
+      assert published.users["u1"].balance_minor == 400
+      assert published.users["u1"].submit_quota == 4
+      assert published.reservations[bill_id].ledger.outcomes[1] == :rejected
+      assert published.reservations[bill_id].ledger.outcomes[2] == :rejected
+      assert published.reservations[bill_id].refundable_minor == 90
+      assert Process.alive?(router)
+    end
+
+    test "kill-restart of empty ledger keeps opt-in guards before any result", %{
+      tmp_dir: tmp_dir
+    } do
+      {router, config, admission} =
+        start_admitting_router(tmp_dir, ttl_ms: 0, segment_count: 3, submit_quota: 5)
+
+      assert {:ok, %Reservation{ledger: %SegmentLedger{outcomes: %{}}}} =
+               Routing.admit_segments(router, admission)
+
+      fingerprint = Routing.snapshot(router).reservations["bill-1"].fingerprint
+      router = kill_restart(router, config)
+      restored = Routing.snapshot(router)
+      assert restored.reservations["bill-1"].ledger.outcomes == %{}
+      assert restored.reservations["bill-1"].fingerprint == fingerprint
+
+      before = restored
+      payload = File.read!(config.snapshot_path)
+      assert {:ok, 0} = Routing.expire_due(router)
+      assert {:error, :billing_conflict} = Routing.settle(router, settle_cmd(admission, :ok))
+      assert_router_unchanged(router, config, before, payload)
+      assert Process.alive?(router)
+    end
+
+    test "router expire_due leaves empty and uncertain segment reservations uncredited", %{
+      tmp_dir: tmp_dir
+    } do
+      {router, config, empty} =
+        start_admitting_router(tmp_dir, ttl_ms: 0, segment_count: 3, submit_quota: 5)
+
+      assert {:ok, _} = Routing.admit_segments(router, empty)
+      before = Routing.snapshot(router)
+      payload = File.read!(config.snapshot_path)
+      assert {:ok, 0} = Routing.expire_due(router)
+      assert_router_unchanged(router, config, before, payload)
+
+      fingerprint = before.reservations["bill-1"].fingerprint
+
+      assert {:ok, %Reservation{ledger: %SegmentLedger{outcomes: %{1 => :uncertain}}}} =
+               Routing.settle_segment(router, empty.bill.bill_id, fingerprint, 1, :uncertain)
+
+      pending = Routing.snapshot(router)
+      payload = File.read!(config.snapshot_path)
+      assert pending.users["u1"].balance_minor == 200
+      assert {:ok, 0} = Routing.expire_due(router)
+      assert_router_unchanged(router, config, pending, payload)
+    end
+
+    test "router terminal tombstone then late segment result is unchanged", %{tmp_dir: tmp_dir} do
+      {router, config, admission} =
+        start_admitting_router(tmp_dir, segment_count: 1, submit_quota: 3)
+
+      assert {:ok, reservation} = Routing.admit_segments(router, admission)
+      fingerprint = reservation.fingerprint
+
+      assert {:ok, %Tombstone{state: :settled_non_ok}} =
+               Routing.settle_segment(router, admission.bill.bill_id, fingerprint, 1, :rejected)
+
+      after_close = Routing.snapshot(router)
+      payload = File.read!(config.snapshot_path)
+      assert after_close.users["u1"].balance_minor == 500
+      assert after_close.users["u1"].submit_quota == 3
+      assert after_close.reservations == %{}
+
+      assert {:ok, :late_ignored} =
+               Routing.settle_segment(router, admission.bill.bill_id, fingerprint, 1, :rejected)
+
+      assert_router_unchanged(router, config, after_close, payload)
     end
   end
 
@@ -952,7 +1194,7 @@ defmodule JasminEx.Routing.BillingTest do
   defp start_admitting_router(tmp_dir, opts \\ []) do
     config =
       Config.new(
-        snapshot_path: Path.join(tmp_dir, "routing-v1.json"),
+        snapshot_path: Path.join(tmp_dir, Keyword.get(opts, :snapshot_name, "routing-v1.json")),
         file_ops: Keyword.get(opts, :file_ops),
         clock: clock()
       )
@@ -967,7 +1209,7 @@ defmodule JasminEx.Routing.BillingTest do
         secret: "s3cret",
         group: group,
         balance_minor: 500,
-        submit_quota: 3
+        submit_quota: Keyword.get(opts, :submit_quota, 3)
       )
 
     {:ok, connector} = ConnectorRef.new("smpp-t")
@@ -983,7 +1225,17 @@ defmodule JasminEx.Routing.BillingTest do
       )
 
     {router, config,
-     admission(Keyword.take(opts, [:bill_id, :rate_minor, :ttl_ms, :precharge_percent]))}
+     admission(
+       Keyword.take(opts, [:segment_count, :bill_id, :rate_minor, :ttl_ms, :precharge_percent])
+     )}
+  end
+
+  defp kill_restart(router, config) do
+    ref = Process.monitor(router)
+    Process.exit(router, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^router, :killed}, 1_000
+    _ = stop_supervised(Router)
+    start_supervised!({Router, config: config})
   end
 
   defp assert_router_typed_error(tmp_dir, reason, admission) do

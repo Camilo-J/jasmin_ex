@@ -33,11 +33,38 @@ defmodule JasminEx.Routing do
           | {:error, atom()}
   defdelegate admit(server, admission), to: Router
 
+  @doc """
+  Admit one bill in opt-in durable segment mode through the live Router.
+
+  Mode is marked at admission and is never inferred from later results. An
+  exact duplicate is a no-op. A legacy reservation or a different economic
+  fingerprint returns `{:error, :billing_conflict}` and leaves state unchanged.
+  """
+  @spec admit_segments(GenServer.server(), term()) ::
+          {:ok, JasminEx.Billing.Reservation.t()}
+          | {:ok, :duplicate, JasminEx.Billing.Bill.t(), JasminEx.Billing.Fingerprint.t()}
+          | {:error, atom()}
+  defdelegate admit_segments(server, admission), to: Router
+
   @spec settle(GenServer.server(), term()) ::
           {:ok, JasminEx.Billing.Tombstone.t()}
           | {:ok, :duplicate | :late_ignored}
           | {:error, atom()}
   defdelegate settle(server, settlement), to: Router
+
+  @doc """
+  Record one segment outcome and persist ledger plus account deltas together.
+
+  Duplicates do not write. After a whole-bill tombstone, results are ignored
+  without credit. The guarantee is a single Router and its snapshot store:
+  atomic rename proves process restart, not unverified power-loss durability,
+  multi-router exactly-once, or external SMS delivery exactly-once.
+  """
+  @spec settle_segment(GenServer.server(), term(), term(), term(), term()) ::
+          {:ok, JasminEx.Billing.Reservation.t() | JasminEx.Billing.Tombstone.t()}
+          | {:ok, :duplicate | :late_ignored}
+          | {:error, atom()}
+  defdelegate settle_segment(server, bill_id, fingerprint, index, outcome), to: Router
 
   @spec expire_due(GenServer.server()) :: {:ok, non_neg_integer()} | {:error, atom()}
   defdelegate expire_due(server), to: Router

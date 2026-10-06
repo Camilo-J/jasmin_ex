@@ -42,9 +42,23 @@ defmodule JasminEx.Routing.Router do
           | {:error, atom()}
   def admit(server, admission), do: GenServer.call(server, {:admit, admission})
 
+  @spec admit_segments(GenServer.server(), term()) ::
+          {:ok, Reservation.t()}
+          | {:ok, :duplicate, Bill.t(), Fingerprint.t()}
+          | {:error, atom()}
+  def admit_segments(server, admission), do: GenServer.call(server, {:admit_segments, admission})
+
   @spec settle(GenServer.server(), term()) ::
           {:ok, Tombstone.t()} | {:ok, :duplicate | :late_ignored} | {:error, atom()}
   def settle(server, settlement), do: GenServer.call(server, {:settle, settlement})
+
+  @spec settle_segment(GenServer.server(), term(), term(), term(), term()) ::
+          {:ok, Reservation.t() | Tombstone.t()}
+          | {:ok, :duplicate | :late_ignored}
+          | {:error, atom()}
+  def settle_segment(server, bill_id, fingerprint, index, outcome) do
+    GenServer.call(server, {:settle_segment, bill_id, fingerprint, index, outcome})
+  end
 
   @spec expire_due(GenServer.server()) :: {:ok, non_neg_integer()} | {:error, atom()}
   def expire_due(server), do: GenServer.call(server, :expire_due)
@@ -121,11 +135,19 @@ defmodule JasminEx.Routing.Router do
   end
 
   def handle_call({:admit, admission}, _from, state) do
-    mutate(state, fn -> admit_change(state, admission) end)
+    mutate(state, fn -> admit_change(state, admission, :legacy) end)
+  end
+
+  def handle_call({:admit_segments, admission}, _from, state) do
+    mutate(state, fn -> admit_change(state, admission, :segments) end)
   end
 
   def handle_call({:settle, settlement}, _from, state) do
     mutate(state, fn -> settle_change(state, settlement) end)
+  end
+
+  def handle_call({:settle_segment, bill_id, fingerprint, index, outcome}, _from, state) do
+    mutate(state, fn -> settle_segment_change(state, bill_id, fingerprint, index, outcome) end)
   end
 
   def handle_call(:expire_due, _from, state) do
@@ -165,27 +187,43 @@ defmodule JasminEx.Routing.Router do
     {:reply, {:error, :invalid_amount}, state}
   end
 
-  defp admit_change(state, %Admission{bill: %Bill{bill_id: bill_id}} = admission) do
+  defp admit_change(state, %Admission{bill: %Bill{bill_id: bill_id}} = admission, mode) do
     case {Map.get(state.tombstones, bill_id), Map.get(state.reservations, bill_id)} do
       {%Tombstone{} = stone, _} ->
         duplicate_admission(Tombstone.classify(stone, admission))
 
       {_, %Reservation{} = reservation} ->
-        duplicate_admission(Reservation.classify(reservation, admission))
+        replay_admission(reservation, admission, mode)
 
       {nil, nil} ->
-        admit_new(state, admission, bill_id)
+        admit_new(state, admission, bill_id, mode)
     end
   end
 
-  defp admit_change(state, admission), do: State.admit(state, admission, clock())
+  defp admit_change(state, admission, :segments),
+    do: State.admit_segments(state, admission, clock())
 
-  defp admit_new(state, admission, bill_id) do
-    with {:ok, next} <- State.admit(state, admission, clock()),
+  defp admit_change(state, admission, _mode), do: State.admit(state, admission, clock())
+
+  defp replay_admission(reservation, admission, mode) do
+    if Reservation.segment_mode?(reservation) == (mode == :segments) do
+      duplicate_admission(Reservation.classify(reservation, admission))
+    else
+      {:error, :billing_conflict}
+    end
+  end
+
+  defp admit_new(state, admission, bill_id, mode) do
+    with {:ok, next} <- open_admission(state, admission, mode),
          {:ok, reservation} <- fetch_admitted_reservation(next, bill_id) do
       {:ok, next, reservation}
     end
   end
+
+  defp open_admission(state, admission, :segments),
+    do: State.admit_segments(state, admission, clock())
+
+  defp open_admission(state, admission, _mode), do: State.admit(state, admission, clock())
 
   defp fetch_admitted_reservation(next, bill_id) do
     case Map.fetch(next.reservations, bill_id) do
@@ -210,6 +248,28 @@ defmodule JasminEx.Routing.Router do
   end
 
   defp settle_change(_state, _settlement), do: {:error, :invalid_bill_id}
+
+  defp settle_segment_change(state, bill_id, fingerprint, index, outcome) do
+    case State.settle_segment(state, bill_id, fingerprint, index, outcome) do
+      {:ok, :duplicate} -> {:unchanged, {:ok, :duplicate}}
+      {:ok, :late_ignored} -> {:unchanged, {:ok, :late_ignored}}
+      {:ok, next} -> fetch_segment_result(next, bill_id)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp fetch_segment_result(next, bill_id) do
+    cond do
+      Map.has_key?(next.tombstones, bill_id) and not Map.has_key?(next.reservations, bill_id) ->
+        {:ok, next, next.tombstones[bill_id]}
+
+      Map.has_key?(next.reservations, bill_id) ->
+        {:ok, next, next.reservations[bill_id]}
+
+      true ->
+        {:error, :inconsistent_settlement}
+    end
+  end
 
   defp fetch_settled_tombstone(next, bill_id) do
     case Map.fetch(next.tombstones, bill_id) do
