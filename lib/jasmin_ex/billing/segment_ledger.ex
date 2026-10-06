@@ -62,6 +62,12 @@ defmodule JasminEx.Billing.SegmentLedger do
 
   def record(_ledger, _bill_id, _fingerprint, _index, _outcome), do: {:error, :invalid_bill}
 
+  @spec terminal?(t()) :: boolean()
+  def terminal?(%__MODULE__{count: count, outcomes: outcomes}) do
+    map_size(outcomes) == count and
+      Enum.all?(outcomes, fn {_index, outcome} -> outcome in [:accepted, :rejected] end)
+  end
+
   defp validate_bill(%Bill{} = bill) do
     with :ok <- validate_id(bill.bill_id),
          :ok <- validate_id(bill.uid),

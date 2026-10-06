@@ -5,6 +5,7 @@ defmodule JasminEx.Billing.Reservation do
   alias JasminEx.Billing.Bill
   alias JasminEx.Billing.Clock
   alias JasminEx.Billing.Fingerprint
+  alias JasminEx.Billing.SegmentLedger
 
   @max_int64 9_223_372_036_854_775_807
   @min_int64 -9_223_372_036_854_775_808
@@ -19,9 +20,9 @@ defmodule JasminEx.Billing.Reservation do
     :wall_deadline_ms,
     :monotonic_deadline_ms
   ]
-  defstruct @enforce_keys
+  defstruct @enforce_keys ++ [ledger: nil]
 
-  @type t :: %__MODULE__{}
+  @type t :: %__MODULE__{ledger: SegmentLedger.t() | nil}
 
   @spec open(Admission.t(), Clock.clock()) :: {:ok, t()} | {:error, :invalid_ttl}
   def open(%Admission{bill: %Bill{} = bill, ttl_ms: ttl_ms}, clock) do
@@ -43,6 +44,19 @@ defmodule JasminEx.Billing.Reservation do
        }}
     end
   end
+
+  @spec open_segments(Admission.t(), Clock.clock()) ::
+          {:ok, t()} | {:error, :invalid_ttl | :invalid_bill | :indivisible_bill}
+  def open_segments(%Admission{bill: %Bill{} = bill} = admission, clock) do
+    with {:ok, reservation} <- open(admission, clock),
+         {:ok, ledger} <- SegmentLedger.open(bill) do
+      {:ok, %{reservation | ledger: ledger}}
+    end
+  end
+
+  @spec segment_mode?(t()) :: boolean()
+  def segment_mode?(%__MODULE__{ledger: %SegmentLedger{}}), do: true
+  def segment_mode?(%__MODULE__{}), do: false
 
   @spec identity(t()) :: {binary(), Fingerprint.t(), :admit}
   def identity(%__MODULE__{bill_id: bill_id, fingerprint: fingerprint}) do

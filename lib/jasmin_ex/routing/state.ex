@@ -5,6 +5,7 @@ defmodule JasminEx.Routing.State do
   alias JasminEx.Billing.Bill
   alias JasminEx.Billing.Clock
   alias JasminEx.Billing.Reservation
+  alias JasminEx.Billing.SegmentLedger
   alias JasminEx.Billing.Settlement
   alias JasminEx.Billing.Tombstone
   alias JasminEx.Routing.Group
@@ -141,24 +142,18 @@ defmodule JasminEx.Routing.State do
   def set_rate(%__MODULE__{}, _order, _rate), do: {:error, :unknown_route}
 
   @spec admit(t(), term(), Clock.clock()) :: {:ok, t()} | {:error, atom()}
-  def admit(%__MODULE__{} = state, %Admission{bill: %Bill{} = bill} = admission, clock) do
-    with {:ok, user} <- fetch_user(state, bill.uid),
-         {:ok, _route} <- fetch_route(state, bill.route_order),
-         {:ok, balance_minor} <- debit_balance(user.balance_minor, bill.rate_minor),
-         {:ok, submit_quota} <- debit_quota(user.submit_quota, bill.quota_debit),
-         {:ok, reservation} <- Reservation.open(admission, clock) do
-      user = %{user | balance_minor: balance_minor, submit_quota: submit_quota}
-
-      {:ok,
-       %{
-         state
-         | users: Map.put(state.users, user.uid, user),
-           reservations: Map.put(state.reservations, bill.bill_id, reservation)
-       }}
-    end
+  def admit(%__MODULE__{} = state, %Admission{bill: %Bill{}} = admission, clock) do
+    admit_with(state, admission, clock, &Reservation.open/2)
   end
 
   def admit(%__MODULE__{}, _admission, _clock), do: {:error, :invalid_bill_id}
+
+  @spec admit_segments(t(), term(), Clock.clock()) :: {:ok, t()} | {:error, atom()}
+  def admit_segments(%__MODULE__{} = state, %Admission{bill: %Bill{}} = admission, clock) do
+    admit_with(state, admission, clock, &Reservation.open_segments/2)
+  end
+
+  def admit_segments(%__MODULE__{}, _admission, _clock), do: {:error, :invalid_bill_id}
 
   @spec settle(t(), term()) ::
           {:ok, t()} | {:ok, :duplicate} | {:ok, :late_ignored} | {:error, atom()}
@@ -172,16 +167,38 @@ defmodule JasminEx.Routing.State do
 
   def settle(%__MODULE__{}, _settlement), do: {:error, :invalid_bill_id}
 
-  @spec expire_due(t(), Clock.clock()) :: {:ok, t(), non_neg_integer()}
+  @spec settle_segment(t(), term(), term(), term(), term()) ::
+          {:ok, t()} | {:ok, :duplicate | :late_ignored} | {:error, atom()}
+  def settle_segment(%__MODULE__{} = state, bill_id, fingerprint, index, outcome)
+      when is_binary(bill_id) do
+    case {Map.get(state.tombstones, bill_id), Map.get(state.reservations, bill_id)} do
+      {%Tombstone{} = stone, _} ->
+        late_segment(stone, fingerprint)
+
+      {_, %Reservation{ledger: nil}} ->
+        {:error, :billing_conflict}
+
+      {_, %Reservation{} = reservation} ->
+        apply_segment(state, reservation, fingerprint, index, outcome)
+
+      {nil, nil} ->
+        {:error, :unknown_bill}
+    end
+  end
+
+  def settle_segment(%__MODULE__{}, _bill_id, _fingerprint, _index, _outcome),
+    do: {:error, :invalid_bill_id}
+
+  @spec expire_due(t(), Clock.clock()) :: {:ok, t(), non_neg_integer()} | {:error, atom()}
   def expire_due(%__MODULE__{} = state, clock) do
     now = Clock.monotonic_ms(clock)
 
     due =
       Enum.filter(state.reservations, fn {_id, reservation} ->
-        reservation.monotonic_deadline_ms <= now
+        reservation.monotonic_deadline_ms <= now and not Reservation.segment_mode?(reservation)
       end)
 
-    {:ok, Enum.reduce(due, state, &expire_one/2), length(due)}
+    expire_batch(due, state)
   end
 
   defp drop_group(_state, {nil, _groups}), do: {:error, :unknown_group}
@@ -189,6 +206,23 @@ defmodule JasminEx.Routing.State do
   defp drop_group(state, {%Group{gid: gid}, groups}) do
     users = Map.reject(state.users, fn {_uid, user} -> user.gid == gid end)
     {:ok, %{state | groups: groups, users: users}}
+  end
+
+  defp admit_with(state, %Admission{bill: %Bill{} = bill} = admission, clock, opener) do
+    with {:ok, user} <- fetch_user(state, bill.uid),
+         {:ok, _route} <- fetch_route(state, bill.route_order),
+         {:ok, balance_minor} <- debit_balance(user.balance_minor, bill.rate_minor),
+         {:ok, submit_quota} <- debit_quota(user.submit_quota, bill.quota_debit),
+         {:ok, reservation} <- opener.(admission, clock) do
+      user = %{user | balance_minor: balance_minor, submit_quota: submit_quota}
+
+      {:ok,
+       %{
+         state
+         | users: Map.put(state.users, user.uid, user),
+           reservations: Map.put(state.reservations, bill.bill_id, reservation)
+       }}
+    end
   end
 
   defp username_taken?(users, uid, username) do
@@ -275,6 +309,9 @@ defmodule JasminEx.Routing.State do
 
   defp open_settle(state, reservation, %Settlement{fingerprint: fingerprint, outcome: outcome}) do
     cond do
+      Reservation.segment_mode?(reservation) ->
+        {:error, :billing_conflict}
+
       reservation.fingerprint != fingerprint ->
         {:error, :billing_conflict}
 
@@ -289,9 +326,20 @@ defmodule JasminEx.Routing.State do
     end
   end
 
-  defp expire_one({_bill_id, reservation}, state) do
-    {:ok, next} = close(state, reservation, :expired, reservation.refundable_minor)
-    next
+  defp expire_batch([], state), do: {:ok, state, 0}
+
+  defp expire_batch(due, state) do
+    case Enum.reduce_while(due, {:ok, state}, &expire_step/2) do
+      {:ok, next} -> {:ok, next, length(due)}
+      error -> error
+    end
+  end
+
+  defp expire_step({_bill_id, reservation}, {:ok, state}) do
+    case close(state, reservation, :expired, reservation.refundable_minor) do
+      {:ok, next} -> {:cont, {:ok, next}}
+      error -> {:halt, error}
+    end
   end
 
   defp close(state, reservation, tombstone_state, credit) do
@@ -313,6 +361,86 @@ defmodule JasminEx.Routing.State do
   defp credit_balance(nil, _amount), do: {:ok, nil}
 
   defp credit_balance(balance, amount)
-       when is_integer(balance) and is_integer(amount) and amount >= 0,
-       do: {:ok, balance + amount}
+       when is_integer(balance) and is_integer(amount) and amount >= 0 do
+    sum = balance + amount
+    if sum <= @max_int64, do: {:ok, sum}, else: {:error, :amount_overflow}
+  end
+
+  defp credit_quota(nil, _amount), do: {:ok, nil}
+
+  defp credit_quota(quota, amount)
+       when is_integer(quota) and is_integer(amount) and amount >= 0 do
+    sum = quota + amount
+    if sum <= @max_int64, do: {:ok, sum}, else: {:error, :amount_overflow}
+  end
+
+  defp late_segment(%Tombstone{fingerprint: fingerprint}, fingerprint), do: {:ok, :late_ignored}
+  defp late_segment(_stone, _fingerprint), do: {:error, :billing_conflict}
+
+  defp apply_segment(state, reservation, fingerprint, index, outcome) do
+    case SegmentLedger.record(
+           reservation.ledger,
+           reservation.bill_id,
+           fingerprint,
+           index,
+           outcome
+         ) do
+      {:ok, :duplicate, _ledger, _delta} ->
+        {:ok, :duplicate}
+
+      {:ok, ledger, delta} ->
+        credit_segment(state, reservation, ledger, delta, outcome)
+
+      error ->
+        error
+    end
+  end
+
+  defp credit_segment(state, reservation, ledger, delta, outcome) do
+    with {:ok, refundable} <- take_remainder(reservation, outcome),
+         {:ok, user} <- fetch_user(state, reservation.uid),
+         {:ok, balance_minor} <- credit_balance(user.balance_minor, delta.refund_minor),
+         {:ok, submit_quota} <- credit_quota(user.submit_quota, delta.quota_credit) do
+      reservation = %{reservation | ledger: ledger, refundable_minor: refundable}
+      user = %{user | balance_minor: balance_minor, submit_quota: submit_quota}
+
+      next = %{
+        state
+        | users: Map.put(state.users, user.uid, user),
+          reservations: Map.put(state.reservations, reservation.bill_id, reservation)
+      }
+
+      close_if_terminal(next, reservation)
+    end
+  end
+
+  defp take_remainder(reservation, :uncertain), do: {:ok, reservation.refundable_minor}
+
+  defp take_remainder(reservation, _outcome) do
+    count = reservation.ledger.count
+    unit = div(reservation.reserved_minor, count)
+    refundable = reservation.refundable_minor - unit
+
+    if rem(reservation.reserved_minor, count) == 0 and refundable >= 0 do
+      {:ok, refundable}
+    else
+      {:error, :invalid_bill}
+    end
+  end
+
+  defp close_if_terminal(state, reservation) do
+    if SegmentLedger.terminal?(reservation.ledger) do
+      close(state, reservation, terminal_tombstone(reservation.ledger), 0)
+    else
+      {:ok, state}
+    end
+  end
+
+  defp terminal_tombstone(%SegmentLedger{outcomes: outcomes}) do
+    if Enum.any?(outcomes, fn {_index, outcome} -> outcome == :rejected end) do
+      :settled_non_ok
+    else
+      :settled_ok
+    end
+  end
 end
