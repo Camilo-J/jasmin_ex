@@ -4,6 +4,8 @@
 
 `JasminEx.Billing.Bill.new/1` optionally accepts `segment_count` as an integer `1..255`. Omit it to keep the existing single-segment bill. `rate_minor` is still the per-segment unit price; the constructed bill stores `unit * N` as total `rate_minor` and `N` as `quota_debit`. Rounding splits the unit rate first, then multiplies precharge and remainder by `N`. Explicit `nil` or any other invalid count returns `{:error, :invalid_segment_count}`. A total past signed int64 returns `{:error, :amount_overflow}`. Count `255` is the representational protocol bound; the HTTP planner's configurable user max (default `5`) is unchanged. This constructor does not activate HTTP multipart billing.
 
+`JasminEx.Billing.SegmentLedger` is a pure, opt-in in-memory ledger for per-segment settlement deltas. It is not wired to reservations, account credit, retries, or HTTP. `open/1` binds a valid `Bill` and its recomputed fingerprint; `record/5` returns refund and quota deltas only. Replay from a stale copy is not durable or idempotent across process restart: the consumer must atomically persist the new ledger and apply each delta. HTTP multipart submission remains inactive.
+
 ## API
 
 ```elixir
