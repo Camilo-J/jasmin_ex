@@ -347,7 +347,7 @@ defmodule JasminEx.Messaging.EnvelopeTest do
   end
 
   test "unsupported versions stay unsupported_version" do
-    assert Envelope.decode(~s({"version":3,"connector_id":"alpha"})) ==
+    assert Envelope.decode(~s({"version":4,"connector_id":"alpha"})) ==
              {:error, :unsupported_version}
 
     assert Envelope.decode(~s({"version":99})) == {:error, :unsupported_version}
@@ -627,6 +627,196 @@ defmodule JasminEx.Messaging.EnvelopeTest do
     assert v1.submit_sm.esm_class == 0x40
   end
 
+  test "accepts all-or-nothing segment bind with distinct parent bill_id" do
+    attributes = Map.put(valid_attributes(data_coding: 0), :segment, valid_segment())
+    assert {:ok, envelope} = Envelope.new(attributes)
+    assert envelope.gateway_id == "gateway-1"
+    assert envelope.segment.bill_id == "bill-parent"
+    assert envelope.segment.bill_id != envelope.gateway_id
+    assert envelope.segment.index == 1
+    assert envelope.segment.count == 2
+    assert envelope.segment.fingerprint_version == 1
+    assert envelope.segment.fingerprint_digest_base64 == canonical_digest()
+    refute is_struct(envelope.segment)
+  end
+
+  test "absent or nil segment stays off the bind and does not change legacy new/1" do
+    assert {:ok, omitted} = Envelope.new(valid_attributes(data_coding: 0))
+    assert omitted.segment == nil
+
+    assert {:ok, explicit} =
+             Envelope.new(Map.put(valid_attributes(data_coding: 0), :segment, nil))
+
+    assert explicit.segment == nil
+    assert explicit.gateway_id == omitted.gateway_id
+    assert explicit.submit_sm == omitted.submit_sm
+  end
+
+  test "rejects invalid segment index, count, types, digest, and partial maps" do
+    valid = valid_segment()
+    digest = canonical_digest()
+
+    invalid = [
+      %{valid | index: 0},
+      %{valid | index: 256},
+      %{valid | index: -1},
+      %{valid | index: 1.0},
+      %{valid | index: "1"},
+      %{valid | count: 0},
+      %{valid | count: 256},
+      %{valid | count: 2.0},
+      %{valid | count: "2"},
+      %{valid | index: 3, count: 2},
+      %{valid | fingerprint_version: 0},
+      %{valid | fingerprint_version: 2},
+      %{valid | fingerprint_version: 1.0},
+      %{valid | fingerprint_version: "1"},
+      %{valid | fingerprint_digest_base64: "aGVsbG8="},
+      %{valid | fingerprint_digest_base64: Base.encode64(:binary.copy(<<1>>, 31))},
+      %{valid | fingerprint_digest_base64: String.trim_trailing(digest, "=")},
+      %{valid | fingerprint_digest_base64: digest <> "\n"},
+      %{valid | fingerprint_digest_base64: :null},
+      %{valid | bill_id: ""},
+      %{valid | bill_id: :null},
+      Map.delete(valid, :index),
+      Map.delete(valid, :bill_id),
+      Map.put(valid, :extra, true),
+      :null,
+      1,
+      [],
+      "segment"
+    ]
+
+    for segment <- invalid do
+      attributes = Map.put(valid_attributes(data_coding: 0), :segment, segment)
+      assert Envelope.new(attributes) == {:error, :invalid_envelope}
+    end
+  end
+
+  test "rejects segment mode when parent bill_id equals child gateway_id" do
+    segment = %{valid_segment() | bill_id: "gateway-1"}
+    attributes = Map.put(valid_attributes(data_coding: 0), :segment, segment)
+    assert Envelope.new(attributes) == {:error, :invalid_envelope}
+  end
+
+  test "round-trips present segment metadata as version 3" do
+    attributes = Map.put(valid_attributes(data_coding: 0), :segment, valid_segment())
+    assert {:ok, envelope} = Envelope.new(attributes)
+    assert {:ok, encoded} = Envelope.encode(envelope)
+    wire = :json.decode(encoded)
+    assert wire["version"] === 3
+    assert wire["segment"] == valid_segment_wire()
+    refute Map.has_key?(wire["submit_sm"], "short_message")
+    assert wire["submit_sm"]["short_message_base64"] == Base.encode64("hello")
+    assert {:ok, decoded} = Envelope.decode(encoded)
+    assert decoded == envelope
+    assert decoded.segment.bill_id != decoded.gateway_id
+  end
+
+  test "legacy envelopes without segment encode as exact version 2 bytes" do
+    assert {:ok, omitted} = Envelope.new(valid_attributes(data_coding: 0))
+
+    assert {:ok, explicit_nil} =
+             Envelope.new(Map.put(valid_attributes(data_coding: 0), :segment, nil))
+
+    assert {:ok, encoded} = Envelope.encode(omitted)
+    assert {:ok, ^encoded} = Envelope.encode(explicit_nil)
+    assert encoded === legacy_v2_bytes()
+    wire = :json.decode(encoded)
+    assert wire["version"] === 2
+    refute Map.has_key?(wire, "segment")
+  end
+
+  test "v1 legacy restore stays unchanged when segment is absent" do
+    payload = v1_fixture(%{"short_message" => "café"})
+    assert {:ok, envelope} = Envelope.decode(payload)
+    assert envelope.submit_sm.short_message === "café"
+    assert envelope.segment == nil
+    assert {:ok, encoded} = Envelope.encode(envelope)
+    assert :json.decode(encoded)["version"] === 2
+    refute Map.has_key?(:json.decode(encoded), "segment")
+  end
+
+  test "v3 without segment, null segment, or partial segment is invalid" do
+    payloads = [
+      ~s({"version":3,"connector_id":"alpha"}),
+      v3_fixture(%{}, %{"segment" => :null}),
+      v3_fixture(%{}, %{"segment" => Map.delete(valid_segment_wire(), "index")}),
+      v3_fixture(%{}, %{"segment" => %{}}),
+      drop_wire_key(v3_fixture(), "segment")
+    ]
+
+    for payload <- payloads do
+      assert Envelope.decode(payload) == {:error, :invalid_envelope}
+    end
+  end
+
+  test "v1 and v2 payloads with a segment key fail closed and never downgrade" do
+    payloads = [
+      v2_fixture(%{}, %{"segment" => valid_segment_wire()}),
+      v2_fixture(%{}, %{"segment" => :null}),
+      v2_fixture(%{}, %{"segment" => %{}}),
+      v2_fixture(%{}, %{"segment" => ""}),
+      v1_with_segment(valid_segment_wire()),
+      v1_with_segment(:null),
+      v1_with_segment(%{})
+    ]
+
+    for payload <- payloads do
+      assert Envelope.decode(payload) == {:error, :invalid_envelope}
+    end
+  end
+
+  test "v3 decode uses v2 binary submit_sm semantics" do
+    assert Envelope.decode(v3_fixture(%{"short_message" => "hello"})) ==
+             {:error, :invalid_envelope}
+
+    assert Envelope.decode(v3_fixture(%{"short_message_base64" => "aGVsbG8"})) ==
+             {:error, :invalid_envelope}
+  end
+
+  test "unknown v3 wire keys do not create atoms" do
+    extra = "untrusted_v3_#{System.unique_integer([:positive])}"
+    nested = "untrusted_seg_#{System.unique_integer([:positive])}"
+
+    extra_top =
+      v3_fixture(%{}, %{extra => "ignored"})
+
+    extra_nested =
+      v3_fixture(%{}, %{"segment" => Map.put(valid_segment_wire(), nested, "value")})
+
+    assert_raise ArgumentError, fn -> String.to_existing_atom(extra) end
+    assert_raise ArgumentError, fn -> String.to_existing_atom(nested) end
+    assert {:ok, envelope} = Envelope.decode(extra_top)
+    assert envelope.segment == valid_segment()
+    refute Enum.any?(Map.keys(Map.from_struct(envelope)), &(Atom.to_string(&1) == extra))
+    assert Envelope.decode(extra_nested) == {:error, :invalid_envelope}
+    assert_raise ArgumentError, fn -> String.to_existing_atom(extra) end
+    assert_raise ArgumentError, fn -> String.to_existing_atom(nested) end
+  end
+
+  test "old accepted version list rejects v3 instead of dropping billing bind" do
+    attributes = Map.put(valid_attributes(data_coding: 0), :segment, valid_segment())
+    assert {:ok, envelope} = Envelope.new(attributes)
+    assert {:ok, encoded} = Envelope.encode(envelope)
+    wire = :json.decode(encoded)
+    assert wire["version"] === 3
+    assert wire["segment"]["bill_id"] == "bill-parent"
+    refute wire["version"] in old_accepted_versions()
+    assert old_decode(encoded) == {:error, :unsupported_version}
+  end
+
+  test "encode of hand-built malformed segment fails closed without raising" do
+    assert {:ok, envelope} = Envelope.new(valid_attributes(data_coding: 0))
+
+    for segment <- [%{}, %{bill_id: "bill-parent"}, :null, %{valid_segment() | index: 0}] do
+      assert Envelope.encode(%{envelope | segment: segment}) == {:error, :invalid_envelope}
+    end
+
+    colliding = %{envelope | segment: %{valid_segment() | bill_id: envelope.gateway_id}}
+    assert Envelope.encode(colliding) == {:error, :invalid_envelope}
+  end
+
   test "envelope transports UDHI with SAR bytes; SubmitSM encode owns sar_with_udhi" do
     optional = sar_optional()
     message = udh_short_message()
@@ -759,6 +949,92 @@ defmodule JasminEx.Messaging.EnvelopeTest do
   end
 
   defp json(value), do: value |> :json.encode() |> IO.iodata_to_binary()
+
+  defp canonical_digest, do: Base.encode64(:binary.copy(<<1>>, 32))
+
+  defp valid_segment do
+    %{
+      bill_id: "bill-parent",
+      index: 1,
+      count: 2,
+      fingerprint_version: 1,
+      fingerprint_digest_base64: canonical_digest()
+    }
+  end
+
+  defp valid_segment_wire do
+    %{
+      "bill_id" => "bill-parent",
+      "index" => 1,
+      "count" => 2,
+      "fingerprint_version" => 1,
+      "fingerprint_digest_base64" => canonical_digest()
+    }
+  end
+
+  defp v3_fixture(submit_overrides \\ %{}, envelope_overrides \\ %{}) do
+    submit =
+      %{
+        "source_addr" => "+12025550100",
+        "destination_addr" => "+12025550101",
+        "short_message_base64" => Base.encode64("hello")
+      }
+      |> Map.merge(submit_overrides)
+
+    %{
+      "version" => 3,
+      "gateway_id" => "gateway-1",
+      "connector_id" => "connector-a",
+      "attempt" => 1,
+      "max_attempts" => 3,
+      "enqueued_at" => "2026-08-01T15:00:00Z",
+      "expires_at" => "2026-08-02T15:00:00Z",
+      "segment" => valid_segment_wire(),
+      "submit_sm" => submit
+    }
+    |> Map.merge(envelope_overrides)
+    |> json()
+  end
+
+  defp v1_with_segment(segment) do
+    %{
+      "version" => 1,
+      "gateway_id" => "gateway-1",
+      "connector_id" => "connector-a",
+      "attempt" => 1,
+      "max_attempts" => 3,
+      "enqueued_at" => "2026-08-01T15:00:00Z",
+      "expires_at" => "2026-08-02T15:00:00Z",
+      "segment" => segment,
+      "submit_sm" => %{
+        "source_addr" => "+12025550100",
+        "destination_addr" => "+12025550101",
+        "short_message" => "hello"
+      }
+    }
+    |> json()
+  end
+
+  defp drop_wire_key(payload, key) do
+    payload
+    |> :json.decode()
+    |> Map.delete(key)
+    |> json()
+  end
+
+  defp legacy_v2_bytes do
+    ~s({"attempt":1,"connector_id":"connector-a","enqueued_at":"2026-08-01T15:00:00Z","expires_at":"2026-08-02T15:00:00Z","gateway_id":"gateway-1","max_attempts":3,"submit_sm":{"data_coding":0,"destination_addr":"+12025550101","registered_delivery":0,"short_message_base64":"aGVsbG8=","source_addr":"+12025550100"},"version":2})
+  end
+
+  defp old_accepted_versions, do: [1, 2]
+
+  defp old_decode(payload) do
+    case :json.decode(payload) do
+      %{"version" => version} when version in [1, 2] -> {:ok, :accepted}
+      %{"version" => _version} -> {:error, :unsupported_version}
+      _ -> {:error, :invalid_envelope}
+    end
+  end
 
   defp sar_optional do
     {:ok, bytes} =
