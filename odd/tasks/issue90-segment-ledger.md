@@ -30,11 +30,12 @@ Default applicable test-first policy; no verified global strict-TDD setting. Run
 - `mix test`
 - `mix dialyzer`
 Runtime harness: N/A; pure immutable state transitions and refund calculations, with no broker or HTTP activation. No known baseline check failures.
-RDD: globally on; candidate assessment pending. The previous billing review refusal and candidate decline do not consent to, approve, or disable this new candidate.
+RDD: globally on. Native assessment: medium, `review_due: true`, reason `slice_budget_reached`. Candidate consent and any reviewer result remain pending. The previous billing review refusal and candidate decline do not consent to, approve, or disable this new candidate.
 
 ## Progress
 T1 source implemented locally; no work-unit commit in this unit. Observed RED: `mix test test/jasmin_ex/billing/segment_ledger_test.exs` → 0/10 passed, `UndefinedFunctionError` `SegmentLedger.open/1` (module not available). Observed GREEN after implementation: 10/10 passed. Required checks: focused billing trio 41 passed; `mix format --check-formatted` exit 0; `mix credo --strict` 184 files, no issues; `mix test` 822 passed, 29 excluded (`:compatibility`, `:integration`); `mix dialyzer` 0 errors. Runtime harness N/A. First reviewed boundary remains the base commit above.
 Parent structurally read back the implementation and independently reran the exact required focused command: 41 passed. Local work-unit commit and native assessment follow; no account credit or durable settlement has been claimed.
+Work-unit commit: `f534dc8` (`feat(billing): track idempotent segment refund deltas`), 4 files and 535 additions. The accepted size exception preserves all tests. Native review is due for this independent unit against the recorded base.
 
 ## Next step
 Parent records the local work-unit commit and native assessment. Later integrate per-segment state and deltas atomically with durable reservations before HTTP dispatch; do not claim durable exactly-once behavior from this pure unit alone.
