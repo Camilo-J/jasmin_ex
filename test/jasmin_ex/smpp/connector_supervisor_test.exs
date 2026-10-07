@@ -43,6 +43,25 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
 
     assert worker_opts[:dlr_enabled] == false
     assert worker_opts[:dlr_outcome_ttl_ms] == SettlementJournal.outcome_retention_ms(86_400)
+    assert worker_opts[:router] == JasminEx.Routing.Router
+    assert is_function(worker_opts[:settle_segment], 4)
+  end
+
+  test "keeps an explicit Router pid on the worker and off the client" do
+    router = self()
+
+    opts =
+      connector_config(1111)
+      |> Keyword.put(:messaging, enabled_messaging())
+      |> Keyword.put(:router, router)
+
+    assert {:ok, {_flags, [_forwarder, client, worker]}} = Instance.init(opts)
+    assert {Instance, :start_client, [client_opts, "connector-1111"]} = client.start
+    refute Keyword.has_key?(client_opts, :router)
+    refute Keyword.has_key?(client_opts, :settle_segment)
+    assert {Instance, :start_worker, [worker_opts, "connector-1111"]} = worker.start
+    assert worker_opts[:router] == router
+    assert is_function(worker_opts[:settle_segment], 4)
   end
 
   test "passes connector dlr_expiry into worker outcome retention when DLR is enabled" do
@@ -174,6 +193,7 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
     worker_state = :sys.get_state(worker)
     assert {StateStoreRedix, %{connection: JasminEx.StateStore.Connection}} = worker_state.store
     assert is_function(worker_state.submit, 1) and is_function(worker_state.republish, 1)
+    assert is_function(worker_state.settle_segment, 4)
     Process.exit(worker, :kill)
 
     assert :ok =
