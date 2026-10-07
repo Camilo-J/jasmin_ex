@@ -119,11 +119,14 @@ defmodule JasminEx.Smpp.ConnectorSupervisor.Instance do
   alias JasminEx.Messaging.RabbitMQ.ConnectorWorker
   alias JasminEx.Messaging.RabbitMQ.WorkQueue
   alias JasminEx.Messaging.SettlementJournal
+  alias JasminEx.Routing
   alias JasminEx.Smpp.Client
   alias JasminEx.Smpp.Client.Config
   alias JasminEx.Smpp.ConnectorSupervisor.LifecycleForwarder
   alias JasminEx.StateStore.Config, as: StateStoreConfig
   alias JasminEx.StateStore.Redix, as: StateStoreRedix
+
+  @default_router Routing.Router
 
   @spec start_link(keyword()) :: Supervisor.on_start()
   def start_link(opts), do: Supervisor.start_link(__MODULE__, opts)
@@ -134,6 +137,7 @@ defmodule JasminEx.Smpp.ConnectorSupervisor.Instance do
 
   def start_worker(opts, id) do
     supervisor = self()
+    {router, opts} = Keyword.pop(opts, :router, @default_router)
 
     dependencies = [
       store: state_store(),
@@ -143,7 +147,8 @@ defmodule JasminEx.Smpp.ConnectorSupervisor.Instance do
           struct(JasminEx.Smpp.PDU.Body.SubmitSM, envelope.submit_sm)
         )
       end,
-      republish: &WorkQueue.republish/1
+      republish: &WorkQueue.republish/1,
+      settle_segment: settle_segment_fun(router)
     ]
 
     case ConnectorWorker.start_link(Keyword.merge(opts, dependencies)) do
@@ -165,11 +170,12 @@ defmodule JasminEx.Smpp.ConnectorSupervisor.Instance do
 
   @impl true
   def init(opts) do
+    {router, opts} = Keyword.pop(opts, :router, @default_router)
     {messaging, client_opts} = Keyword.pop(opts, :messaging, messaging_config())
 
     Supervisor.init(
       forwarder_children(messaging, client_opts) ++
-        [client_child(client_opts, messaging) | worker_children(messaging, client_opts)],
+        [client_child(client_opts, messaging) | worker_children(messaging, client_opts, router)],
       strategy: :one_for_one,
       max_restarts: 3,
       max_seconds: 5
@@ -211,17 +217,17 @@ defmodule JasminEx.Smpp.ConnectorSupervisor.Instance do
     }
   end
 
-  defp worker_children(messaging, opts) when is_list(messaging) do
+  defp worker_children(messaging, opts, router) when is_list(messaging) do
     if Keyword.get(messaging, :enabled, false) do
-      [worker_child(messaging, opts)]
+      [worker_child(messaging, opts, router)]
     else
       []
     end
   end
 
-  defp worker_children(_messaging, _opts), do: []
+  defp worker_children(_messaging, _opts, _router), do: []
 
-  defp worker_child(messaging, opts) when is_list(messaging) do
+  defp worker_child(messaging, opts, router) when is_list(messaging) do
     client_config = Config.new!(opts)
     connector_id = client_config.connector_id
 
@@ -243,7 +249,9 @@ defmodule JasminEx.Smpp.ConnectorSupervisor.Instance do
                  opts,
                  :dlr_known_publisher,
                  Keyword.get(opts, :dlr_publisher, Keyword.get(messaging, :dlr_publisher))
-               )
+               ),
+             router: router,
+             settle_segment: settle_segment_fun(router)
            ],
            connector_id
          ]},
@@ -251,6 +259,12 @@ defmodule JasminEx.Smpp.ConnectorSupervisor.Instance do
       type: :worker,
       modules: [ConnectorWorker]
     }
+  end
+
+  defp settle_segment_fun(router) do
+    fn bill_id, fingerprint, index, outcome ->
+      Routing.settle_segment(router, bill_id, fingerprint, index, outcome)
+    end
   end
 
   defp messaging_config, do: Application.get_env(:jasmin_ex, :messaging, [])

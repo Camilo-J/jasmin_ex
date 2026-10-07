@@ -1,9 +1,16 @@
 defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
   use ExUnit.Case, async: true
 
+  alias JasminEx.Billing.Admission
+  alias JasminEx.Billing.Bill
   alias JasminEx.Billing.Fingerprint
   alias JasminEx.Messaging.{Envelope, SettlementJournal, StateStoreJournal}
   alias JasminEx.Messaging.RabbitMQ.{Config, Connection, ConnectorWorker}
+  alias JasminEx.Routing
+  alias JasminEx.Routing.Config, as: RoutingConfig
+  alias JasminEx.Routing.ConnectorRef
+  alias JasminEx.Routing.Router
+  alias JasminEx.Smpp.ConnectorSupervisor.Instance
   alias JasminEx.Smpp.PDU.Tlv
 
   @future "2099-01-01T00:00:00Z"
@@ -27,6 +34,26 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     def put(a, _k, _v, _t) when is_pid(a), do: Agent.get_and_update(a, &List.pop_at(&1, 0))
     def put(_table, _key, _value, _ttl_ms), do: {:error, :unavailable}
     def fetch(_table, _key), do: :missing
+  end
+
+  defmodule ProductionSnapshotOps do
+    @moduledoc false
+
+    alias JasminEx.Routing.FileOps
+
+    def fail_dir!(dir), do: :persistent_term.put({__MODULE__, dir}, true)
+    def clear_dir!(dir), do: :persistent_term.erase({__MODULE__, dir})
+    def mkdir_p(path), do: FileOps.mkdir_p(path)
+    def chmod(path, mode), do: FileOps.chmod(path, mode)
+    def read(path), do: FileOps.read(path)
+    def fsync(path), do: FileOps.fsync(path)
+    def rename(from, to), do: FileOps.rename(from, to)
+
+    def write(path, data) do
+      if :persistent_term.get({__MODULE__, Path.dirname(path)}, false),
+        do: {:error, :eio},
+        else: FileOps.write(path, data)
+    end
   end
 
   defmodule ScriptedJournalStore do
@@ -1922,6 +1949,182 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     end
   end
 
+  describe "production Router settlement" do
+    @describetag :tmp_dir
+
+    test "injected production callback retains, refunds once, and holds uncertain", %{
+      tmp_dir: tmp_dir,
+      config: config
+    } do
+      for {result, outcome, balance, quota, decision} <- [
+            {{:ok, "smsc-ok"}, :accepted, 300, 3, {:ack, 1, 1}},
+            {{:error, {:submit_rejected, :ESME_RINVDESTADR}}, :rejected, 400, 4,
+             {:reject, 1, 1, [requeue: false]}},
+            {{:unknown, :response_timeout}, :uncertain, 300, 3, {:ack, 1, 1}}
+          ] do
+        {router, _routing} = start_production_router(tmp_dir, file: "routing-#{outcome}.json")
+        {admission, reservation, segment} = admit_segments(router, "bill-#{outcome}")
+        settle = production_settle_segment(router)
+        {store, _} = journal_store()
+        submits = Agent.start_link(fn -> 0 end) |> elem(1)
+        gateway_id = "gw-prod-#{outcome}"
+
+        {worker, agent} =
+          start_bound(config, "alpha", fn agent ->
+            [
+              store: store,
+              submit: fn _ ->
+                Agent.update(submits, &(&1 + 1))
+                result
+              end,
+              settle_segment: settle,
+              republish: republish_ok(agent)
+            ]
+          end)
+
+        {_envelope, payload} =
+          valid_payload(%{
+            gateway_id: gateway_id,
+            expires_at: @future,
+            segment: segment
+          })
+
+        assert :ok = Fake.deliver(agent, payload)
+        assert ConnectorWorker.inflight(worker) == nil
+        assert Agent.get(submits, & &1) == 1
+        assert decision in Fake.events(agent)
+        snap = Routing.snapshot(router)
+        assert snap.users["u1"].balance_minor == balance
+        assert snap.users["u1"].submit_quota == quota
+        assert snap.reservations[admission.bill.bill_id].ledger.outcomes[1] == outcome
+        assert reservation.fingerprint.digest != :binary.copy(<<7>>, 32)
+        stop(worker, agent)
+      end
+    end
+
+    test "snapshot failure withholds ACK then recovery settles without another send", %{
+      tmp_dir: tmp_dir,
+      config: config
+    } do
+      for {result, outcome, balance, quota, decision} <- [
+            {{:ok, "smsc-ok"}, :accepted, 300, 3, {:ack, 1, 1}},
+            {{:error, {:submit_rejected, :ESME_RINVDESTADR}}, :rejected, 400, 4,
+             {:reject, 1, 1, [requeue: false]}}
+          ] do
+        {router, routing} =
+          start_production_router(tmp_dir,
+            file: "routing-fail-#{outcome}.json",
+            file_ops: ProductionSnapshotOps
+          )
+
+        {_admission, _reservation, segment} = admit_segments(router, "bill-fail-#{outcome}")
+        before = Routing.snapshot(router)
+        settle = production_settle_segment(router)
+        {store, _} = journal_store()
+        submits = Agent.start_link(fn -> 0 end) |> elem(1)
+        gateway_id = "gw-fail-#{outcome}"
+        dir = Path.dirname(routing.snapshot_path)
+        ProductionSnapshotOps.fail_dir!(dir)
+        on_exit(fn -> ProductionSnapshotOps.clear_dir!(dir) end)
+
+        extra = fn agent ->
+          [
+            store: store,
+            submit: fn _ ->
+              Agent.update(submits, &(&1 + 1))
+              result
+            end,
+            settle_segment: settle,
+            republish: republish_ok(agent)
+          ]
+        end
+
+        {worker, agent} = start_bound(config, "alpha", extra)
+
+        {_envelope, payload} =
+          valid_payload(%{
+            gateway_id: gateway_id,
+            expires_at: @future,
+            segment: segment
+          })
+
+        assert :ok = Fake.deliver(agent, payload)
+        _ = ConnectorWorker.inflight(worker)
+        assert Agent.get(submits, & &1) == 1
+        events = Fake.events(agent)
+        refute Enum.any?(events, &match?({:ack, _, _}, &1))
+        refute Enum.any?(events, &match?({:reject, _, _, _}, &1))
+        assert {:ok, record} = StateStoreJournal.read(store, gateway_id, 1)
+        assert {:ok, _known} = SettlementJournal.known_response(record)
+
+        assert Routing.snapshot(router).users["u1"].balance_minor ==
+                 before.users["u1"].balance_minor
+
+        assert Routing.snapshot(router).users["u1"].submit_quota ==
+                 before.users["u1"].submit_quota
+
+        stop(worker, agent)
+
+        ProductionSnapshotOps.clear_dir!(dir)
+        {worker2, agent2} = start_bound(config, "alpha", extra)
+        assert :ok = Fake.deliver(agent2, payload)
+        assert ConnectorWorker.inflight(worker2) == nil
+        assert Agent.get(submits, & &1) == 1
+        assert decision in Fake.events(agent2)
+        snap = Routing.snapshot(router)
+        assert snap.users["u1"].balance_minor == balance
+        assert snap.users["u1"].submit_quota == quota
+        assert snap.reservations["bill-fail-#{outcome}"].ledger.outcomes[1] == outcome
+        stop(worker2, agent2)
+
+        {worker3, agent3} = start_bound(config, "alpha", extra)
+        assert :ok = Fake.deliver(agent3, payload)
+        assert ConnectorWorker.inflight(worker3) == nil
+        assert Agent.get(submits, & &1) == 1
+        assert decision in Fake.events(agent3)
+        again = Routing.snapshot(router)
+        assert again.users["u1"].balance_minor == balance
+        assert again.users["u1"].submit_quota == quota
+        stop(worker3, agent3)
+      end
+    end
+
+    test "legacy v2 never calls production settlement", %{tmp_dir: tmp_dir, config: config} do
+      {router, _routing} = start_production_router(tmp_dir, file: "routing-v2.json")
+      {_admission, _reservation, _segment} = admit_segments(router, "bill-legacy")
+      before = Routing.snapshot(router)
+      settle = production_settle_segment(router)
+      {store, _} = journal_store()
+      submits = Agent.start_link(fn -> 0 end) |> elem(1)
+
+      {worker, agent} =
+        start_bound(config, "alpha", fn agent ->
+          [
+            store: store,
+            submit: fn _ ->
+              Agent.update(submits, &(&1 + 1))
+              {:ok, "smsc-ok"}
+            end,
+            settle_segment: settle,
+            republish: republish_ok(agent)
+          ]
+        end)
+
+      {_envelope, payload} = valid_payload(%{gateway_id: "gw-v2-prod", expires_at: @future})
+      assert :ok = Fake.deliver(agent, payload)
+      assert ConnectorWorker.inflight(worker) == nil
+      assert Agent.get(submits, & &1) == 1
+      assert {:ack, 1, 1} in Fake.events(agent)
+
+      assert Routing.snapshot(router).users["u1"].balance_minor ==
+               before.users["u1"].balance_minor
+
+      assert Routing.snapshot(router).users["u1"].submit_quota == before.users["u1"].submit_quota
+      assert Routing.snapshot(router).reservations["bill-legacy"].ledger.outcomes == %{}
+      stop(worker, agent)
+    end
+  end
+
   defp dlr_publisher(agent, result) do
     fn routing_key, payload ->
       Fake.record(agent, {:dlr_publish, routing_key, payload})
@@ -2100,5 +2303,107 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
   defp stop(worker, agent) do
     if Process.alive?(worker), do: GenServer.stop(worker)
     Agent.stop(agent)
+  end
+
+  defp production_settle_segment(router) do
+    opts =
+      production_connector_config(1111)
+      |> Keyword.put(:messaging, production_messaging())
+      |> Keyword.put(:router, router)
+
+    assert {:ok, {_flags, [_forwarder, _client, worker]}} = Instance.init(opts)
+    assert {Instance, :start_worker, [worker_opts, "connector-1111"]} = worker.start
+    settle = worker_opts[:settle_segment]
+    assert is_function(settle, 4)
+    settle
+  end
+
+  defp start_production_router(tmp_dir, opts) do
+    config =
+      RoutingConfig.new(
+        snapshot_path: Path.join(tmp_dir, Keyword.get(opts, :file, "routing-v1.json")),
+        file_ops: Keyword.get(opts, :file_ops)
+      )
+
+    router = start_supervised!({Router, name: nil, config: config}, id: make_ref())
+    {:ok, group} = Routing.put_group(router, gid: "ops")
+
+    {:ok, _} =
+      Routing.put_user(router,
+        uid: "u1",
+        username: "alice",
+        secret: "s3cret",
+        group: group,
+        balance_minor: 500,
+        submit_quota: 5
+      )
+
+    {:ok, connector} = ConnectorRef.new("smpp-t")
+
+    {:ok, _} =
+      Routing.put_route(router,
+        kind: :static,
+        order: 10,
+        connector: connector,
+        filters: [],
+        rate_minor: 100,
+        precharge_percent: 10
+      )
+
+    {router, config}
+  end
+
+  defp admit_segments(router, bill_id) do
+    {:ok, bill} =
+      Bill.new(
+        bill_id: bill_id,
+        uid: "u1",
+        route_order: 10,
+        rate_minor: 100,
+        precharge_percent: 10,
+        segment_count: 2
+      )
+
+    {:ok, admission} = Admission.new(bill: bill, ttl_ms: 86_400_000)
+    assert {:ok, reservation} = Routing.admit_segments(router, admission)
+    fingerprint = reservation.fingerprint
+    refute fingerprint.digest == :binary.copy(<<7>>, 32)
+
+    segment = %{
+      bill_id: bill_id,
+      index: 1,
+      count: 2,
+      fingerprint_version: 1,
+      fingerprint_digest_base64: Base.encode64(fingerprint.digest)
+    }
+
+    {admission, reservation, segment}
+  end
+
+  defp production_messaging do
+    [
+      enabled: true,
+      host: "broker.example",
+      username: "app",
+      password: "secret",
+      queue_prefix: "jasmin.work"
+    ]
+  end
+
+  defp production_connector_config(port) do
+    [
+      connector_id: "connector-#{port}",
+      host: ~c"localhost",
+      port: port,
+      system_id: "user",
+      password: "pw",
+      system_type: "type",
+      bind_as: :transmitter,
+      heartbeat_ms: 10_000,
+      response_timeout_ms: 100,
+      reconnect_base_ms: 5,
+      reconnect_cap_ms: 5,
+      reconnect_jitter: false
+    ]
   end
 end
