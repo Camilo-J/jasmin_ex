@@ -22,12 +22,13 @@ Identity precedes settlement, compensation and activation. Unique child gateway 
   - Route: delegated direct; trigger: hunk staging and intermediate-state verification while preserving the full implementation.
   - Stage only `persist_known_response/3` and its use from `checkpoint_and_publish/5`; no segment settlement or new behavior. Existing worker checkpoint tests prove the refactor.
   - Ordinary-verified commit `00d8b94`, 9 insertions / 3 deletions. Parent focused 35 passed; auxiliary full suite 864 passed, 29 excluded; format, Credo and Dialyzer passed. Native candidate omission confirmed (`declined_this_candidate`), not an approval.
-- [ ] T2A2 Settle optional segment outcomes after durable journal evidence; replay settlement without another SMPP send.
+- [x] T2A2 Settle optional segment outcomes after durable journal evidence; replay settlement without another SMPP send.
   - Route: delegated direct; triggers: worker lifecycle mapping and non-trivial implementation/tests.
   - Allowed source: connector worker, its existing tests, one settlement paragraph in HTTP long-message docs.
   - Inject the settlement dependency; missing dependency fails closed. Keep production segment publication inactive until dependency wiring is proven.
   - Prove known-response persistence before settlement, settlement failure replay without resubmit, transient retries without refund, exhausted definitive nonacceptance refund, and uncertain holds.
   - User selected two deliveries and explicitly accepted a size exception only for this second delivery (about 790 authored lines). Keep all settlement outcomes with their tests; no temporary partial-settlement behavior or omitted tests. Publication and merge remain separate decisions.
+  - Ordinary-verified commit `e1f9ad2`, 815 authored lines including tracking. Parent and independent verifier confirmed 48 worker tests; full suite 877 passed, 29 excluded; format, Credo and Dialyzer passed. Native candidate omission confirmed, not an approval. No publication performed.
 - [ ] T2B Wire production segment settlement and prove the Router integration before HTTP activation.
   - Route: delegated direct; triggers: dependency wiring and integration tests. Exact surfaces to derive before launch.
 - [ ] T2C Implement bounded delayed safe retries with the existing attempt budget.
@@ -47,7 +48,7 @@ Each unit: `mix format --check-formatted`, `mix credo --strict`, `mix test`, `mi
 RDD is on (global), read-only status confirmed. Each candidate needs its own native assessment/consent; prior omissions do not apply. Native approval is not publication authorization.
 
 ## Progress and next step
-T1A and T1B are ordinary-verified and merged upstream in PR110/111. T2A1 checkpoint extraction is committed as `00d8b94`; T2A2 settlement is staged only (not committed). Native review was omitted, not approved; last native-reviewed boundary remains `f89b74a`. T2B production wiring and T2C delayed retry remain required follow-ups. T3–T5 are untouched. HTTP multipart remains inactive. Full mirror is parent-owned.
+T1A and T1B are ordinary-verified and merged upstream in PR110/111. T2A1 checkpoint extraction is committed as `00d8b94`; T2A2 settlement is committed as `e1f9ad2`. Both new deliveries are local only. Native review was omitted, not approved; last native-reviewed boundary remains `f89b74a`. T2B production wiring and T2C delayed retry remain required follow-ups. T3–T5 are untouched. HTTP multipart remains inactive. Full mirror is parent-owned.
 
 Full T1 observed (kept as the complete T1 evidence, not an intermediate proof):
 - RED: focused three-file command → 79/96 passed, 17 failed (seed 241261).
@@ -58,7 +59,7 @@ T1B historical staged proof before commit/publication:
 - Staged retry transport plus tracking; expected about 313 plus tracking, actual code 323 authored (under 400, not golfed). No extra size exception.
 - HEAD+staged focused 96 passed (seed 12265); format passed; Credo no issues; full suite 864 passed, 29 excluded; Dialyzer 0 errors.
 
-T2A observed (checkbox pending parent commit/review choice; HTTP multipart still inactive):
+T2A observed functional proof (both deliveries committed; HTTP multipart still inactive):
 - RED: `mix test test/jasmin_ex/messaging/rabbit_mq/connector_worker_test.exs` → 36/48 passed, 12 failed (seed 215969).
 - GREEN: same command → 48 passed in 0.9s (seed 777198).
 - Final after allowed-source format/credo normalization: focused 48 passed in 0.8s (seed 706420); `mix format --check-formatted` passed; `mix credo --strict` no issues; full suite 877 passed, 29 excluded (`:compatibility`, `:integration`); Dialyzer 0 errors.
@@ -72,7 +73,7 @@ T2A1 historical first proof (committed `00d8b94`; native omitted `declined_this_
 - `mix format --check-formatted` passed; `mix credo --strict` no issues; full suite 864 passed, 29 excluded (`:compatibility`, `:integration`); Dialyzer 0 errors.
 - Message: `refactor(messaging): extract durable response checkpoint`. T2A2 size exception remains explicit for the second delivery.
 
-T2A2 staged (checkbox pending parent commit/native choice; not committed):
+T2A2 historical staged proof (committed `e1f9ad2`; native omitted, not approved):
 - Four paths only: connector worker, its tests, HTTP long-message docs, this task doc. Production Router wiring is inactive; HTTP multipart is inactive.
 - HEAD+staged focused `mix test test/jasmin_ex/messaging/rabbit_mq/connector_worker_test.exs` → 48 passed in 0.9s (seed 370529).
 - `mix format --check-formatted` passed; `mix credo --strict` no issues; full suite 877 passed, 29 excluded (`:compatibility`, `:integration`); Dialyzer 0 errors.
