@@ -13,6 +13,10 @@ defmodule JasminEx.Messaging.RabbitMQ.Publisher do
       when is_binary(connector_id) and is_binary(payload),
       do: GenServer.call(server, {:publish, connector_id, payload})
 
+  def publish_retry(server \\ __MODULE__, connector_id, payload)
+      when is_binary(connector_id) and is_binary(payload),
+      do: GenServer.call(server, {:publish_retry, connector_id, payload})
+
   def reservation_action({:ambiguous, _reason}), do: :leave_open
   def reservation_action({:error, :non_ok}), do: :settle_non_ok
 
@@ -31,14 +35,11 @@ defmodule JasminEx.Messaging.RabbitMQ.Publisher do
 
   @impl true
   def handle_call({:publish, connector_id, payload}, _from, state) do
-    state = ensure(state)
+    publish_call(state, connector_id, payload, :work)
+  end
 
-    if state.channel do
-      {reply, state} = publish_once(state, connector_id, payload)
-      {:reply, reply, state}
-    else
-      {:reply, {:error, :channel_closed}, state}
-    end
+  def handle_call({:publish_retry, connector_id, payload}, _from, state) do
+    publish_call(state, connector_id, payload, :retry)
   end
 
   @impl true
@@ -50,12 +51,24 @@ defmodule JasminEx.Messaging.RabbitMQ.Publisher do
   @impl true
   def terminate(_, state), do: close(state)
 
-  defp publish_once(state, connector_id, payload) do
-    queue = state.config.queue_prefix <> "." <> connector_id
+  defp publish_call(state, connector_id, payload, role) do
+    state = ensure(state)
+
+    if state.channel do
+      {reply, state} = publish_once(state, connector_id, payload, role)
+      {:reply, reply, state}
+    else
+      {:reply, {:error, :channel_closed}, state}
+    end
+  end
+
+  defp publish_once(state, connector_id, payload, role) do
+    prefix = state.config.queue_prefix
+    {queue, declare_opts} = queue_target(prefix, connector_id, role)
     ch = state.channel
     client = state.client
 
-    with {:ok, _} <- client.declare_queue(ch, queue, Client.queue_declare_opts()),
+    with {:ok, _} <- client.declare_queue(ch, queue, declare_opts),
          :ok <- client.publish(ch, "", queue, payload, persistent: true) do
       started = System.monotonic_time(:millisecond)
       confirm = client.wait_for_confirms(ch, state.config.confirm_timeout_ms)
@@ -116,6 +129,16 @@ defmodule JasminEx.Messaging.RabbitMQ.Publisher do
     if is_reference(mon), do: Process.demonitor(mon, [:flush])
     _ = client.close_channel(ch)
     :ok
+  end
+
+  defp queue_target(prefix, connector_id, :work) do
+    {Client.work_queue_name(prefix, connector_id), Client.queue_declare_opts()}
+  end
+
+  defp queue_target(prefix, connector_id, :retry) do
+    work_queue = Client.work_queue_name(prefix, connector_id)
+    wait_queue = Client.retry_wait_queue_name(prefix, connector_id)
+    {wait_queue, Client.wait_queue_declare_opts(work_queue)}
   end
 
   defp name_opts(nil), do: []

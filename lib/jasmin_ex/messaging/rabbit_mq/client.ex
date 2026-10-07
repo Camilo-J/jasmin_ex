@@ -22,8 +22,37 @@ defmodule JasminEx.Messaging.RabbitMQ.Client do
   def select_confirms(%{channel: ch}), do: AMQP.Confirm.select(ch)
 
   @classic_queue_arguments [{"x-queue-type", :longstr, "classic"}]
+  @wait_queue_ttl_ms 5_000
 
   def queue_declare_opts, do: [durable: true, arguments: @classic_queue_arguments]
+
+  def wait_queue_ttl_ms, do: @wait_queue_ttl_ms
+
+  def work_queue_name(prefix, connector_id)
+      when is_binary(prefix) and is_binary(connector_id) and prefix != "" and connector_id != "" do
+    prefix <> "." <> connector_id
+  end
+
+  def retry_wait_queue_name(prefix, connector_id)
+      when is_binary(prefix) and is_binary(connector_id) and prefix != "" and
+             connector_id != "" do
+    prefix <> "-retry." <> connector_id <> ".wait"
+  end
+
+  def wait_queue_declare_opts(work_queue_name)
+      when is_binary(work_queue_name) and work_queue_name != "" do
+    [
+      durable: true,
+      arguments: [
+        {"x-queue-type", :longstr, "quorum"},
+        {"x-overflow", :longstr, "reject-publish"},
+        {"x-dead-letter-exchange", :longstr, ""},
+        {"x-dead-letter-routing-key", :longstr, work_queue_name},
+        {"x-dead-letter-strategy", :longstr, "at-least-once"},
+        {"x-message-ttl", :long, @wait_queue_ttl_ms}
+      ]
+    ]
+  end
 
   def declare_queue(%{channel: ch}, name, opts), do: AMQP.Queue.declare(ch, name, opts)
 

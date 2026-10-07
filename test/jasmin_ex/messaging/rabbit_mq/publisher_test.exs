@@ -2,7 +2,7 @@ defmodule JasminEx.Messaging.RabbitMQ.PublisherTest do
   use ExUnit.Case, async: true
 
   alias JasminEx.Billing.{Admission, Bill, Reservation}
-  alias JasminEx.Messaging.RabbitMQ.{Config, Publisher}
+  alias JasminEx.Messaging.RabbitMQ.{Client, Config, Publisher}
   alias JasminEx.Routing
   alias JasminEx.Routing.Config, as: RoutingConfig
   alias JasminEx.Routing.ConnectorRef
@@ -26,7 +26,7 @@ defmodule JasminEx.Messaging.RabbitMQ.PublisherTest do
 
     def declare_queue(%{agent: agent}, name, opts) do
       track(agent, {:declare_queue, name, opts})
-      {:ok, %{queue: name}}
+      script(agent, :declare_queue, {:ok, %{queue: name}})
     end
 
     def publish(%{agent: agent}, exchange, key, payload, opts) do
@@ -194,6 +194,165 @@ defmodule JasminEx.Messaging.RabbitMQ.PublisherTest do
     stop(pub, agent)
   end
 
+  test "wait publication declares a durable quorum delay queue to the work queue", %{
+    config: config
+  } do
+    agent = Fake.start(%{wait_for_confirms: true})
+    {:ok, pub} = start(config, agent)
+    assert :ok = Publisher.publish_retry(pub, "connector-a", "payload-wait")
+
+    events = Fake.events(agent)
+
+    assert {:declare_queue, "jasmin.work-retry.connector-a.wait", opts} =
+             find(events, :declare_queue)
+
+    assert_wait_queue(opts, "jasmin.work.connector-a")
+
+    assert {:publish, "", "jasmin.work-retry.connector-a.wait", "payload-wait", popts} =
+             find(events, :publish)
+
+    assert popts[:persistent] == true
+    assert find(events, :select_confirms)
+    assert {:wait_for_confirms, 50} = find(events, :wait_for_confirms)
+    stop(pub, agent)
+  end
+
+  test "wait publication uses the configured prefix for queue name and dead-letter key" do
+    config =
+      Config.new!(
+        host: "b",
+        username: "u",
+        password: "p",
+        queue_prefix: "custom.mt",
+        confirm_timeout_ms: 50
+      )
+
+    agent = Fake.start(%{wait_for_confirms: true})
+    {:ok, pub} = start(config, agent)
+    assert :ok = Publisher.publish_retry(pub, "alpha", "payload-wait")
+
+    events = Fake.events(agent)
+    assert {:declare_queue, "custom.mt-retry.alpha.wait", opts} = find(events, :declare_queue)
+    assert_wait_queue(opts, "custom.mt.alpha")
+
+    assert {:publish, "", "custom.mt-retry.alpha.wait", "payload-wait", popts} =
+             find(events, :publish)
+
+    assert popts[:persistent] == true
+    stop(pub, agent)
+  end
+
+  test "wait declaration failure does not publish or report success", %{config: config} do
+    agent = Fake.start(%{declare_queue: {:error, :incompatible_queue_arguments}})
+    {:ok, pub} = start(config, agent)
+
+    assert {:error, :incompatible_queue_arguments} =
+             Publisher.publish_retry(pub, "connector-a", "payload-wait")
+
+    events = Fake.events(agent)
+
+    assert {:declare_queue, "jasmin.work-retry.connector-a.wait", opts} =
+             find(events, :declare_queue)
+
+    assert_wait_queue(opts, "jasmin.work.connector-a")
+    refute Enum.any?(events, &match?({:publish, _, _, _, _}, &1))
+    refute Enum.any?(events, &match?({:wait_for_confirms, _}, &1))
+    stop(pub, agent)
+  end
+
+  test "ordinary publish of ids ending in .wait stays classic", %{config: config} do
+    agent = Fake.start(%{wait_for_confirms: true})
+    {:ok, pub} = start(config, agent)
+    assert :ok = Publisher.publish(pub, "foo.wait", "payload")
+
+    events = Fake.events(agent)
+    assert {:declare_queue, "jasmin.work.foo.wait", opts} = find(events, :declare_queue)
+    assert_classic_queue(opts)
+    assert {:publish, "", "jasmin.work.foo.wait", "payload", popts} = find(events, :publish)
+    assert popts[:persistent] == true
+
+    refute Enum.any?(events, fn
+             {:declare_queue, "jasmin.work-retry." <> _, _} -> true
+             _ -> false
+           end)
+
+    stop(pub, agent)
+  end
+
+  test "ordinary publish of retry.foo and foo.quarantine stays classic", %{config: config} do
+    for connector_id <- ["retry.foo", "foo.quarantine"] do
+      agent = Fake.start(%{wait_for_confirms: true})
+      {:ok, pub} = start(config, agent)
+      assert :ok = Publisher.publish(pub, connector_id, "payload")
+      events = Fake.events(agent)
+
+      assert {:declare_queue, "jasmin.work." <> ^connector_id, opts} =
+               find(events, :declare_queue)
+
+      assert_classic_queue(opts)
+      stop(pub, agent)
+    end
+  end
+
+  test "explicit retry publication uses a non-overlapping work-retry namespace", %{
+    config: config
+  } do
+    agent = Fake.start(%{wait_for_confirms: true})
+    {:ok, pub} = start(config, agent)
+    assert :ok = Publisher.publish_retry(pub, "foo", "payload-wait")
+
+    events = Fake.events(agent)
+    assert {:declare_queue, "jasmin.work-retry.foo.wait", opts} = find(events, :declare_queue)
+    assert_wait_queue(opts, "jasmin.work.foo")
+
+    assert {:publish, "", "jasmin.work-retry.foo.wait", "payload-wait", popts} =
+             find(events, :publish)
+
+    assert popts[:persistent] == true
+
+    refute Enum.any?(events, fn
+             {:declare_queue, "jasmin.work.foo.wait", _} -> true
+             _ -> false
+           end)
+
+    stop(pub, agent)
+  end
+
+  test "retry of a .wait connector id does not collide with that connector work queue", %{
+    config: config
+  } do
+    agent = Fake.start(%{wait_for_confirms: true})
+    {:ok, pub} = start(config, agent)
+    assert :ok = Publisher.publish_retry(pub, "foo.wait", "payload-wait")
+
+    events = Fake.events(agent)
+
+    assert {:declare_queue, "jasmin.work-retry.foo.wait.wait", opts} =
+             find(events, :declare_queue)
+
+    assert_wait_queue(opts, "jasmin.work.foo.wait")
+
+    refute Enum.any?(events, fn
+             {:declare_queue, "jasmin.work.foo.wait", _} -> true
+             _ -> false
+           end)
+
+    stop(pub, agent)
+  end
+
+  test "wait nack, timeout, and channel loss never report success", %{config: config} do
+    for {script, expected} <- [
+          {%{wait_for_confirms: false}, {:error, :non_ok}},
+          {%{wait_for_confirms: :timeout}, {:ambiguous, :timeout}},
+          {%{wait_for_confirms: :channel_down}, {:ambiguous, :channel_closed}}
+        ] do
+      agent = Fake.start(script)
+      {:ok, pub} = start(config, agent)
+      assert ^expected = Publisher.publish_retry(pub, "connector-a", "payload-wait")
+      stop(pub, agent)
+    end
+  end
+
   defp assert_reservation_left_open(router, reservation, result) do
     assert Publisher.reservation_action(result) == :leave_open
     snapshot = Routing.snapshot(router)
@@ -256,6 +415,18 @@ defmodule JasminEx.Messaging.RabbitMQ.PublisherTest do
   defp assert_classic_queue(opts) do
     assert opts[:durable] == true
     assert {"x-queue-type", :longstr, "classic"} in Keyword.get(opts, :arguments, [])
+  end
+
+  defp assert_wait_queue(opts, work_queue) do
+    assert opts[:durable] == true
+    args = Keyword.get(opts, :arguments, [])
+    assert {"x-queue-type", :longstr, "quorum"} in args
+    assert {"x-overflow", :longstr, "reject-publish"} in args
+    assert {"x-dead-letter-exchange", :longstr, ""} in args
+    assert {"x-dead-letter-routing-key", :longstr, work_queue} in args
+    assert {"x-dead-letter-strategy", :longstr, "at-least-once"} in args
+    assert {"x-message-ttl", :long, Client.wait_queue_ttl_ms()} in args
+    refute {"x-queue-type", :longstr, "classic"} in args
   end
 
   defp find(events, kind),

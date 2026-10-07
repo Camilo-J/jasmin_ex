@@ -243,6 +243,92 @@ defmodule JasminEx.Messaging.RabbitMQ.E2ETest do
     stop_stack(stack)
   end
 
+  @tag :retry_quarantine
+  test "wait queue keeps work empty until the fixed TTL then forwards the same attempt", %{
+    harness: harness,
+    config: config
+  } do
+    connector_id = unique("wait-ttl")
+    work = Client.work_queue_name("jasmin.work", connector_id)
+    wait = Client.retry_wait_queue_name("jasmin.work", connector_id)
+    {_envelope, payload} = valid_payload(connector_id, "gw-wait", %{attempt: 2})
+    stack = start_amqp(harness, config)
+
+    {:ok, conn} = Client.open_connection(Config.to_connection_options(config))
+    {:ok, ch} = Client.open_channel(conn)
+    assert {:ok, _} = Client.declare_queue(ch, work, Client.queue_declare_opts())
+    assert :ok = Publisher.publish_retry(stack.publisher, connector_id, payload)
+
+    assert {:ok, wait_info} = Client.declare_queue(ch, wait, Client.wait_queue_declare_opts(work))
+    assert wait_info.message_count == 1
+    assert {:ok, before_work} = Client.declare_queue(ch, work, Client.queue_declare_opts())
+    assert before_work.message_count == 0
+
+    assert {:error, _} = classic_redeclare_wait(config, wait)
+
+    assert :ok =
+             wait_until(
+               fn ->
+                 match?(
+                   {:ok, %{message_count: count}} when count >= 1,
+                   Client.declare_queue(ch, work, Client.queue_declare_opts())
+                 )
+               end,
+               Client.wait_queue_ttl_ms() + 5_000
+             )
+
+    assert {:basic_deliver, delivered, _} = consume_one(ch, work)
+    assert {:ok, retried} = Envelope.decode(delivered)
+    assert retried.attempt == 2
+    assert retried.gateway_id == "gw-wait"
+    assert retried.connector_id == connector_id
+    _ = Client.close_connection(conn)
+    stop_amqp(stack)
+  end
+
+  defp start_amqp(_harness, config) do
+    {:ok, connection} = Connection.start_link(config: config, name: nil)
+
+    {:ok, publisher} =
+      Publisher.start_link(config: config, connection_server: connection, name: nil)
+
+    %{config: config, connection: connection, publisher: publisher}
+  end
+
+  defp stop_amqp(stack), do: Enum.each([stack.publisher, stack.connection], &stop_pid/1)
+
+  defp classic_redeclare_wait(config, wait),
+    do: declare_once(config, wait, Client.queue_declare_opts())
+
+  defp declare_once(config, name, opts) do
+    {:ok, conn} = Client.open_connection(Config.to_connection_options(config))
+    {:ok, ch} = Client.open_channel(conn)
+
+    result =
+      try do
+        Client.declare_queue(ch, name, opts)
+      catch
+        :exit, reason -> {:error, reason}
+      end
+
+    _ = Client.close_connection(conn)
+    result
+  end
+
+  defp consume_one(ch, name) do
+    collector = start_collector()
+    assert :ok = Client.qos(ch, prefetch_count: 1)
+    assert {:ok, _} = Client.consume(ch, name, collector, no_ack: false)
+
+    receive do
+      {^collector, {:basic_deliver, payload, meta}} ->
+        {:basic_deliver, payload, meta}
+    after
+      1_000 ->
+        flunk("missing delivery on #{name}")
+    end
+  end
+
   defp bind_client!(stack, opts \\ []) do
     {:ok, client} =
       SmppClient.start_link(

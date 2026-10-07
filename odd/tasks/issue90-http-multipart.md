@@ -36,9 +36,14 @@ Identity precedes settlement, compensation and activation. Unique child gateway 
   - Reuse `Routing.settle_segment/5`; prove production callback wiring, accepted/rejected/uncertain ledger effects, one full-unit-plus-quota refund, and durable replay after snapshot failure/restart without another SMPP send. Preserve legacy behavior and keep HTTP multipart inactive.
   - TDD: default applicable deterministic test-first policy; global strict mode unknown. RED/GREEN runner: `mix test test/jasmin_ex/smpp/connector_supervisor_test.exs test/jasmin_ex/messaging/rabbit_mq/connector_worker_test.exs`. Closure: format check, Credo, full tests and Dialyzer. RDD effective global on; this candidate needs its own assessment/consent.
   - Status: ordinary-verified work-unit commit `0f221e9e83d5e1d7bbe60e6ea281a95f310fbccc` (366 additions / 13 deletions, 379 authored). Parent repeated 71 focused tests (seed 927679), independent technical spot verification repeated 71 (seed 428383). Native assessment: medium; committed range from retained native boundary `f89b74a` was due (`slice_budget_reached`), including historical omitted units. User omitted this candidate; exact provider decline returned `action: declined`, `consent: declined_this_candidate` and matching target `sha256:a0d824ff4332be1cfe1ca0d97fb316e2cb3457134e16ac8b6cec38d47d46ac82`. No native approval; review remains globally enabled. Post-decline T2B-only committed assessment from `d884117`: medium, 379 lines, ordinary self-verification plus independent spot verification complete. HTTP multipart remains inactive. T2C–T5 untouched.
-- [ ] T2C Implement bounded delayed safe retries with the existing attempt budget.
-  - Route: delegated direct; triggers: timer/queue mapping and behavior tests. Exact surfaces to derive before launch.
-  - Current retries remain immediate; delay is explicitly pending. Do not block workers with sleep or automatically retransmit uncertain outcomes.
+- [x] T2C-1 Add inert Client/Publisher retry wait transport (direct API unused by workers).
+  - Depends on merged PR114 (`bd4f188050f9f82d983d483c2ce9e186b18131d6`). Non-closing `Refs #90`.
+  - Route: delegated direct; triggers: broker topology helpers and publisher regression tests.
+  - User approved a fixed 5000 ms TTL; retain the existing three-attempt budget. Explicit `publish_retry/3` and `<work-prefix>-retry.<id>.wait`; no WorkQueue, worker, or production retry-delay wiring.
+  - Verification: publisher/work-queue/worker unit tests; direct-API e2e wait TTL; format, Credo, full tests, Dialyzer. Production MT retries remain immediate.
+- [ ] T2C-2 Wire WorkQueue delayed retries onto the wait primitive.
+  - Route: delegated direct; triggers: WorkQueue retry publish/ACK and worker e2e wait activation.
+  - Pending human merge of T2C-1 and a separate publication authorization. Do not block workers with sleep or automatically retransmit uncertain outcomes.
 - [ ] T3 Implement stop-first queue publication and per-segment compensation without activating HTTP.
   - Route: delegated direct; triggers: new dispatch/compensation behavior and failure/race tests. Exact surfaces to derive before launch.
 - [ ] T4 Pass validated server multipart configuration through HTTP/pipeline options, without client overrides.
@@ -53,7 +58,7 @@ Each unit: `mix format --check-formatted`, `mix credo --strict`, `mix test`, `mi
 RDD is on (global), read-only status confirmed. Each candidate needs its own native assessment/consent; prior omissions do not apply. Native approval is not publication authorization.
 
 ## Progress and next step
-T1A and T1B are ordinary-verified and merged upstream in PR110/111. T2A1 checkpoint extraction is committed locally as `00d8b94` and published in merged PR112; T2A2 settlement is committed locally as `e1f9ad2` and published in merged PR113. Merge evidence is retained in the previous session handoff. Native review was omitted, not approved; last native-reviewed boundary remains `f89b74a`. T2B production wiring is ordinary-verified and committed as `0f221e9`; native review was omitted for this candidate with validated decline, not approval. T2C delayed retry is next. T3–T5 are untouched. HTTP multipart remains inactive. Full mirror is parent-owned.
+T1A and T1B are ordinary-verified and merged upstream in PR110/111. T2A1 checkpoint extraction is committed locally as `00d8b94` and published in merged PR112; T2A2 settlement is committed locally as `e1f9ad2` and published in merged PR113. Merge evidence is retained in the previous session handoff. Native review was omitted, not approved; last native-reviewed boundary remains `f89b74a`. T2B production wiring is ordinary-verified and committed as `0f221e9`; native review was omitted for this candidate with validated decline, not approval. PR114 merged at `bd4f188`. T2C-1 inert wait transport is implemented on this stacked-to-main slice; T2C-2 WorkQueue wiring remains pending. T3–T5 are untouched. HTTP multipart remains inactive. Full mirror is parent-owned.
 
 Full T1 observed (kept as the complete T1 evidence, not an intermediate proof):
 - RED: focused three-file command → 79/96 passed, 17 failed (seed 241261).
@@ -79,6 +84,12 @@ T2B observed functional proof (committed `0f221e9`; native review omitted for th
 - Runtime proof scope: real isolated Router (`name: nil`, `tmp_dir`) plus fake broker/SMPP transport. Not external SMPP or RabbitMQ proof.
 - Proof limitation: ledger tests invoke the production child-spec callback factory; the live worker test checks callback presence but does not invoke its closure against the Router. Source readback confirms both use the same factory. Uncertain snapshot-failure replay is not separately tested.
 - Rollback boundary: `lib/jasmin_ex/smpp/connector_supervisor.ex` production callback wiring; supervisor and worker tests; one settlement paragraph in `docs/http-long-messages.md`; this task document. No T2C/T3/T4/T5 or HTTP activation.
+
+T2C-1 observed (inert direct API; production MT retries remain immediate):
+- RED: focused publisher/work-queue/worker tests → 71/77 passed, 6 failed (seed 113578). Failures were missing `Publisher.publish_retry/3`, not compile errors.
+- GREEN: same command → 77 passed in 1.4s (seed 72733). Final focused 77 passed (seed 701188).
+- Closure: `mix format --check-formatted` passed; `mix credo --strict` no issues; full suite 889 passed (1 doctest, 888 tests), 30 excluded (`:compatibility`, `:integration`); Dialyzer 0 errors.
+- Runtime: local pinned `rabbitmq:4.3.4` already present; `mix test --include integration test/jasmin_ex/messaging/rabbit_mq/e2e_test.exs` → 10 passed in 96.6s (seed 827909). Direct `publish_retry` wait declare accepted, classic redeclare 406, work empty before TTL, same attempt 2 after ~5s. Exhausted worker retries stay immediate at the default timeout. HTTP remains inactive.
 
 T2A1 historical first proof (committed `00d8b94`; native omitted `declined_this_candidate`, not approved):
 - Index path only: `lib/jasmin_ex/messaging/rabbit_mq/connector_worker.ex`, 9 insertions / 3 deletions, blob `7cbe9ee119691eb5bf8069030c929acfe59902fc`.
