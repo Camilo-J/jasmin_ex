@@ -227,7 +227,7 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
 
   defp persist_dispatching(_state, _envelope), do: {:error, :unavailable}
 
-  defp checkpoint_and_publish(state, envelope, meta, attrs, decision) do
+  defp persist_known_response(state, envelope, attrs) do
     known = %{
       gateway_id: envelope.gateway_id,
       connector_id: envelope.connector_id,
@@ -242,8 +242,14 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
     with {:ok, record} <-
            StateStoreJournal.read(state.store, envelope.gateway_id, envelope.attempt),
          {:ok, recorded} <- SettlementJournal.record_known_response(record, known),
-         :ok <- StateStoreJournal.write(state.store, recorded, ttl),
-         :ok <- publish_known(state, recorded.known_response) do
+         :ok <- StateStoreJournal.write(state.store, recorded, ttl) do
+      {:ok, recorded.known_response}
+    end
+  end
+
+  defp checkpoint_and_publish(state, envelope, meta, attrs, decision) do
+    with {:ok, known} <- persist_known_response(state, envelope, attrs),
+         :ok <- publish_known(state, known) do
       finish(state, decision, meta, envelope)
     else
       _ -> state
