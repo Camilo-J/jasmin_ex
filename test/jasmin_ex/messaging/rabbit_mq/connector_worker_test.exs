@@ -1,6 +1,7 @@
 defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
   use ExUnit.Case, async: true
 
+  alias JasminEx.Billing.Fingerprint
   alias JasminEx.Messaging.{Envelope, SettlementJournal, StateStoreJournal}
   alias JasminEx.Messaging.RabbitMQ.{Config, Connection, ConnectorWorker}
   alias JasminEx.Smpp.PDU.Tlv
@@ -821,6 +822,7 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
             send(test, {:submitted, env})
             {:error, :disconnected}
           end,
+          settle_segment: fn _, _, _, _ -> {:ok, :duplicate} end,
           republish: republish_ok(agent)
         ]
       end)
@@ -891,6 +893,7 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
             send(test, {:submitted, env})
             {:error, :disconnected}
           end,
+          settle_segment: fn _, _, _, _ -> {:ok, :duplicate} end,
           republish: republish_ok(agent)
         ]
       end)
@@ -1356,6 +1359,569 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     end
   end
 
+  describe "v3 segment settlement" do
+    test "persists known SMSC proof before ledger for accepted and rejected", %{config: config} do
+      for {result, outcome, decision, status, dlr_enabled} <- [
+            {{:ok, "smsc-ok"}, :accepted, {:ack, 1, 1}, "ESME_ROK", true},
+            {{:ok, "smsc-ok"}, :accepted, {:ack, 1, 1}, "ESME_ROK", false},
+            {{:error, {:submit_rejected, :ESME_RINVDESTADR}}, :rejected,
+             {:reject, 1, 1, [requeue: false]}, "ESME_RINVDESTADR", true},
+            {{:error, {:submit_rejected, :ESME_RINVDESTADR}}, :rejected,
+             {:reject, 1, 1, [requeue: false]}, "ESME_RINVDESTADR", false}
+          ] do
+        {store, _} = journal_store()
+        gateway_id = "gw-seg-known"
+
+        {worker, agent} =
+          start_bound(config, "alpha", fn agent ->
+            [
+              store: store,
+              submit: fn _ -> result end,
+              settle_segment: settle_after_journal(agent, store, gateway_id, 1),
+              dlr_enabled: dlr_enabled,
+              dlr_publisher: dlr_publisher(agent, :ok)
+            ]
+          end)
+
+        {_envelope, payload} = v3_payload(%{gateway_id: gateway_id})
+        assert :ok = Fake.deliver(agent, payload)
+        assert ConnectorWorker.inflight(worker) == nil
+        events = Fake.events(agent)
+
+        assert {:segment_settle, "bill-parent", fingerprint, 1, ^outcome,
+                {:sent, {:ok, known}, _evidence}} = find(events, :segment_settle)
+
+        assert %Fingerprint{version: 1, digest: digest} = fingerprint
+        assert digest == :binary.copy(<<7>>, 32)
+        assert Base.encode64(digest) == digest_b64()
+        assert known["status"] == status
+        assert known["gateway_id"] == gateway_id
+        assert decision in events
+        settle_at = Enum.find_index(events, &match?({:segment_settle, _, _, _, _, _}, &1))
+        done_at = Enum.find_index(events, &(&1 == decision))
+        assert settle_at < done_at
+
+        if dlr_enabled do
+          assert {:dlr_publish, "dlr.submit_sm_resp", _} = find(events, :dlr_publish)
+          dlr_at = Enum.find_index(events, &match?({:dlr_publish, _, _}, &1))
+          assert settle_at < dlr_at
+          assert dlr_at < done_at
+        else
+          refute Enum.any?(events, &match?({:dlr_publish, _, _}, &1))
+        end
+
+        stop(worker, agent)
+      end
+    end
+
+    test "unknown SMSC outcome settles uncertain without synthesizing known", %{config: config} do
+      {store, _} = journal_store()
+      gateway_id = "gw-seg-unknown"
+
+      {worker, agent} =
+        start_bound(config, "alpha", fn agent ->
+          [
+            store: store,
+            submit: fn _ -> {:unknown, :response_timeout} end,
+            settle_segment: settle_after_journal(agent, store, gateway_id, 1),
+            republish: republish_ok(agent)
+          ]
+        end)
+
+      {_envelope, payload} = v3_payload(%{gateway_id: gateway_id, expires_at: @future})
+      assert :ok = Fake.deliver(agent, payload)
+      assert ConnectorWorker.inflight(worker) == nil
+      events = Fake.events(agent)
+
+      assert {:segment_settle, "bill-parent", _fp, 1, :uncertain, {:sent, :none, evidence}} =
+               find(events, :segment_settle)
+
+      assert evidence["stage"] == "post_write"
+      assert {:republish, {:quarantine, _env, _ev}} = find(events, :republish)
+      settle_at = Enum.find_index(events, &match?({:segment_settle, _, _, _, _, _}, &1))
+      republish_at = Enum.find_index(events, &match?({:republish, {:quarantine, _, _}}, &1))
+      ack_at = Enum.find_index(events, &(&1 == {:ack, 1, 1}))
+      assert settle_at < republish_at
+      assert republish_at < ack_at
+      assert {:ok, record} = StateStoreJournal.read(store, gateway_id, 1)
+      assert SettlementJournal.known_response(record) == :none
+      stop(worker, agent)
+    end
+
+    test "exhausted or expired pre-write settles rejected from journal proof", %{config: config} do
+      for {overrides, result} <- [
+            {%{gateway_id: "gw-seg-max", attempt: 3, max_attempts: 3, expires_at: @future},
+             {:error, :disconnected}},
+            {%{gateway_id: "gw-seg-exp", attempt: 1, max_attempts: 3, expires_at: @past},
+             {:error, :unbinding}}
+          ] do
+        {store, _} = journal_store()
+        gateway_id = overrides.gateway_id
+
+        {worker, agent} =
+          start_bound(config, "alpha", fn agent ->
+            [
+              store: store,
+              submit: fn _ -> result end,
+              settle_segment: settle_after_journal(agent, store, gateway_id, overrides.attempt),
+              republish: republish_ok(agent)
+            ]
+          end)
+
+        {_envelope, payload} = v3_payload(overrides)
+        assert :ok = Fake.deliver(agent, payload)
+        assert ConnectorWorker.inflight(worker) == nil
+        events = Fake.events(agent)
+
+        assert {:segment_settle, "bill-parent", _fp, 1, :rejected, {:not_sent, :none, evidence}} =
+                 find(events, :segment_settle)
+
+        assert evidence["stage"] == "pre_write"
+        assert {:republish, {:quarantine, env, ev}} = find(events, :republish)
+        assert env.gateway_id == gateway_id
+        assert ev.stage == :pre_write
+        refute Enum.any?(events, &match?({:republish, {:retry, _}}, &1))
+        stop(worker, agent)
+      end
+    end
+
+    test "retryable pre-write does not settle and republish failure does not refund", %{
+      config: config
+    } do
+      for {republish_result, expect_ack?} <- [{:ok, true}, {{:error, :timeout}, false}] do
+        {store, _} = journal_store()
+        submits = Agent.start_link(fn -> 0 end) |> elem(1)
+
+        {worker, agent} =
+          start_bound(config, "alpha", fn agent ->
+            [
+              store: store,
+              submit: fn _ ->
+                Agent.update(submits, &(&1 + 1))
+                {:error, :disconnected}
+              end,
+              settle_segment: settle_record(agent),
+              republish: fn action ->
+                Fake.record(agent, {:republish, action})
+                republish_result
+              end
+            ]
+          end)
+
+        {_envelope, payload} =
+          v3_payload(%{
+            gateway_id: "gw-seg-retry",
+            attempt: 1,
+            max_attempts: 3,
+            expires_at: @future
+          })
+
+        assert :ok = Fake.deliver(agent, payload)
+        _ = ConnectorWorker.inflight(worker)
+        events = Fake.events(agent)
+        refute Enum.any?(events, &match?({:segment_settle, _, _, _, _}, &1))
+        assert {:republish, {:retry, next}} = find(events, :republish)
+        assert next.attempt == 2
+        assert next.segment.index == 1
+        assert next.segment.bill_id == "bill-parent"
+        assert next.segment.fingerprint_digest_base64 == digest_b64()
+        assert Agent.get(submits, & &1) == 1
+
+        if expect_ack? do
+          assert ConnectorWorker.inflight(worker) == nil
+          assert {:ack, 1, 1} in events
+        else
+          assert {:basic_deliver, ^payload, %{delivery_tag: 1}} =
+                   ConnectorWorker.inflight(worker)
+
+          refute Enum.any?(events, &match?({:ack, _, _}, &1))
+        end
+
+        stop(worker, agent)
+      end
+    end
+
+    test "known journal persist failure does not settle or ack", %{config: config} do
+      table = :ets.new(:seg_ckpt_fail, [:set, :public])
+      {:ok, script} = Agent.start_link(fn -> [:ok, {:error, :unavailable}] end)
+      store = {ScriptedJournalStore, {table, script}}
+      submits = Agent.start_link(fn -> 0 end) |> elem(1)
+
+      {worker, agent} =
+        start_bound(config, "alpha", fn agent ->
+          [
+            store: store,
+            submit: fn _ ->
+              Agent.update(submits, &(&1 + 1))
+              {:ok, "smsc-ok"}
+            end,
+            settle_segment: settle_record(agent)
+          ]
+        end)
+
+      {_envelope, payload} = v3_payload(%{gateway_id: "gw-seg-ckpt"})
+      assert :ok = Fake.deliver(agent, payload)
+      _ = ConnectorWorker.inflight(worker)
+      assert Agent.get(submits, & &1) == 1
+      events = Fake.events(agent)
+      refute Enum.any?(events, &match?({:segment_settle, _, _, _, _}, &1))
+      refute Enum.any?(events, &match?({:ack, _, _}, &1))
+      refute Enum.any?(events, &match?({:reject, _, _, _}, &1))
+      assert {:ok, record} = StateStoreJournal.read(store, "gw-seg-ckpt", 1)
+      assert record.state == :dispatching
+      assert SettlementJournal.known_response(record) == :none
+      stop(worker, agent)
+    end
+
+    test "ledger failure keeps known and replays settlement without resubmit", %{config: config} do
+      for {result, outcome, status, decision} <- [
+            {{:ok, "smsc-ok"}, :accepted, "ESME_ROK", {:ack, 1, 1}},
+            {{:error, {:submit_rejected, :ESME_RINVDESTADR}}, :rejected, "ESME_RINVDESTADR",
+             {:reject, 1, 1, [requeue: false]}}
+          ] do
+        {store, _} = journal_store()
+        submits = Agent.start_link(fn -> 0 end) |> elem(1)
+        {:ok, script} = Agent.start_link(fn -> [{:error, :unavailable}] end)
+        gateway_id = "gw-seg-ledger"
+
+        extra = fn agent ->
+          [
+            store: store,
+            submit: fn _ ->
+              Agent.update(submits, &(&1 + 1))
+              result
+            end,
+            settle_segment: settle_script(agent, script)
+          ]
+        end
+
+        {worker, agent} = start_bound(config, "alpha", extra)
+        {_envelope, payload} = v3_payload(%{gateway_id: gateway_id})
+        assert :ok = Fake.deliver(agent, payload)
+        _ = ConnectorWorker.inflight(worker)
+        assert Agent.get(submits, & &1) == 1
+        events = Fake.events(agent)
+        assert {:segment_settle, "bill-parent", _fp, 1, ^outcome} = find(events, :segment_settle)
+        refute Enum.any?(events, &match?({:ack, _, _}, &1))
+        refute Enum.any?(events, &match?({:reject, _, _, _}, &1))
+        assert {:ok, record} = StateStoreJournal.read(store, gateway_id, 1)
+        assert {:ok, known} = SettlementJournal.known_response(record)
+        assert known["status"] == status
+        stop(worker, agent)
+
+        {worker2, agent2} = start_bound(config, "alpha", extra)
+        assert :ok = Fake.deliver(agent2, payload)
+        assert ConnectorWorker.inflight(worker2) == nil
+        assert Agent.get(submits, & &1) == 1
+        events2 = Fake.events(agent2)
+
+        assert {:segment_settle, "bill-parent", _fp2, 1, ^outcome} =
+                 find(events2, :segment_settle)
+
+        assert decision in events2
+        stop(worker2, agent2)
+      end
+    end
+
+    test "billing_conflict keeps known without resend or ack", %{config: config} do
+      {store, _} = journal_store()
+      submits = Agent.start_link(fn -> 0 end) |> elem(1)
+
+      {worker, agent} =
+        start_bound(config, "alpha", fn agent ->
+          [
+            store: store,
+            submit: fn _ ->
+              Agent.update(submits, &(&1 + 1))
+              {:ok, "smsc-ok"}
+            end,
+            settle_segment: settle_record(agent, {:error, :billing_conflict})
+          ]
+        end)
+
+      {_envelope, payload} = v3_payload(%{gateway_id: "gw-seg-conflict"})
+      assert :ok = Fake.deliver(agent, payload)
+      _ = ConnectorWorker.inflight(worker)
+      assert Agent.get(submits, & &1) == 1
+      assert Process.alive?(worker)
+      events = Fake.events(agent)
+      assert {:segment_settle, "bill-parent", _fp, 1, :accepted} = find(events, :segment_settle)
+      refute Enum.any?(events, &match?({:ack, _, _}, &1))
+      assert {:ok, record} = StateStoreJournal.read(store, "gw-seg-conflict", 1)
+      assert {:ok, _known} = SettlementJournal.known_response(record)
+      stop(worker, agent)
+    end
+
+    test "missing settle_segment fails closed without a fresh submit", %{config: config} do
+      {store, _} = journal_store()
+      submits = Agent.start_link(fn -> 0 end) |> elem(1)
+      test = self()
+
+      {worker, agent} =
+        start_bound(config, "alpha",
+          store: store,
+          submit: fn env ->
+            Agent.update(submits, &(&1 + 1))
+            send(test, {:submitted, env})
+            {:ok, "smsc-ok"}
+          end
+        )
+
+      {_envelope, payload} = v3_payload(%{gateway_id: "gw-seg-missing"})
+      assert :ok = Fake.deliver(agent, payload)
+      assert {:basic_deliver, ^payload, %{delivery_tag: 1}} = ConnectorWorker.inflight(worker)
+      refute_received {:submitted, _}
+      assert Agent.get(submits, & &1) == 0
+      assert StateStoreJournal.read(store, "gw-seg-missing", 1) == :missing
+      refute Enum.any?(Fake.events(agent), &match?({:ack, _, _}, &1))
+      stop(worker, agent)
+
+      record = SettlementJournal.dispatching("gw-seg-known-missing", 1)
+
+      {:ok, recorded} =
+        SettlementJournal.record_known_response(record, %{
+          gateway_id: "gw-seg-known-missing",
+          connector_id: "alpha",
+          attempt: 1,
+          smsc_id: "smsc-ok",
+          status: :ESME_ROK,
+          observed_at_ms: 1
+        })
+
+      assert :ok = StateStoreJournal.write(store, recorded, 60_000)
+      {_envelope, payload2} = v3_payload(%{gateway_id: "gw-seg-known-missing"})
+
+      {worker2, agent2} =
+        start_bound(config, "alpha",
+          store: store,
+          submit: fn env ->
+            Agent.update(submits, &(&1 + 1))
+            send(test, {:submitted, env})
+            {:ok, "nope"}
+          end
+        )
+
+      assert :ok = Fake.deliver(agent2, payload2)
+      assert {:basic_deliver, ^payload2, %{delivery_tag: 1}} = ConnectorWorker.inflight(worker2)
+      refute_received {:submitted, _}
+      assert Agent.get(submits, & &1) == 0
+      assert {:ok, kept} = StateStoreJournal.read(store, "gw-seg-known-missing", 1)
+      assert {:ok, _} = SettlementJournal.known_response(kept)
+      refute Enum.any?(Fake.events(agent2), &match?({:ack, _, _}, &1))
+      stop(worker2, agent2)
+    end
+
+    test "unresolved dispatch and sent without known settle uncertain without resubmit", %{
+      config: config
+    } do
+      seeds = [
+        {"gw-seg-unresolved",
+         fn store ->
+           record = SettlementJournal.dispatching("gw-seg-unresolved", 1)
+           StateStoreJournal.write(store, record, 60_000)
+         end},
+        {"gw-seg-sent",
+         fn store ->
+           record = SettlementJournal.dispatching("gw-seg-sent", 1)
+
+           {:ok, recorded} =
+             SettlementJournal.record_outcome(
+               record,
+               {:sent, %{stage: :post_write, reason: :response_timeout}}
+             )
+
+           StateStoreJournal.write(store, recorded, 60_000)
+         end}
+      ]
+
+      for {gateway_id, seed} <- seeds do
+        {store, _} = journal_store()
+        assert :ok = seed.(store)
+        submits = Agent.start_link(fn -> 0 end) |> elem(1)
+
+        {worker, agent} =
+          start_bound(config, "alpha", fn agent ->
+            [
+              store: store,
+              submit: fn _ ->
+                Agent.update(submits, &(&1 + 1))
+                {:ok, "should-not-submit"}
+              end,
+              settle_segment: settle_after_journal(agent, store, gateway_id, 1),
+              republish: republish_ok(agent)
+            ]
+          end)
+
+        {_envelope, payload} = v3_payload(%{gateway_id: gateway_id, expires_at: @future})
+        assert :ok = Fake.deliver(agent, payload)
+        assert ConnectorWorker.inflight(worker) == nil
+        assert Agent.get(submits, & &1) == 0
+        events = Fake.events(agent)
+
+        assert {:segment_settle, "bill-parent", _fp, 1, :uncertain, {_state, :none, _evidence}} =
+                 find(events, :segment_settle)
+
+        refute Enum.any?(events, &match?({:segment_settle, _, _, _, :accepted, _}, &1))
+        assert {:republish, {:quarantine, _env, _ev}} = find(events, :republish)
+        stop(worker, agent)
+      end
+    end
+
+    test "duplicate and late_ignored settlement finish without resubmit", %{config: config} do
+      for result <- [{:ok, :duplicate}, {:ok, :late_ignored}] do
+        {store, _} = journal_store()
+        submits = Agent.start_link(fn -> 0 end) |> elem(1)
+
+        {worker, agent} =
+          start_bound(config, "alpha", fn agent ->
+            [
+              store: store,
+              submit: fn _ ->
+                Agent.update(submits, &(&1 + 1))
+                {:ok, "smsc-ok"}
+              end,
+              settle_segment: settle_record(agent, result)
+            ]
+          end)
+
+        {_envelope, payload} = v3_payload(%{gateway_id: "gw-seg-dup"})
+        assert :ok = Fake.deliver(agent, payload)
+        assert ConnectorWorker.inflight(worker) == nil
+        assert Agent.get(submits, & &1) == 1
+        events = Fake.events(agent)
+        assert {:segment_settle, "bill-parent", _fp, 1, :accepted} = find(events, :segment_settle)
+        assert {:ack, 1, 1} in events
+        stop(worker, agent)
+      end
+    end
+
+    test "legacy v2 never calls settle_segment and keeps DLR on and off behavior", %{
+      config: config
+    } do
+      for {dlr_enabled, expect_dlr?} <- [{true, true}, {false, false}] do
+        {store, _} = journal_store()
+
+        {worker, agent} =
+          start_bound(config, "alpha", fn agent ->
+            [
+              store: store,
+              submit: fn _ -> {:ok, "smsc-ok"} end,
+              settle_segment: settle_record(agent),
+              dlr_enabled: dlr_enabled,
+              dlr_publisher: dlr_publisher(agent, :ok)
+            ]
+          end)
+
+        {_envelope, payload} = valid_payload(%{gateway_id: "gw-v2-settle"})
+        assert :ok = Fake.deliver(agent, payload)
+        assert ConnectorWorker.inflight(worker) == nil
+        events = Fake.events(agent)
+        refute Enum.any?(events, &match?({:segment_settle, _, _, _, _}, &1))
+        assert {:ack, 1, 1} in events
+
+        if expect_dlr? do
+          assert {:dlr_publish, "dlr.submit_sm_resp", _} = find(events, :dlr_publish)
+          assert {:ok, record} = StateStoreJournal.read(store, "gw-v2-settle", 1)
+          assert {:ok, known} = SettlementJournal.known_response(record)
+          assert known["status"] == "ESME_ROK"
+        else
+          refute Enum.any?(events, &match?({:dlr_publish, _, _}, &1))
+        end
+
+        stop(worker, agent)
+      end
+    end
+
+    test "DLR publish failure after settlement replays journal and ledger without submit", %{
+      config: config
+    } do
+      {store, _} = journal_store()
+      submits = Agent.start_link(fn -> 0 end) |> elem(1)
+      gateway_id = "gw-seg-dlr-fail"
+
+      {worker, agent} =
+        start_bound(config, "alpha", fn agent ->
+          [
+            store: store,
+            submit: fn _ ->
+              Agent.update(submits, &(&1 + 1))
+              {:ok, "smsc-ok"}
+            end,
+            settle_segment: settle_record(agent),
+            dlr_enabled: true,
+            dlr_publisher: dlr_publisher(agent, {:error, :unroutable})
+          ]
+        end)
+
+      {_envelope, payload} = v3_payload(%{gateway_id: gateway_id})
+      assert :ok = Fake.deliver(agent, payload)
+      _ = ConnectorWorker.inflight(worker)
+      assert Agent.get(submits, & &1) == 1
+      events = Fake.events(agent)
+      assert {:segment_settle, "bill-parent", _fp, 1, :accepted} = find(events, :segment_settle)
+      assert {:dlr_publish, "dlr.submit_sm_resp", _} = find(events, :dlr_publish)
+      refute Enum.any?(events, &match?({:ack, _, _}, &1))
+      assert {:ok, record} = StateStoreJournal.read(store, gateway_id, 1)
+      assert {:ok, _} = SettlementJournal.known_response(record)
+      stop(worker, agent)
+
+      {worker2, agent2} =
+        start_bound(config, "alpha", fn agent ->
+          [
+            store: store,
+            submit: fn _ ->
+              Agent.update(submits, &(&1 + 1))
+              {:ok, "should-not"}
+            end,
+            settle_segment: settle_record(agent),
+            dlr_enabled: true,
+            dlr_publisher: dlr_publisher(agent, :ok)
+          ]
+        end)
+
+      assert :ok = Fake.deliver(agent2, payload)
+      assert ConnectorWorker.inflight(worker2) == nil
+      assert Agent.get(submits, & &1) == 1
+      events2 = Fake.events(agent2)
+      assert {:segment_settle, "bill-parent", _fp2, 1, :accepted} = find(events2, :segment_settle)
+      assert {:dlr_publish, "dlr.submit_sm_resp", _} = find(events2, :dlr_publish)
+      assert {:ack, 1, 1} in events2
+      stop(worker2, agent2)
+    end
+
+    test "malformed, unsupported, or crashing settle_segment fails closed", %{config: config} do
+      for settle <- [
+            fn _bill, _fp, _index, _outcome -> :ok end,
+            fn _bill, _fp, _index, _outcome -> {:ok} end,
+            fn _bill, _fp, _index, _outcome -> raise "boom" end,
+            fn _bill, _fp, _index, _outcome -> exit(:boom) end
+          ] do
+        {store, _} = journal_store()
+        submits = Agent.start_link(fn -> 0 end) |> elem(1)
+
+        {worker, agent} =
+          start_bound(config, "alpha",
+            store: store,
+            submit: fn _ ->
+              Agent.update(submits, &(&1 + 1))
+              {:ok, "smsc-ok"}
+            end,
+            settle_segment: settle
+          )
+
+        {_envelope, payload} = v3_payload(%{gateway_id: "gw-seg-bad"})
+        assert :ok = Fake.deliver(agent, payload)
+        _ = ConnectorWorker.inflight(worker)
+        assert Process.alive?(worker)
+        assert Agent.get(submits, & &1) == 1
+        refute Enum.any?(Fake.events(agent), &match?({:ack, _, _}, &1))
+        assert {:ok, record} = StateStoreJournal.read(store, "gw-seg-bad", 1)
+        assert {:ok, _} = SettlementJournal.known_response(record)
+        stop(worker, agent)
+      end
+    end
+  end
+
   defp dlr_publisher(agent, result) do
     fn routing_key, payload ->
       Fake.record(agent, {:dlr_publish, routing_key, payload})
@@ -1412,6 +1978,56 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     {:ok, envelope} = Envelope.new(attributes)
     {:ok, payload} = Envelope.encode(envelope)
     {envelope, payload}
+  end
+
+  defp v3_payload(overrides) do
+    valid_payload(Map.put_new(overrides, :segment, segment_bind()))
+  end
+
+  defp segment_bind do
+    %{
+      bill_id: "bill-parent",
+      index: 1,
+      count: 2,
+      fingerprint_version: 1,
+      fingerprint_digest_base64: digest_b64()
+    }
+  end
+
+  defp digest_b64, do: Base.encode64(:binary.copy(<<7>>, 32))
+
+  defp settle_record(agent, result \\ {:ok, :duplicate}) do
+    fn bill_id, fingerprint, index, outcome ->
+      Fake.record(agent, {:segment_settle, bill_id, fingerprint, index, outcome})
+      result
+    end
+  end
+
+  defp settle_script(agent, script) do
+    fn bill_id, fingerprint, index, outcome ->
+      Fake.record(agent, {:segment_settle, bill_id, fingerprint, index, outcome})
+
+      Agent.get_and_update(script, fn
+        [result | rest] -> {result, rest}
+        [] -> {{:ok, :duplicate}, []}
+      end)
+    end
+  end
+
+  defp settle_after_journal(agent, store, gateway_id, attempt, result \\ {:ok, :duplicate}) do
+    fn bill_id, fingerprint, index, outcome ->
+      journal =
+        case StateStoreJournal.read(store, gateway_id, attempt) do
+          {:ok, record} ->
+            {record.state, SettlementJournal.known_response(record), record.evidence}
+
+          other ->
+            other
+        end
+
+      Fake.record(agent, {:segment_settle, bill_id, fingerprint, index, outcome, journal})
+      result
+    end
   end
 
   defp v2_payload(message, envelope_overrides, submit_overrides \\ %{}) do
