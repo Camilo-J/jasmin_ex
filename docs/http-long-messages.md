@@ -6,6 +6,8 @@
 
 `JasminEx.Billing.SegmentLedger` remains the pure per-segment outcome ledger. Opt-in durable settlement is marked at admission with `JasminEx.Routing.admit_segments/2`; legacy `admit/2` never retrofits at first result. `settle_segment/5` records `accepted`, `rejected`, or `uncertain` (timeout/no-response is provisionally uncertain) and persists ledger identity plus account deltas in the same Router snapshot transaction. Confirmed rejection refunds the full unit including precharge and credits one quota; accepted segments retain charge; pending/uncertain keep remainder and are never auto-refunded by whole-bill settle or expiry. Duplicate results are no-ops; malformed identity/index/outcome and overflow fail closed. HTTP multipart submission remains inactive.
 
+Connector workers may inject `settle_segment/4` (`bill_id`, `%JasminEx.Billing.Fingerprint{}`, one-based index, `accepted | rejected | uncertain`) for v3 envelopes. Durable journal known-response evidence is persisted before that callback; a missing callback, journal persist failure, `{:error, _}`, malformed returns, and callback crashes fail closed without broker ACK or another SMPP submit. Transient pre-write retries do not settle; exhausted or expired pre-write nonacceptance settles `rejected` only with that proof; unknown or unresolved outcomes settle `uncertain` and never auto-refund. Production Router wiring is inactive; this is not exactly-once SMSC or ledger delivery.
+
 The durability guarantee is a single local Router and its snapshot store. Atomic rename is process-restart proof; it is not an unverified power-loss/fsync guarantee, not multi-router exactly-once, and not external SMS delivery exactly-once. Final timeout charge/reconciliation is deferred.
 
 ## API

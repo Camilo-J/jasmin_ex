@@ -2,6 +2,7 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
   @moduledoc false
   use GenServer
 
+  alias JasminEx.Billing.Fingerprint
   alias JasminEx.Messaging.{Envelope, SettlementJournal, StateStoreJournal}
   alias JasminEx.Messaging.RabbitMQ.{Client, Connection, Telemetry}
 
@@ -28,6 +29,7 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
        dlr_publisher: Keyword.get(opts, :dlr_publisher),
        dlr_clock: Keyword.get(opts, :dlr_clock, {__MODULE__, :system}),
        dlr_outcome_ttl_ms: Keyword.get(opts, :dlr_outcome_ttl_ms),
+       settle_segment: Keyword.get(opts, :settle_segment),
        bound: false,
        phase: :idle,
        channel: nil,
@@ -172,7 +174,7 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
   end
 
   defp dispatch_valid(state, envelope, meta) do
-    if dispatchable?(state) do
+    if dispatchable?(state) and segment_ready?(state, envelope) do
       case StateStoreJournal.read(state.store, envelope.gateway_id, envelope.attempt) do
         :missing -> submit_fresh(state, envelope, meta)
         {:ok, record} -> settle_or_replay(state, envelope, meta, record)
@@ -193,15 +195,24 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
     end
   end
 
-  defp settle_or_replay(%{dlr_enabled: true} = state, envelope, meta, record) do
-    case SettlementJournal.known_response(record) do
-      {:ok, known} -> replay_known(state, envelope, meta, known)
-      :none -> settle_recorded(state, envelope, meta, record)
+  defp settle_or_replay(state, envelope, meta, record) do
+    case {known_replay?(state, envelope), SettlementJournal.known_response(record)} do
+      {true, {:ok, known}} -> replay_known(state, envelope, meta, known)
+      _ -> settle_recorded(state, envelope, meta, record)
     end
   end
 
-  defp settle_or_replay(state, envelope, meta, record),
-    do: settle_recorded(state, envelope, meta, record)
+  defp known_replay?(_state, %{segment: segment}) when is_map(segment), do: true
+  defp known_replay?(%{dlr_enabled: true}, _envelope), do: true
+  defp known_replay?(_state, _envelope), do: false
+
+  defp segment_ready?(_state, %{segment: nil}), do: true
+
+  defp segment_ready?(%{settle_segment: fun}, %{segment: segment})
+       when is_function(fun, 4) and is_map(segment),
+       do: true
+
+  defp segment_ready?(_state, _envelope), do: false
 
   defp settle_recorded(state, envelope, meta, record) do
     case SettlementJournal.redelivery_directive(record) do
@@ -259,9 +270,11 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
   defp replay_known(state, envelope, meta, known) do
     decision = if known["status"] == "ESME_ROK", do: :ack, else: :reject
 
-    case publish_known(state, known) do
-      :ok -> finish(state, decision, meta, envelope)
-      _other -> state
+    with :ok <- maybe_settle_known(state, envelope, known),
+         :ok <- maybe_publish_known(state, known) do
+      finish(state, decision, meta, envelope)
+    else
+      _ -> state
     end
   end
 
@@ -272,10 +285,17 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
 
   defp publish_known(_state, _known), do: {:error, :dlr_unavailable}
 
+  defp maybe_publish_known(%{dlr_enabled: true} = state, known), do: publish_known(state, known)
+  defp maybe_publish_known(_state, _known), do: :ok
+
   def now_ms(:system), do: System.system_time(:millisecond)
 
   defp observed_at_ms(%{dlr_clock: {module, context}}), do: module.now_ms(context)
   defp observed_at_ms(_state), do: now_ms(:system)
+
+  defp classify(state, %{segment: segment} = envelope, meta, result) when is_map(segment) do
+    classify_segment(state, envelope, meta, result)
+  end
 
   defp classify(%{dlr_enabled: true} = state, envelope, meta, {:ok, id}) do
     checkpoint_and_publish(state, envelope, meta, %{smsc_id: id, status: :ESME_ROK}, :ack)
@@ -304,9 +324,38 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
 
   defp classify(state, _envelope, _meta, _other), do: state
 
+  defp classify_segment(state, envelope, meta, {:ok, id}) do
+    checkpoint_segment(state, envelope, meta, %{smsc_id: id, status: :ESME_ROK}, :ack, :accepted)
+  end
+
+  defp classify_segment(state, envelope, meta, {:error, {:submit_rejected, status}}) do
+    checkpoint_segment(state, envelope, meta, %{status: status}, :reject, :rejected)
+  end
+
+  defp classify_segment(state, envelope, meta, {:error, reason})
+       when reason in [:disconnected, :unbinding] do
+    settle_retry(state, envelope, meta, evidence(envelope, :pre_write, reason))
+  end
+
+  defp classify_segment(state, envelope, meta, {:unknown, reason}) do
+    settle_quarantine(state, envelope, meta, evidence(envelope, :post_write, reason))
+  end
+
+  defp classify_segment(state, _envelope, _meta, _other), do: state
+
+  defp checkpoint_segment(state, envelope, meta, attrs, decision, outcome) do
+    with {:ok, known} <- persist_known_response(state, envelope, attrs),
+         :ok <- apply_segment_settlement(state, envelope, outcome),
+         :ok <- maybe_publish_known(state, known) do
+      finish(state, decision, meta, envelope)
+    else
+      _ -> state
+    end
+  end
+
   defp settle_retry(state, envelope, meta, evidence) do
     if retryable?(envelope) do
-      confirm_action(state, envelope, meta, :not_sent, evidence, &retry_envelope/2)
+      confirm_action(state, envelope, meta, :not_sent, evidence, &retry_envelope/2, false)
     else
       settle_quarantine(state, envelope, meta, evidence)
     end
@@ -314,7 +363,7 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
 
   defp settle_quarantine(state, envelope, meta, evidence) do
     journal_state = if evidence.stage == :pre_write, do: :not_sent, else: :sent
-    confirm_action(state, envelope, meta, journal_state, evidence, &quarantine_action/2)
+    confirm_action(state, envelope, meta, journal_state, evidence, &quarantine_action/2, true)
   end
 
   defp confirm_action(
@@ -323,10 +372,12 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
          meta,
          journal_state,
          evidence,
-         fun
+         fun,
+         settle_after?
        )
        when is_function(republish, 1) do
     with :ok <- persist_outcome(state, envelope, journal_state, evidence),
+         :ok <- maybe_settle_after(state, envelope, evidence, settle_after?),
          {:ok, action} <- fun.(envelope, evidence),
          :ok <- republish.(action) do
       emit_action(state, action, envelope)
@@ -336,7 +387,77 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
     end
   end
 
-  defp confirm_action(state, _envelope, _meta, _journal_state, _evidence, _fun), do: state
+  defp confirm_action(state, _envelope, _meta, _journal_state, _evidence, _fun, _settle_after?),
+    do: state
+
+  defp maybe_settle_after(_state, _envelope, _evidence, false), do: :ok
+
+  defp maybe_settle_after(state, envelope, evidence, true) do
+    apply_segment_settlement(state, envelope, quarantine_outcome(envelope, evidence))
+  end
+
+  defp quarantine_outcome(envelope, evidence) do
+    if evidence.stage == :pre_write and not retryable?(envelope) do
+      :rejected
+    else
+      :uncertain
+    end
+  end
+
+  defp maybe_settle_known(state, envelope, known) do
+    apply_segment_settlement(state, envelope, known_outcome(known))
+  end
+
+  defp known_outcome(%{"status" => "ESME_ROK"}), do: :accepted
+  defp known_outcome(_known), do: :rejected
+
+  defp apply_segment_settlement(_state, %{segment: nil}, _outcome), do: :ok
+
+  defp apply_segment_settlement(state, envelope, outcome) do
+    with {:ok, fingerprint} <- fingerprint_from_segment(envelope.segment),
+         {:ok, fun} <- settle_fun(state) do
+      invoke_settle_fun(
+        fun,
+        envelope.segment.bill_id,
+        fingerprint,
+        envelope.segment.index,
+        outcome
+      )
+    end
+  end
+
+  defp settle_fun(%{settle_segment: fun}) when is_function(fun, 4), do: {:ok, fun}
+  defp settle_fun(_state), do: {:error, :missing_settlement}
+
+  defp fingerprint_from_segment(%{
+         fingerprint_version: 1,
+         fingerprint_digest_base64: encoded
+       })
+       when is_binary(encoded) do
+    case Base.decode64(encoded) do
+      {:ok, digest} when byte_size(digest) == 32 ->
+        if Base.encode64(digest) == encoded do
+          {:ok, %Fingerprint{version: 1, digest: digest}}
+        else
+          {:error, :malformed_binding}
+        end
+
+      _ ->
+        {:error, :malformed_binding}
+    end
+  end
+
+  defp fingerprint_from_segment(_segment), do: {:error, :malformed_binding}
+
+  defp invoke_settle_fun(fun, bill_id, fingerprint, index, outcome) do
+    case fun.(bill_id, fingerprint, index, outcome) do
+      {:ok, _value} -> :ok
+      {:error, _reason} -> {:error, :settlement_failed}
+      _other -> {:error, :malformed_result}
+    end
+  catch
+    _kind, _reason -> {:error, :settlement_failed}
+  end
 
   defp retry_envelope(envelope, _evidence) do
     with {:ok, next} <- increment(envelope), do: {:ok, {:retry, next}}
