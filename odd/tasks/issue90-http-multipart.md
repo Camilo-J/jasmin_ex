@@ -41,9 +41,13 @@ Identity precedes settlement, compensation and activation. Unique child gateway 
   - Route: delegated direct; triggers: broker topology helpers and publisher regression tests.
   - User approved a fixed 5000 ms TTL; retain the existing three-attempt budget. Explicit `publish_retry/3` and `<work-prefix>-retry.<id>.wait`; no WorkQueue, worker, or production retry-delay wiring.
   - Verification: publisher/work-queue/worker unit tests; direct-API e2e wait TTL; format, Credo, full tests, Dialyzer. Production MT retries remain immediate.
-- [ ] T2C-2 Wire WorkQueue delayed retries onto the wait primitive.
+  - Published: PR115 merged at `2026-10-07T23:55:14Z` as `4cfd29866729d8c4d821e94d4a2f06ee4b12e873`; required `ci`, Redis, Dragonfly and RabbitMQ all succeeded.
+- [x] T2C-2 Wire WorkQueue delayed retries onto the wait primitive.
+  - Depends on merged PR115 (`4cfd29866729d8c4d821e94d4a2f06ee4b12e873`). Non-closing `Refs #90`.
   - Route: delegated direct; triggers: WorkQueue retry publish/ACK and worker e2e wait activation.
-  - Pending human merge of T2C-1 and a separate publication authorization. Do not block workers with sleep or automatically retransmit uncertain outcomes.
+  - Safe retries now delay 5000 ms via explicit `publish_retry/3` onto `<work-prefix>-retry.<id>.wait` and publisher confirm before original ACK. Max 3 unchanged. Enqueue/quarantine stay classic. Uncertain outcomes still quarantine without delay; no sleep, auto-retransmit, or refund.
+  - Client/Publisher/publisher-test bytes unchanged from T2C-1. HTTP multipart remains inactive.
+  - Status: ordinary-verified on aux `feat/mt-retry-delay-wire-90`; this work-unit commit; native assessment pending from retained boundary `bd4f188`; publication pending current authorization; no future pushes.
 - [ ] T3 Implement stop-first queue publication and per-segment compensation without activating HTTP.
   - Route: delegated direct; triggers: new dispatch/compensation behavior and failure/race tests. Exact surfaces to derive before launch.
 - [ ] T4 Pass validated server multipart configuration through HTTP/pipeline options, without client overrides.
@@ -58,7 +62,7 @@ Each unit: `mix format --check-formatted`, `mix credo --strict`, `mix test`, `mi
 RDD is on (global), read-only status confirmed. Each candidate needs its own native assessment/consent; prior omissions do not apply. Native approval is not publication authorization.
 
 ## Progress and next step
-T1A and T1B are ordinary-verified and merged upstream in PR110/111. T2A1 checkpoint extraction is committed locally as `00d8b94` and published in merged PR112; T2A2 settlement is committed locally as `e1f9ad2` and published in merged PR113. Merge evidence is retained in the previous session handoff. Native review was omitted, not approved; last native-reviewed boundary remains `f89b74a`. T2B production wiring is ordinary-verified and committed as `0f221e9`; native review was omitted for this candidate with validated decline, not approval. PR114 merged at `bd4f188`. T2C-1 inert wait transport is implemented on this stacked-to-main slice; T2C-2 WorkQueue wiring remains pending. T3–T5 are untouched. HTTP multipart remains inactive. Full mirror is parent-owned.
+T1A and T1B are ordinary-verified and merged upstream in PR110/111. T2A1 checkpoint extraction is committed locally as `00d8b94` and published in merged PR112; T2A2 settlement is committed locally as `e1f9ad2` and published in merged PR113. Merge evidence is retained in the previous session handoff. Native review was omitted, not approved; last native-reviewed boundary remains `f89b74a`. T2B production wiring is ordinary-verified and committed as `0f221e9`; native review was omitted for this candidate with validated decline, not approval. PR114 merged at `bd4f188`. T2C-1 inert wait transport is published as PR115 merged at `4cfd298`. T2C-2 WorkQueue wiring is ordinary-verified on this stacked-to-main slice; native assessment and publication pending. T3–T5 are untouched. HTTP multipart remains inactive. Full mirror is parent-owned. No future pushes.
 
 Full T1 observed (kept as the complete T1 evidence, not an intermediate proof):
 - RED: focused three-file command → 79/96 passed, 17 failed (seed 241261).
@@ -90,6 +94,12 @@ T2C-1 observed (inert direct API; production MT retries remain immediate):
 - GREEN: same command → 77 passed in 1.4s (seed 72733). Final focused 77 passed (seed 701188).
 - Closure: `mix format --check-formatted` passed; `mix credo --strict` no issues; full suite 889 passed (1 doctest, 888 tests), 30 excluded (`:compatibility`, `:integration`); Dialyzer 0 errors.
 - Runtime: local pinned `rabbitmq:4.3.4` already present; `mix test --include integration test/jasmin_ex/messaging/rabbit_mq/e2e_test.exs` → 10 passed in 96.6s (seed 827909). Direct `publish_retry` wait declare accepted, classic redeclare 406, work empty before TTL, same attempt 2 after ~5s. Exhausted worker retries stay immediate at the default timeout. HTTP remains inactive.
+
+T2C-2 observed (WorkQueue wires wait primitive; production safe MT retries delay 5s):
+- RED: focused publisher/work-queue/worker tests → 73/83 passed, 10 failed (seed 295232). Failures were immediate classic `publish` versus expected `publish_retry`, not compile errors.
+- GREEN: same command → 83 passed in 1.4s (seed 819368). Final focused 83 passed (seed 956695).
+- Closure: `mix format --check-formatted` passed; `mix credo --strict` no issues; full suite 895 passed (1 doctest, 894 tests), 30 excluded (`:compatibility`, `:integration`); Dialyzer 0 errors.
+- Runtime: local pinned `rabbitmq:4.3.4@sha256:4b336f82e93749f1ebf8d6283b4d5a98bf1efac8412ec56015a6ab5aae0f57a2` already present; `mix test --include integration test/jasmin_ex/messaging/rabbit_mq/e2e_test.exs` → 10 passed in 107.0s (seed 908397). Exhausted worker retries wait `2 * Client.wait_queue_ttl_ms() + 5000`. Direct `publish_retry` wait API from T2C-1 remains. Independent probe (not this e2e): absent work target can leave RabbitMQ total messages 1 with ready 0; destination recreation is not proven as an immediate or eventual handoff. HTTP remains inactive. Not exactly-once.
 
 T2A1 historical first proof (committed `00d8b94`; native omitted `declined_this_candidate`, not approved):
 - Index path only: `lib/jasmin_ex/messaging/rabbit_mq/connector_worker.ex`, 9 insertions / 3 deletions, blob `7cbe9ee119691eb5bf8069030c929acfe59902fc`.

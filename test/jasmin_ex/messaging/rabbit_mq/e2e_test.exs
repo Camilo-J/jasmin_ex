@@ -85,7 +85,9 @@ defmodule JasminEx.Messaging.RabbitMQ.E2ETest do
     publish_envelope!(stack, "gw-retry")
     stack = bind_client!(stack)
 
-    assert {:basic_deliver, payload, _} = await_deliver(stack, quarantine_name(stack))
+    assert {:basic_deliver, payload, _} =
+             await_deliver(stack, quarantine_name(stack), 2 * Client.wait_queue_ttl_ms() + 5_000)
+
     assert {:ok, quarantined} = Envelope.decode(payload)
     assert quarantined.gateway_id == "gw-retry"
     assert quarantined.attempt == 3
