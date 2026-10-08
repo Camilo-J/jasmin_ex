@@ -5,6 +5,7 @@ defmodule JasminEx.Routing.State do
   alias JasminEx.Billing.Bill
   alias JasminEx.Billing.Clock
   alias JasminEx.Billing.Reservation
+  alias JasminEx.Billing.SegmentDispatch
   alias JasminEx.Billing.SegmentLedger
   alias JasminEx.Billing.Settlement
   alias JasminEx.Billing.Tombstone
@@ -18,7 +19,8 @@ defmodule JasminEx.Routing.State do
             routes: %RouteTable{},
             revision: 0,
             reservations: %{},
-            tombstones: %{}
+            tombstones: %{},
+            segment_dispatches: %{}
 
   @type t :: %__MODULE__{
           groups: %{optional(String.t()) => Group.t()},
@@ -26,7 +28,8 @@ defmodule JasminEx.Routing.State do
           routes: RouteTable.t(),
           revision: non_neg_integer(),
           reservations: %{optional(binary()) => Reservation.t()},
-          tombstones: %{optional(binary()) => Tombstone.t()}
+          tombstones: %{optional(binary()) => Tombstone.t()},
+          segment_dispatches: %{optional(binary()) => SegmentDispatch.t()}
         }
 
   @spec new() :: t()
@@ -155,6 +158,22 @@ defmodule JasminEx.Routing.State do
 
   def admit_segments(%__MODULE__{}, _admission, _clock), do: {:error, :invalid_bill_id}
 
+  @spec admit_segments_with_dispatch(t(), term(), term(), Clock.clock()) ::
+          {:ok, t()} | {:ok, :duplicate} | {:error, atom()}
+  def admit_segments_with_dispatch(
+        %__MODULE__{} = state,
+        %Admission{bill: %Bill{}} = admission,
+        children,
+        clock
+      ) do
+    with {:ok, dispatch} <- SegmentDispatch.plan(admission.bill, children) do
+      replay_or_admit(state, admission, dispatch, clock)
+    end
+  end
+
+  def admit_segments_with_dispatch(%__MODULE__{}, _admission, _children, _clock),
+    do: {:error, :invalid_bill_id}
+
   @spec settle(t(), term()) ::
           {:ok, t()} | {:ok, :duplicate} | {:ok, :late_ignored} | {:error, atom()}
   def settle(%__MODULE__{} = state, %Settlement{bill_id: bill_id} = settlement) do
@@ -206,6 +225,64 @@ defmodule JasminEx.Routing.State do
   defp drop_group(state, {%Group{gid: gid}, groups}) do
     users = Map.reject(state.users, fn {_uid, user} -> user.gid == gid end)
     {:ok, %{state | groups: groups, users: users}}
+  end
+
+  defp put_dispatch(state, %SegmentDispatch{bill_id: bill_id} = dispatch) do
+    %{state | segment_dispatches: Map.put(state.segment_dispatches, bill_id, dispatch)}
+  end
+
+  defp replay_or_admit(
+         state,
+         %Admission{bill: %Bill{bill_id: bill_id}} = admission,
+         dispatch,
+         clock
+       ) do
+    case {Map.get(state.tombstones, bill_id), Map.get(state.reservations, bill_id),
+          Map.get(state.segment_dispatches, bill_id)} do
+      {%Tombstone{}, _reservation, _existing} ->
+        {:error, :billing_conflict}
+
+      {_stone, %Reservation{} = reservation, %SegmentDispatch{} = existing} ->
+        replay_dispatch(reservation, existing, admission, dispatch)
+
+      {_stone, %Reservation{}, _existing} ->
+        {:error, :billing_conflict}
+
+      {_stone, _reservation, %SegmentDispatch{}} ->
+        {:error, :billing_conflict}
+
+      {nil, nil, nil} ->
+        admit_new_dispatch(state, admission, dispatch, clock)
+    end
+  end
+
+  defp replay_dispatch(reservation, existing, admission, dispatch) do
+    case Reservation.classify(reservation, admission) do
+      {:ok, :duplicate, _bill, _fingerprint} ->
+        if SegmentDispatch.same_bound_plan?(existing, dispatch) do
+          {:ok, :duplicate}
+        else
+          {:error, :billing_conflict}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp admit_new_dispatch(state, admission, dispatch, clock) do
+    with {:ok, admitted} <- admit_segments(state, admission, clock),
+         {:ok, reservation} <- fetch_reservation(admitted, dispatch.bill_id),
+         {:ok, dispatch} <- SegmentDispatch.bind(dispatch, reservation) do
+      {:ok, put_dispatch(admitted, dispatch)}
+    end
+  end
+
+  defp fetch_reservation(state, bill_id) do
+    case Map.fetch(state.reservations, bill_id) do
+      {:ok, reservation} -> {:ok, reservation}
+      :error -> {:error, :inconsistent_admission}
+    end
   end
 
   defp admit_with(state, %Admission{bill: %Bill{} = bill} = admission, clock, opener) do

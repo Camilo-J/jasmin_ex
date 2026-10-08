@@ -1,7 +1,14 @@
 defmodule JasminEx.Routing.Snapshot do
   @moduledoc false
 
-  alias JasminEx.Billing.{Clock, Fingerprint, Reservation, SegmentLedger, Tombstone}
+  alias JasminEx.Billing.{
+    Clock,
+    Fingerprint,
+    Reservation,
+    SegmentDispatch,
+    SegmentLedger,
+    Tombstone
+  }
 
   alias JasminEx.Routing.{
     Config,
@@ -63,14 +70,15 @@ defmodule JasminEx.Routing.Snapshot do
 
   defp encode(state) do
     %{
-      "version" => 5,
+      "version" => 6,
       "revision" => state.revision,
       "groups" =>
         Enum.map(Map.values(state.groups), &%{"gid" => &1.gid, "enabled" => &1.enabled}),
       "users" => Enum.map(Map.values(state.users), &encode_user/1),
       "routes" => Enum.map(Map.values(state.routes.routes), &encode_route/1),
       "reservations" => Enum.map(Map.values(state.reservations), &encode_reservation/1),
-      "tombstones" => Enum.map(Map.values(state.tombstones), &encode_tombstone/1)
+      "tombstones" => Enum.map(Map.values(state.tombstones), &encode_tombstone/1),
+      "segment_dispatches" => Enum.map(Map.values(state.segment_dispatches), &encode_dispatch/1)
     }
   end
 
@@ -131,7 +139,7 @@ defmodule JasminEx.Routing.Snapshot do
     _error -> {:error, :invalid_json}
   end
 
-  defp version(%{"version" => version}) when version in [1, 2, 3, 4, 5], do: :ok
+  defp version(%{"version" => version}) when version in [1, 2, 3, 4, 5, 6], do: :ok
   defp version(%{"version" => _version}), do: {:error, :unsupported_version}
   defp version(_map), do: {:error, :invalid_json}
 
@@ -162,10 +170,10 @@ defmodule JasminEx.Routing.Snapshot do
            "routes" => routes,
            "reservations" => reservations,
            "tombstones" => tombstones
-         },
+         } = map,
          clock
        )
-       when version in [2, 3, 4, 5] and is_integer(rev) and rev >= 0 and is_list(groups) and
+       when version in [2, 3, 4, 5, 6] and is_integer(rev) and rev >= 0 and is_list(groups) and
               is_list(users) and is_list(routes) and is_list(reservations) and
               is_list(tombstones) do
     with {:ok, state} <- reduce_state(State.new(), groups, &load_group/2),
@@ -174,7 +182,9 @@ defmodule JasminEx.Routing.Snapshot do
          {:ok, state} <-
            reduce_state(state, reservations, &load_reservation(&1, &2, clock, version)),
          {:ok, state} <- reduce_state(state, tombstones, &load_tombstone/2),
-         do: {:ok, %{state | revision: rev}}
+         {:ok, state} <- load_dispatches(state, map, version) do
+      {:ok, %{state | revision: rev}}
+    end
   end
 
   defp load(_map, _clock), do: {:error, :invalid_state}
@@ -183,6 +193,7 @@ defmodule JasminEx.Routing.Snapshot do
   defp user_loader(3), do: &load_user_v3/2
   defp user_loader(4), do: &load_user_v4/2
   defp user_loader(5), do: &load_user_v4/2
+  defp user_loader(6), do: &load_user_v4/2
 
   defp reduce_state(state, items, fun) do
     Enum.reduce_while(items, {:ok, state}, fn item, {:ok, acc} ->
@@ -341,6 +352,29 @@ defmodule JasminEx.Routing.Snapshot do
     }
   end
 
+  defp encode_dispatch(%SegmentDispatch{} = dispatch) do
+    %{
+      "bill_id" => dispatch.bill_id,
+      "fingerprint" => encode_fingerprint(dispatch.fingerprint),
+      "count" => dispatch.count,
+      "phase" => encode_dispatch_phase(dispatch.phase),
+      "stop_outcome" => encode_stop_outcome(dispatch.stop_outcome),
+      "children" => Enum.map(dispatch.children, &encode_dispatch_child/1)
+    }
+  end
+
+  defp encode_dispatch_phase(phase), do: Atom.to_string(phase)
+  defp encode_stop_outcome(nil), do: :null
+  defp encode_stop_outcome(outcome), do: Atom.to_string(outcome)
+
+  defp encode_dispatch_child(%SegmentDispatch.Child{} = child) do
+    %{
+      "gateway_id" => child.gateway_id,
+      "payload_hash" => Base.encode64(child.payload_hash),
+      "status" => Atom.to_string(child.status)
+    }
+  end
+
   defp encode_fingerprint(%Fingerprint{version: 1, digest: digest}) do
     %{"version" => 1, "digest" => Base.encode64(digest)}
   end
@@ -448,7 +482,10 @@ defmodule JasminEx.Routing.Snapshot do
   defp load_reservation(_state, _attrs, _clock, _version), do: {:error, :invalid_state}
 
   defp decode_reservation_ledger(_attrs, version) when version in [2, 3, 4], do: {:ok, nil}
-  defp decode_reservation_ledger(attrs, 5), do: decode_ledger(Map.get(attrs, "ledger"))
+
+  defp decode_reservation_ledger(attrs, version) when version in [5, 6],
+    do: decode_ledger(Map.get(attrs, "ledger"))
+
   defp decode_reservation_ledger(_attrs, _version), do: {:error, :invalid_state}
 
   defp decode_ledger(nil), do: {:ok, nil}
@@ -575,6 +612,135 @@ defmodule JasminEx.Routing.Snapshot do
   defp unique_bill?(state, bill_id) do
     not Map.has_key?(state.reservations, bill_id) and not Map.has_key?(state.tombstones, bill_id)
   end
+
+  defp load_dispatches(state, _map, version) when version in [2, 3, 4, 5], do: {:ok, state}
+
+  defp load_dispatches(state, %{"segment_dispatches" => dispatches}, 6)
+       when is_list(dispatches) do
+    reduce_state(state, dispatches, &load_dispatch/2)
+  end
+
+  defp load_dispatches(_state, _map, 6), do: {:error, :invalid_state}
+
+  defp load_dispatch(state, attrs) when is_map(attrs) do
+    with {:ok, dispatch} <- decode_dispatch(attrs),
+         true <- unique_dispatch?(state, dispatch.bill_id),
+         :ok <- match_dispatch_anchor(state, dispatch) do
+      {:ok,
+       %{
+         state
+         | segment_dispatches: Map.put(state.segment_dispatches, dispatch.bill_id, dispatch)
+       }}
+    else
+      _error -> {:error, :invalid_state}
+    end
+  end
+
+  defp load_dispatch(_state, _attrs), do: {:error, :invalid_state}
+
+  defp unique_dispatch?(state, bill_id), do: not Map.has_key?(state.segment_dispatches, bill_id)
+
+  defp match_dispatch_anchor(state, dispatch) do
+    case {Map.get(state.reservations, dispatch.bill_id),
+          Map.get(state.tombstones, dispatch.bill_id)} do
+      {%Reservation{} = reservation, nil} ->
+        compatible_dispatch(dispatch, reservation)
+
+      {nil, %Tombstone{} = stone} ->
+        compatible_dispatch(dispatch, stone)
+
+      _other ->
+        {:error, :invalid_state}
+    end
+  end
+
+  defp compatible_dispatch(dispatch, anchor) do
+    if SegmentDispatch.compatible?(dispatch, anchor), do: :ok, else: {:error, :invalid_state}
+  end
+
+  defp decode_dispatch(%{
+         "bill_id" => bill_id,
+         "fingerprint" => fingerprint,
+         "count" => count,
+         "phase" => phase,
+         "stop_outcome" => stop_outcome,
+         "children" => children
+       })
+       when is_list(children) do
+    with {:ok, fingerprint} <- decode_fingerprint(fingerprint),
+         {:ok, phase} <- decode_dispatch_phase(phase),
+         {:ok, stop_outcome} <- decode_stop_outcome(stop_outcome),
+         {:ok, children} <- decode_dispatch_children(children) do
+      case SegmentDispatch.new(
+             bill_id: bill_id,
+             fingerprint: fingerprint,
+             count: count,
+             phase: phase,
+             stop_outcome: stop_outcome,
+             children: children
+           ) do
+        {:ok, dispatch} -> {:ok, dispatch}
+        _error -> {:error, :invalid_state}
+      end
+    else
+      _error -> {:error, :invalid_state}
+    end
+  end
+
+  defp decode_dispatch(_attrs), do: {:error, :invalid_state}
+
+  defp decode_dispatch_phase("planned"), do: {:ok, :planned}
+  defp decode_dispatch_phase("dispatching"), do: {:ok, :dispatching}
+  defp decode_dispatch_phase("stopped"), do: {:ok, :stopped}
+  defp decode_dispatch_phase(_phase), do: {:error, :invalid_state}
+
+  defp decode_stop_outcome(:null), do: {:ok, nil}
+  defp decode_stop_outcome("rejected"), do: {:ok, :rejected}
+  defp decode_stop_outcome("uncertain"), do: {:ok, :uncertain}
+  defp decode_stop_outcome("unattempted"), do: {:ok, :unattempted}
+  defp decode_stop_outcome(_outcome), do: {:error, :invalid_state}
+
+  defp decode_dispatch_children(children) do
+    decoded = Enum.map(children, &decode_dispatch_child/1)
+
+    if Enum.all?(decoded, &match?({:ok, _}, &1)) do
+      {:ok, Enum.map(decoded, fn {:ok, child} -> child end)}
+    else
+      {:error, :invalid_state}
+    end
+  end
+
+  defp decode_dispatch_child(%{
+         "gateway_id" => gateway_id,
+         "payload_hash" => payload_hash,
+         "status" => status
+       }) do
+    with {:ok, payload_hash} <- decode_payload_hash(payload_hash),
+         {:ok, status} <- decode_child_status(status) do
+      {:ok, %{gateway_id: gateway_id, payload_hash: payload_hash, status: status}}
+    else
+      _error -> {:error, :invalid_state}
+    end
+  end
+
+  defp decode_dispatch_child(_attrs), do: {:error, :invalid_state}
+
+  defp decode_payload_hash(encoded) when is_binary(encoded) do
+    with {:ok, raw} <- Base.decode64(encoded),
+         true <- byte_size(raw) == 32 do
+      {:ok, raw}
+    else
+      _error -> {:error, :invalid_state}
+    end
+  end
+
+  defp decode_payload_hash(_encoded), do: {:error, :invalid_state}
+
+  defp decode_child_status("unattempted"), do: {:ok, :unattempted}
+  defp decode_child_status("claimed"), do: {:ok, :claimed}
+  defp decode_child_status("queued"), do: {:ok, :queued}
+  defp decode_child_status("failed"), do: {:ok, :failed}
+  defp decode_child_status(_status), do: {:error, :invalid_state}
 
   defp decode_bill_id(id)
        when is_binary(id) and byte_size(id) > 0 and byte_size(id) <= @max_id_bytes,
