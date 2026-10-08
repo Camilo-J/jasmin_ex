@@ -81,16 +81,17 @@ pinned durable/restart harness retains a complete metric baseline.
 | Wait | `jasmin.work-retry.<connector_id>.wait` |
 | Quarantine | `jasmin.work.<connector_id>.quarantine` |
 
-`Publisher.publish_retry/3` is a direct primitive onto a durable quorum
-wait queue named `<work-prefix>-retry.<connector_id>.wait`, with a fixed
-5000 ms TTL, reject-publish overflow, default DLX, and at-least-once
-dead-lettering to the existing classic work queue. Ordinary publish stays
-classic for every connector id, including `foo.wait`, `foo.quarantine`,
-and `retry.foo`. Production MT retries remain immediate until WorkQueue
-wiring. Broker forwarding may duplicate; this is not exactly-once
-delivery. An absent work target can keep the expired copy on the wait
-queue (RabbitMQ total messages remain 1 while the ready count is 0); a
-later target recreate is not proven here as an immediate handoff.
+Safe retries use an explicit retry publish onto the wait queue, a durable
+quorum queue with a fixed 5000 ms message TTL. The wait name is
+`<work-prefix>-retry.<connector_id>.wait` so it never overlaps a connector
+whose id ends in `.wait`. Expired copies dead-letter at-least-once onto
+the existing classic work queue. Ordinary publish stays classic for every
+connector id, including `foo.wait`, `foo.quarantine`, and `retry.foo`.
+Work and quarantine declarations stay classic and are unchanged. Broker
+forwarding may duplicate; this is not exactly-once delivery. An absent
+work target can keep the expired copy on the wait queue (RabbitMQ total
+messages remain 1 while the ready count is 0); a later target recreate
+is not proven here as an immediate handoff.
 
 ### Quarantine ownership
 

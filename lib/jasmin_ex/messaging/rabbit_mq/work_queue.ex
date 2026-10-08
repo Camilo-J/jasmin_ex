@@ -30,8 +30,7 @@ defmodule JasminEx.Messaging.RabbitMQ.WorkQueue do
 
   def retry(context, %Delivery{envelope: envelope, reference: tag}, _evidence) do
     with {:ok, next} <- increment(envelope),
-         {:ok, payload} <- Envelope.encode(next),
-         :ok <- publish(context, next.connector_id, payload) do
+         :ok <- delayed_publish(context, next) do
       client(context).ack(channel(context), tag)
     end
   end
@@ -45,11 +44,17 @@ defmodule JasminEx.Messaging.RabbitMQ.WorkQueue do
   end
 
   def republish(action), do: republish(%{publisher: Publisher}, action)
-  def republish(context, {:retry, envelope}), do: enqueue(context, envelope)
+  def republish(context, {:retry, envelope}), do: delayed_publish(context, envelope)
 
   def republish(context, {:quarantine, envelope, evidence}) do
     with {:ok, payload} <- Envelope.encode(envelope) do
       publish(context, envelope.connector_id <> ".quarantine", with_ev(payload, evidence))
+    end
+  end
+
+  defp delayed_publish(context, envelope) do
+    with {:ok, payload} <- Envelope.encode(envelope) do
+      publish_retry(context, envelope.connector_id, payload)
     end
   end
 
@@ -58,6 +63,12 @@ defmodule JasminEx.Messaging.RabbitMQ.WorkQueue do
 
   defp publish(%{publisher: server}, connector_id, payload),
     do: Publisher.publish(server, connector_id, payload)
+
+  defp publish_retry(%{publisher: {module, server}}, connector_id, payload),
+    do: module.publish_retry(server, connector_id, payload)
+
+  defp publish_retry(%{publisher: server}, connector_id, payload),
+    do: Publisher.publish_retry(server, connector_id, payload)
 
   defp client(%{client: client}), do: client
   defp channel(%{channel: channel}), do: channel

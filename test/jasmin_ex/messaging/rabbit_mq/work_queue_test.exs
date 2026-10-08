@@ -11,12 +11,70 @@ defmodule JasminEx.Messaging.RabbitMQ.WorkQueueTest do
       Agent.update(agent, &[{:publish, connector_id, payload} | &1])
       :ok
     end
+
+    def publish_retry(agent, connector_id, payload) do
+      Agent.update(agent, &[{:publish_retry, connector_id, payload} | &1])
+      :ok
+    end
   end
 
   defmodule FailingPublisher do
     def publish(agent, connector_id, payload) do
       Agent.update(agent, &[{:publish, connector_id, payload} | &1])
       {:error, :timeout}
+    end
+
+    def publish_retry(agent, connector_id, payload) do
+      Agent.update(agent, &[{:publish_retry, connector_id, payload} | &1])
+      {:error, :timeout}
+    end
+  end
+
+  defmodule NackPublisher do
+    def publish(agent, connector_id, payload) do
+      Agent.update(agent, &[{:publish, connector_id, payload} | &1])
+      {:error, :non_ok}
+    end
+
+    def publish_retry(agent, connector_id, payload) do
+      Agent.update(agent, &[{:publish_retry, connector_id, payload} | &1])
+      {:error, :non_ok}
+    end
+  end
+
+  defmodule AmbiguousPublisher do
+    def publish(agent, connector_id, payload) do
+      Agent.update(agent, &[{:publish, connector_id, payload} | &1])
+      {:ambiguous, :timeout}
+    end
+
+    def publish_retry(agent, connector_id, payload) do
+      Agent.update(agent, &[{:publish_retry, connector_id, payload} | &1])
+      {:ambiguous, :timeout}
+    end
+  end
+
+  defmodule ClosedPublisher do
+    def publish(agent, connector_id, payload) do
+      Agent.update(agent, &[{:publish, connector_id, payload} | &1])
+      {:ambiguous, :channel_closed}
+    end
+
+    def publish_retry(agent, connector_id, payload) do
+      Agent.update(agent, &[{:publish_retry, connector_id, payload} | &1])
+      {:ambiguous, :channel_closed}
+    end
+  end
+
+  defmodule DeclareFailPublisher do
+    def publish(agent, connector_id, payload) do
+      Agent.update(agent, &[{:publish, connector_id, payload} | &1])
+      {:error, :incompatible_queue_arguments}
+    end
+
+    def publish_retry(agent, connector_id, payload) do
+      Agent.update(agent, &[{:publish_retry, connector_id, payload} | &1])
+      {:error, :incompatible_queue_arguments}
     end
   end
 
@@ -70,7 +128,7 @@ defmodule JasminEx.Messaging.RabbitMQ.WorkQueueTest do
     assert :ok = WorkQueue.quarantine(queue, delivery, %{stage: :post_write, reason: :bind_lost})
 
     assert [
-             {:publish, "alpha", retry_payload},
+             {:publish_retry, "alpha", retry_payload},
              {:ack, 4},
              {:publish, "alpha.quarantine", quarantine_payload},
              {:ack, 4}
@@ -95,7 +153,7 @@ defmodule JasminEx.Messaging.RabbitMQ.WorkQueueTest do
     assert {:error, :timeout} =
              WorkQueue.retry({Adapter, context(fail_agent, FailingPublisher)}, fail_delivery, %{})
 
-    assert [{:publish, "alpha", _}] = events(fail_agent)
+    assert [{:publish_retry, "alpha", _}] = events(fail_agent)
 
     assert :ok = Adapter.republish(context(agent, FakePublisher), {:retry, envelope})
   end
@@ -119,7 +177,7 @@ defmodule JasminEx.Messaging.RabbitMQ.WorkQueueTest do
 
     assert [
              {:publish, "alpha", _enqueued},
-             {:publish, "alpha", retry_payload},
+             {:publish_retry, "alpha", retry_payload},
              {:ack, 7},
              {:publish, "alpha.quarantine", quarantine_payload},
              {:ack, 7}
@@ -156,7 +214,7 @@ defmodule JasminEx.Messaging.RabbitMQ.WorkQueueTest do
     {queue, agent, _fresh} = start_queue()
     delivery = %Delivery{envelope: envelope, reference: 3}
     assert :ok = WorkQueue.retry(queue, delivery, %{stage: :pre_write})
-    assert [{:publish, "alpha", retry_payload}, {:ack, 3}] = events(agent)
+    assert [{:publish_retry, "alpha", retry_payload}, {:ack, 3}] = events(agent)
     wire = :json.decode(retry_payload)
     assert wire["version"] === 2
     refute Map.has_key?(wire["submit_sm"], "short_message")
@@ -196,7 +254,7 @@ defmodule JasminEx.Messaging.RabbitMQ.WorkQueueTest do
 
     assert [
              {:publish, "alpha", _enqueued},
-             {:publish, "alpha", retry_payload},
+             {:publish_retry, "alpha", retry_payload},
              {:ack, 8},
              {:publish, "alpha.quarantine", quarantine_payload},
              {:ack, 8}
@@ -262,7 +320,7 @@ defmodule JasminEx.Messaging.RabbitMQ.WorkQueueTest do
 
     assert [
              {:publish, "alpha", _enqueued},
-             {:publish, "alpha", retry_payload},
+             {:publish_retry, "alpha", retry_payload},
              {:ack, 8},
              {:publish, "alpha.quarantine", quarantine_payload},
              {:ack, 8}
@@ -336,7 +394,7 @@ defmodule JasminEx.Messaging.RabbitMQ.WorkQueueTest do
 
     assert [
              {:publish, "alpha", _enqueued},
-             {:publish, "alpha", retry_payload},
+             {:publish_retry, "alpha", retry_payload},
              {:ack, 8},
              {:publish, "alpha.quarantine", quarantine_payload},
              {:ack, 8}
@@ -363,6 +421,93 @@ defmodule JasminEx.Messaging.RabbitMQ.WorkQueueTest do
              "reason" => "bind_lost",
              "stage" => "post_write"
            }
+  end
+
+  test "retry publishes once to wait then acks and preserves identity" do
+    {queue, agent, envelope} = start_queue()
+    delivery = %Delivery{envelope: envelope, reference: 4}
+    assert :ok = WorkQueue.retry(queue, delivery, %{stage: :pre_write})
+
+    assert [{:publish_retry, "alpha", retry_payload}, {:ack, 4}] = events(agent)
+    assert {:ok, retried} = Envelope.decode(retry_payload)
+    assert retried.attempt == 2
+    assert retried.max_attempts == envelope.max_attempts
+    assert retried.gateway_id == envelope.gateway_id
+    assert retried.connector_id == envelope.connector_id
+    assert retried.submit_sm == envelope.submit_sm
+  end
+
+  test "republish retry does not increment an already incremented envelope" do
+    {_queue, agent, envelope} = start_queue()
+    {:ok, next} = Envelope.retry(envelope)
+    assert next.attempt == 2
+    assert :ok = Adapter.republish(context(agent, FakePublisher), {:retry, next})
+    assert [{:publish_retry, "alpha", payload}] = events(agent)
+    assert {:ok, retried} = Envelope.decode(payload)
+    assert retried.attempt == 2
+    assert retried.gateway_id == envelope.gateway_id
+    assert retried.connector_id == envelope.connector_id
+    assert retried.submit_sm == envelope.submit_sm
+  end
+
+  test "does not ack the source when wait publication is not confirmed" do
+    for {publisher, expected} <- [
+          {FailingPublisher, {:error, :timeout}},
+          {NackPublisher, {:error, :non_ok}},
+          {AmbiguousPublisher, {:ambiguous, :timeout}},
+          {ClosedPublisher, {:ambiguous, :channel_closed}},
+          {DeclareFailPublisher, {:error, :incompatible_queue_arguments}}
+        ] do
+      {queue, agent, envelope} = start_queue(publisher)
+      delivery = %Delivery{envelope: envelope, reference: 5}
+      assert expected == WorkQueue.retry(queue, delivery, %{stage: :pre_write})
+      assert [{:publish_retry, "alpha", payload}] = events(agent)
+      assert {:ok, retried} = Envelope.decode(payload)
+      assert retried.attempt == 2
+      refute Enum.any?(events(agent), &match?({:ack, _}, &1))
+    end
+  end
+
+  test "enqueue and quarantine keep immediate classic destinations" do
+    {queue, agent, envelope} = start_queue()
+    delivery = %Delivery{envelope: envelope, reference: 9}
+    assert :ok = WorkQueue.enqueue(queue, envelope)
+    assert :ok = WorkQueue.quarantine(queue, delivery, %{stage: :post_write, reason: :bind_lost})
+
+    assert [
+             {:publish, "alpha", enqueued},
+             {:publish, "alpha.quarantine", quarantined},
+             {:ack, 9}
+           ] = events(agent)
+
+    assert {:ok, ^envelope} = Envelope.decode(enqueued)
+    assert {:ok, ^envelope} = Envelope.decode(quarantined)
+  end
+
+  test "enqueue of a connector id ending in .wait uses classic publish" do
+    {:ok, agent} = Agent.start_link(fn -> [] end)
+    {:ok, envelope} = valid_envelope("hello", nil)
+    envelope = %{envelope | connector_id: "foo.wait"}
+    queue = {Adapter, context(agent, FakePublisher)}
+    assert :ok = WorkQueue.enqueue(queue, envelope)
+    assert [{:publish, "foo.wait", payload}] = events(agent)
+    assert {:ok, ^envelope} = Envelope.decode(payload)
+    refute Enum.any?(events(agent), &match?({:publish_retry, _, _}, &1))
+  end
+
+  test "retry of a connector id ending in .wait does not rewrite the id onto .wait" do
+    {:ok, agent} = Agent.start_link(fn -> [] end)
+    {:ok, envelope} = valid_envelope("hello", nil)
+    envelope = %{envelope | connector_id: "foo.wait"}
+    queue = {Adapter, context(agent, FakePublisher)}
+    delivery = %Delivery{envelope: envelope, reference: 4}
+    assert :ok = WorkQueue.retry(queue, delivery, %{stage: :pre_write})
+    assert [{:publish_retry, "foo.wait", retry_payload}, {:ack, 4}] = events(agent)
+    assert {:ok, retried} = Envelope.decode(retry_payload)
+    assert retried.attempt == 2
+    assert retried.connector_id == "foo.wait"
+    refute Enum.any?(events(agent), &match?({:publish, "foo.wait.wait", _}, &1))
+    refute Enum.any?(events(agent), &match?({:publish, "foo.wait", _}, &1))
   end
 
   test "retry overflow returns invalid_envelope without raising" do
