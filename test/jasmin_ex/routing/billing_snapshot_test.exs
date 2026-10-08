@@ -196,7 +196,6 @@ defmodule JasminEx.Routing.BillingSnapshotTest do
               }
             ]
         },
-        %{billed_v6() | "segment_dispatches" => [%{segment_dispatch() | "phase" => "closed"}]},
         %{billed_v6() | "segment_dispatches" => [%{segment_dispatch() | "phase" => "accepted"}]},
         %{
           billed_v6()
@@ -260,6 +259,29 @@ defmodule JasminEx.Routing.BillingSnapshotTest do
              state.tombstones["bill-t"].fingerprint
 
     refute Map.has_key?(state.reservations, "bill-t")
+  end
+
+  test "v6 closed checkpoint restores without changing balances or child hashes", %{tmp_dir: dir} do
+    billed =
+      billed_v6_two([
+        child_json("gw-a", <<2::256>>, "queued"),
+        child_json("gw-b", <<3::256>>, "unattempted")
+      ])
+      |> put_in(["segment_dispatches", Access.at(0), "phase"], "closed")
+      |> put_in(["segment_dispatches", Access.at(0), "stop_outcome"], "uncertain")
+
+    config = write!(dir, billed)
+    assert {:ok, state} = Snapshot.restore(config)
+    dispatch = state.segment_dispatches["bill-1"]
+    assert dispatch.phase == :closed
+    assert dispatch.stop_outcome == :uncertain
+    assert Enum.map(dispatch.children, & &1.status) == [:queued, :unattempted]
+    assert hd(dispatch.children).payload_hash == <<2::256>>
+    assert state.users["u1"].balance_minor == 300
+    assert :ok = Snapshot.write(state, config)
+    assert {:ok, again} = Snapshot.restore(config)
+    assert again.segment_dispatches["bill-1"].phase == :closed
+    assert again.users["u1"].balance_minor == 300
   end
 
   test "malformed v5 ledger and incoherent money fail closed", %{tmp_dir: dir} do

@@ -165,14 +165,6 @@ defmodule JasminEx.Billing.SegmentDispatchTest do
                fingerprint: fingerprint,
                count: 1,
                children: valid_children,
-               phase: :closed
-             ) == {:error, :unsafe_phase}
-
-      assert SegmentDispatch.new(
-               bill_id: "bill-1",
-               fingerprint: fingerprint,
-               count: 1,
-               children: valid_children,
                phase: :accepted
              ) == {:error, :unsafe_phase}
 
@@ -316,6 +308,20 @@ defmodule JasminEx.Billing.SegmentDispatchTest do
                actions ++ SegmentDispatch.recovery_actions(only_claimed),
                &(&1.action in [:republish, :accepted])
              )
+    end
+
+    test "close keeps reachable children and refuses further claims" do
+      dispatch = planned_dispatch(2)
+      {:ok, claimed} = SegmentDispatch.claim(dispatch, "gw-a")
+      {:ok, queued} = SegmentDispatch.confirm_queued(claimed, "gw-a")
+      {:ok, closed} = SegmentDispatch.close(queued, :uncertain)
+
+      assert closed.phase == :closed
+      assert closed.stop_outcome == :uncertain
+      assert statuses(closed) == [:queued, :unattempted]
+      assert {:ok, ^closed} = SegmentDispatch.new(attrs_from(closed))
+      assert {:ok, ^closed} = SegmentDispatch.close(closed, :uncertain)
+      assert {:error, :unsafe_phase} = SegmentDispatch.claim(closed, "gw-b")
     end
   end
 
@@ -503,6 +509,105 @@ defmodule JasminEx.Billing.SegmentDispatchTest do
       assert closed.segment_dispatches == %{}
       assert closed.reservations == %{}
       assert closed.users["u1"].balance_minor == 300
+    end
+
+    test "recover refunds unpublished children and closes without republishing" do
+      {state, admission} = fixture(segment_count: 2, submit_quota: 5)
+      children = children_for(admission.bill, ["gw-a", "gw-b"])
+
+      assert {:ok, admitted} =
+               State.admit_segments_with_dispatch(state, admission, children, clock())
+
+      {:ok, claimed} = SegmentDispatch.claim(admitted.segment_dispatches["bill-1"], "gw-a")
+      claimed_state = put_in(admitted.segment_dispatches["bill-1"], claimed)
+
+      assert {:ok, recovered} = State.recover_dispatch(claimed_state, "bill-1")
+      assert recovered.users["u1"].balance_minor == 400
+      assert recovered.users["u1"].submit_quota == 4
+      assert recovered.segment_dispatches["bill-1"].phase == :closed
+      assert recovered.reservations["bill-1"].ledger.outcomes[1] == :uncertain
+      assert recovered.reservations["bill-1"].ledger.outcomes[2] == :rejected
+      assert {:ok, :duplicate} = State.recover_dispatch(recovered, "bill-1")
+      assert recovered.users["u1"].balance_minor == 400
+    end
+
+    test "recover preserves a claimed child already accepted and refunds only the suffix" do
+      {state, admission} = fixture(segment_count: 2, submit_quota: 5)
+      children = children_for(admission.bill, ["gw-a", "gw-b"])
+
+      assert {:ok, admitted} =
+               State.admit_segments_with_dispatch(state, admission, children, clock())
+
+      {:ok, claimed} = SegmentDispatch.claim(admitted.segment_dispatches["bill-1"], "gw-a")
+      claimed_state = put_in(admitted.segment_dispatches["bill-1"], claimed)
+      fingerprint = claimed_state.reservations["bill-1"].fingerprint
+
+      assert {:ok, accepted} =
+               State.settle_segment(claimed_state, "bill-1", fingerprint, 1, :accepted)
+
+      assert accepted.users["u1"].balance_minor == 300
+      assert accepted.reservations["bill-1"].ledger.outcomes[1] == :accepted
+      assert {:ok, recovered} = State.recover_dispatch(accepted, "bill-1")
+      assert recovered.users["u1"].balance_minor == 400
+      assert recovered.users["u1"].submit_quota == 4
+      assert recovered.segment_dispatches["bill-1"].phase == :closed
+      assert recovered.tombstones["bill-1"]
+      refute Map.has_key?(recovered.reservations, "bill-1")
+      assert {:ok, :duplicate} = State.recover_dispatch(recovered, "bill-1")
+      assert recovered.users["u1"].balance_minor == 400
+    end
+
+    test "recover does not duplicate a claimed child already rejected" do
+      {state, admission} = fixture(segment_count: 2, submit_quota: 5)
+      children = children_for(admission.bill, ["gw-a", "gw-b"])
+
+      assert {:ok, admitted} =
+               State.admit_segments_with_dispatch(state, admission, children, clock())
+
+      {:ok, claimed} = SegmentDispatch.claim(admitted.segment_dispatches["bill-1"], "gw-a")
+      claimed_state = put_in(admitted.segment_dispatches["bill-1"], claimed)
+      fingerprint = claimed_state.reservations["bill-1"].fingerprint
+
+      assert {:ok, rejected} =
+               State.settle_segment(claimed_state, "bill-1", fingerprint, 1, :rejected)
+
+      assert rejected.users["u1"].balance_minor == 400
+      assert rejected.reservations["bill-1"].ledger.outcomes[1] == :rejected
+      assert {:ok, recovered} = State.recover_dispatch(rejected, "bill-1")
+      assert recovered.users["u1"].balance_minor == 500
+      assert recovered.users["u1"].submit_quota == 5
+      assert recovered.segment_dispatches["bill-1"].phase == :closed
+      assert {:ok, :duplicate} = State.recover_dispatch(recovered, "bill-1")
+      assert recovered.users["u1"].balance_minor == 500
+    end
+
+    test "recover of a mismatched reservation fingerprint fails closed" do
+      {state, admission} = fixture(segment_count: 2, submit_quota: 5)
+      children = children_for(admission.bill, ["gw-a", "gw-b"])
+
+      assert {:ok, admitted} =
+               State.admit_segments_with_dispatch(state, admission, children, clock())
+
+      {:ok, claimed} = SegmentDispatch.claim(admitted.segment_dispatches["bill-1"], "gw-a")
+      claimed_state = put_in(admitted.segment_dispatches["bill-1"], claimed)
+      {:ok, other_bill} = Bill.new(bill_attrs(segment_count: 2, rate_minor: 50))
+      {:ok, other_fingerprint} = Fingerprint.compute(other_bill)
+
+      mismatched =
+        update_in(claimed_state.reservations["bill-1"], fn reservation ->
+          %{reservation | fingerprint: other_fingerprint}
+        end)
+
+      assert {:error, :billing_conflict} = State.recover_dispatch(mismatched, "bill-1")
+      assert mismatched.users["u1"].balance_minor == 300
+    end
+
+    test "recover of a standalone reservation without a checkpoint does not refund" do
+      {state, admission} = fixture(segment_count: 2, submit_quota: 5)
+      assert {:ok, open} = State.admit_segments(state, admission, clock())
+      assert {:error, :unknown_bill} = State.recover_dispatch(open, "bill-1")
+      assert open.users["u1"].balance_minor == 300
+      assert open.reservations["bill-1"].ledger.outcomes == %{}
     end
   end
 

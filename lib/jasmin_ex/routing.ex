@@ -46,6 +46,36 @@ defmodule JasminEx.Routing do
           | {:error, atom()}
   defdelegate admit_segments(server, admission), to: Router
 
+  @doc """
+  Admit a caller-allocated segment bill and attach a durable publication checkpoint.
+
+  Admission and prepare share one snapshot transaction. A generation token is
+  returned only after durable owned success. Exact bound-plan replay is
+  `{:ok, :duplicate}` without another debit or a new generation.
+  """
+  @spec admit_segments_with_dispatch(GenServer.server(), term(), term()) ::
+          {:ok, JasminEx.Billing.Reservation.t(), reference()}
+          | {:ok, :duplicate}
+          | {:error, atom()}
+  defdelegate admit_segments_with_dispatch(server, admission, children), to: Router
+
+  @spec claim_segment_dispatch(GenServer.server(), term(), term(), term()) ::
+          {:ok, JasminEx.Billing.SegmentDispatch.t()} | {:error, atom()}
+  defdelegate claim_segment_dispatch(server, bill_id, generation, gateway_id), to: Router
+
+  @spec record_segment_dispatch(GenServer.server(), term(), term(), term(), term()) ::
+          {:ok, JasminEx.Billing.Reservation.t() | JasminEx.Billing.Tombstone.t()}
+          | {:ok, :duplicate}
+          | {:error, atom()}
+  defdelegate record_segment_dispatch(server, bill_id, generation, gateway_id, outcome),
+    to: Router
+
+  @spec recover_segment_dispatch(GenServer.server(), term()) ::
+          {:ok, JasminEx.Billing.Reservation.t() | JasminEx.Billing.Tombstone.t()}
+          | {:ok, :duplicate}
+          | {:error, atom()}
+  defdelegate recover_segment_dispatch(server, bill_id), to: Router
+
   @spec settle(GenServer.server(), term()) ::
           {:ok, JasminEx.Billing.Tombstone.t()}
           | {:ok, :duplicate | :late_ignored}

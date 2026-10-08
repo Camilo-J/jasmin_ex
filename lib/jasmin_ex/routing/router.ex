@@ -6,6 +6,7 @@ defmodule JasminEx.Routing.Router do
   alias JasminEx.Billing.Bill
   alias JasminEx.Billing.Fingerprint
   alias JasminEx.Billing.Reservation
+  alias JasminEx.Billing.SegmentDispatch
   alias JasminEx.Billing.Settlement
   alias JasminEx.Billing.Tombstone
   alias JasminEx.Routing.Config
@@ -48,6 +49,30 @@ defmodule JasminEx.Routing.Router do
           | {:error, atom()}
   def admit_segments(server, admission), do: GenServer.call(server, {:admit_segments, admission})
 
+  @spec admit_segments_with_dispatch(GenServer.server(), term(), term()) ::
+          {:ok, Reservation.t(), reference()} | {:ok, :duplicate} | {:error, atom()}
+  def admit_segments_with_dispatch(server, admission, children) do
+    GenServer.call(server, {:admit_segments_with_dispatch, admission, children})
+  end
+
+  @spec claim_segment_dispatch(GenServer.server(), term(), term(), term()) ::
+          {:ok, SegmentDispatch.t()} | {:error, atom()}
+  def claim_segment_dispatch(server, bill_id, generation, gateway_id) do
+    GenServer.call(server, {:claim_segment_dispatch, bill_id, generation, gateway_id})
+  end
+
+  @spec record_segment_dispatch(GenServer.server(), term(), term(), term(), term()) ::
+          {:ok, Reservation.t() | Tombstone.t()} | {:ok, :duplicate} | {:error, atom()}
+  def record_segment_dispatch(server, bill_id, generation, gateway_id, outcome) do
+    GenServer.call(server, {:record_segment_dispatch, bill_id, generation, gateway_id, outcome})
+  end
+
+  @spec recover_segment_dispatch(GenServer.server(), term()) ::
+          {:ok, Reservation.t() | Tombstone.t()} | {:ok, :duplicate} | {:error, atom()}
+  def recover_segment_dispatch(server, bill_id) do
+    GenServer.call(server, {:recover_segment_dispatch, bill_id})
+  end
+
   @spec settle(GenServer.server(), term()) ::
           {:ok, Tombstone.t()} | {:ok, :duplicate | :late_ignored} | {:error, atom()}
   def settle(server, settlement), do: GenServer.call(server, {:settle, settlement})
@@ -89,11 +114,11 @@ defmodule JasminEx.Routing.Router do
     config = Keyword.get(opts, :config) || Config.new()
 
     Process.put({__MODULE__, :config}, config)
+    Process.put({__MODULE__, :owners}, %{})
 
     case Snapshot.restore(config) do
       {:ok, state} ->
-        Telemetry.emit([:snapshot], %{}, %{outcome: :ok})
-        {:ok, state}
+        boot(state, config)
 
       {:error, reason} ->
         Telemetry.emit([:snapshot], %{}, %{outcome: :restore_failed})
@@ -142,6 +167,48 @@ defmodule JasminEx.Routing.Router do
     mutate(state, fn -> admit_change(state, admission, :segments) end)
   end
 
+  def handle_call({:admit_segments_with_dispatch, admission, children}, {pid, _tag}, state) do
+    case mutate(state, fn -> admit_dispatch_change(state, admission, children) end) do
+      {:reply, {:ok, {reservation, dispatch}}, next} ->
+        generation = take_ownership(dispatch.bill_id, pid)
+        {:reply, {:ok, reservation, generation}, next}
+
+      other ->
+        other
+    end
+  end
+
+  def handle_call({:claim_segment_dispatch, bill_id, generation, gateway_id}, {pid, _tag}, state) do
+    case authorize_owner(bill_id, generation, pid) do
+      :ok -> mutate(state, fn -> claim_change(state, bill_id, gateway_id) end)
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call(
+        {:record_segment_dispatch, bill_id, generation, gateway_id, outcome},
+        {pid, _tag},
+        state
+      ) do
+    case authorize_owner(bill_id, generation, pid) do
+      :ok ->
+        finish_record(
+          bill_id,
+          mutate(state, fn -> record_change(state, bill_id, gateway_id, outcome) end)
+        )
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:recover_segment_dispatch, bill_id}, _from, state) do
+    case may_recover(bill_id) do
+      :ok -> finish_recover(bill_id, mutate(state, fn -> recover_change(state, bill_id) end))
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
   def handle_call({:settle, settlement}, _from, state) do
     mutate(state, fn -> settle_change(state, settlement) end)
   end
@@ -185,6 +252,14 @@ defmodule JasminEx.Routing.Router do
   def handle_call(request, _from, state)
       when is_tuple(request) and elem(request, 0) in [:set_balance, :set_quota, :set_rate] do
     {:reply, {:error, :invalid_amount}, state}
+  end
+
+  @impl true
+  def handle_info({:DOWN, ref, :process, pid, _reason}, state) do
+    case owner_by_monitor(ref, pid) do
+      {:ok, bill_id} -> recover_down(state, bill_id)
+      :error -> {:noreply, state}
+    end
   end
 
   defp admit_change(state, %Admission{bill: %Bill{bill_id: bill_id}} = admission, mode) do
@@ -338,6 +413,200 @@ defmodule JasminEx.Routing.Router do
   end
 
   defp publish(state), do: %{state | revision: state.revision + 1}
+
+  defp boot(state, config) do
+    case State.recover_open_dispatches(state) do
+      {:ok, :unchanged} ->
+        Telemetry.emit([:snapshot], %{}, %{outcome: :ok})
+        {:ok, state}
+
+      {:ok, next} ->
+        persist_boot(publish(next), config)
+
+      {:error, reason} ->
+        {:stop, reason}
+    end
+  end
+
+  defp persist_boot(published, config) do
+    case Snapshot.write(published, config) do
+      :ok ->
+        Telemetry.emit([:snapshot], %{}, %{outcome: :ok})
+        {:ok, published}
+
+      {:error, _reason} ->
+        Telemetry.emit([:snapshot], %{}, %{outcome: :snapshot_failed})
+        {:stop, :snapshot_failed}
+    end
+  end
+
+  defp admit_dispatch_change(
+         state,
+         %Admission{bill: %Bill{bill_id: bill_id}} = admission,
+         children
+       ) do
+    case State.admit_segments_with_dispatch(state, admission, children, clock()) do
+      {:ok, :duplicate} ->
+        {:unchanged, {:ok, :duplicate}}
+
+      {:ok, next} ->
+        {:ok, next, {next.reservations[bill_id], next.segment_dispatches[bill_id]}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp admit_dispatch_change(_state, _admission, _children), do: {:error, :invalid_bill_id}
+
+  defp claim_change(state, bill_id, gateway_id) do
+    case State.claim_dispatch(state, bill_id, gateway_id) do
+      {:ok, next} -> {:ok, next, next.segment_dispatches[bill_id]}
+      error -> error
+    end
+  end
+
+  defp record_change(state, bill_id, gateway_id, outcome) do
+    case State.record_dispatch(state, bill_id, gateway_id, outcome) do
+      {:ok, :duplicate} -> {:unchanged, {:ok, :duplicate}}
+      {:ok, next} -> fetch_segment_result(next, bill_id)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp recover_change(state, bill_id) do
+    case State.recover_dispatch(state, bill_id) do
+      {:ok, :duplicate} -> {:unchanged, {:ok, :duplicate}}
+      {:ok, next} -> fetch_segment_result(next, bill_id)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp finish_record(bill_id, {:reply, {:ok, value}, next}) do
+    maybe_drop_closed(next, bill_id)
+    {:reply, {:ok, value}, next}
+  end
+
+  defp finish_record(bill_id, {:reply, {:error, :snapshot_failed}, next}) do
+    fence_owner(bill_id)
+    {:reply, {:error, :snapshot_failed}, next}
+  end
+
+  defp finish_record(_bill_id, other), do: other
+
+  defp finish_recover(bill_id, {:reply, {:ok, value}, next}) do
+    drop_owner(bill_id)
+    {:reply, {:ok, value}, next}
+  end
+
+  defp finish_recover(bill_id, {:reply, {:error, :snapshot_failed}, next}) do
+    fence_owner(bill_id)
+    {:reply, {:error, :snapshot_failed}, next}
+  end
+
+  defp finish_recover(_bill_id, other), do: other
+
+  defp recover_down(state, bill_id) do
+    case recover_change(state, bill_id) do
+      {:unchanged, _reply} ->
+        drop_owner(bill_id)
+        {:noreply, state}
+
+      {:ok, next, _value} ->
+        commit_down(state, bill_id, publish(next))
+
+      {:error, _reason} ->
+        fence_owner(bill_id)
+        {:noreply, state}
+    end
+  end
+
+  defp commit_down(state, bill_id, published) do
+    case Snapshot.write(published, Process.get({__MODULE__, :config})) do
+      :ok ->
+        emit_mutation(:ok, nil, published.revision)
+        Telemetry.emit([:snapshot], %{}, %{outcome: :ok})
+        drop_owner(bill_id)
+        {:noreply, published}
+
+      {:error, _reason} ->
+        emit_mutation(:error, :snapshot_failed, state.revision)
+        Telemetry.emit([:snapshot], %{}, %{outcome: :snapshot_failed})
+        fence_owner(bill_id)
+        {:noreply, state}
+    end
+  end
+
+  defp take_ownership(bill_id, pid) do
+    generation = make_ref()
+    monitor = Process.monitor(pid)
+
+    put_owners(
+      Map.put(owners(), bill_id, %{
+        pid: pid,
+        monitor: monitor,
+        generation: generation,
+        fenced: false
+      })
+    )
+
+    generation
+  end
+
+  defp authorize_owner(bill_id, generation, pid) do
+    case Map.get(owners(), bill_id) do
+      %{generation: ^generation, pid: ^pid, fenced: false} -> :ok
+      %{generation: ^generation, pid: ^pid, fenced: true} -> {:error, :owner_fenced}
+      %{generation: ^generation} -> {:error, :owner_mismatch}
+      %{generation: _other} -> {:error, :generation_mismatch}
+      nil -> {:error, :generation_mismatch}
+    end
+  end
+
+  defp may_recover(bill_id) do
+    case Map.get(owners(), bill_id) do
+      %{pid: pid, fenced: false} ->
+        if Process.alive?(pid), do: {:error, :owner_alive}, else: :ok
+
+      _other ->
+        :ok
+    end
+  end
+
+  defp maybe_drop_closed(state, bill_id) do
+    case Map.get(state.segment_dispatches, bill_id) do
+      %SegmentDispatch{phase: :closed} -> drop_owner(bill_id)
+      _other -> :ok
+    end
+  end
+
+  defp drop_owner(bill_id) do
+    case Map.pop(owners(), bill_id) do
+      {%{monitor: monitor}, rest} ->
+        Process.demonitor(monitor, [:flush])
+        put_owners(rest)
+
+      {nil, rest} ->
+        put_owners(rest)
+    end
+  end
+
+  defp fence_owner(bill_id) do
+    case Map.get(owners(), bill_id) do
+      nil -> :ok
+      owner -> put_owners(Map.put(owners(), bill_id, %{owner | fenced: true}))
+    end
+  end
+
+  defp owner_by_monitor(ref, pid) do
+    Enum.find_value(owners(), :error, fn
+      {bill_id, %{monitor: ^ref, pid: ^pid}} -> {:ok, bill_id}
+      _other -> nil
+    end)
+  end
+
+  defp owners, do: Process.get({__MODULE__, :owners}) || %{}
+  defp put_owners(map), do: Process.put({__MODULE__, :owners}, map)
 
   defp name_opts(nil), do: []
   defp name_opts(name), do: [name: name]

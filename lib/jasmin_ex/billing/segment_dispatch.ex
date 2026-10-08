@@ -28,15 +28,15 @@ defmodule JasminEx.Billing.SegmentDispatch do
                 "payload_hash",
                 "status"
               ])
-  @phases [:planned, :dispatching, :stopped]
+  @phases [:planned, :dispatching, :stopped, :closed]
   @statuses [:unattempted, :claimed, :queued, :failed]
-  @stop_outcomes [:rejected]
+  @stop_outcomes [:rejected, :uncertain]
 
   @enforce_keys [:bill_id, :fingerprint, :count, :children, :phase, :stop_outcome]
   defstruct @enforce_keys
 
-  @type phase :: :planned | :dispatching | :stopped
-  @type stop_outcome :: nil | :rejected
+  @type phase :: :planned | :dispatching | :stopped | :closed
+  @type stop_outcome :: nil | :rejected | :uncertain
   @type recovery_action :: :refund | :hold_uncertain | :hold_queued | :reject
 
   @type t :: %__MODULE__{
@@ -186,6 +186,29 @@ defmodule JasminEx.Billing.SegmentDispatch do
 
   def record_failure(%__MODULE__{}, _gateway_id), do: {:error, :unsafe_phase}
 
+  @spec close(t(), stop_outcome()) :: {:ok, t()} | {:error, atom()}
+  def close(%__MODULE__{phase: :closed} = dispatch, _outcome), do: {:ok, dispatch}
+
+  def close(%__MODULE__{} = dispatch, outcome) do
+    new(
+      bill_id: dispatch.bill_id,
+      fingerprint: dispatch.fingerprint,
+      count: dispatch.count,
+      children:
+        Enum.map(dispatch.children, fn child ->
+          %{
+            gateway_id: child.gateway_id,
+            payload_hash: child.payload_hash,
+            status: child.status
+          }
+        end),
+      phase: :closed,
+      stop_outcome: outcome
+    )
+  end
+
+  def close(_dispatch, _outcome), do: {:error, :invalid_dispatch}
+
   @spec recovery_actions(t()) :: [%{gateway_id: binary(), action: recovery_action()}]
   def recovery_actions(%__MODULE__{children: children}) do
     Enum.map(children, fn child ->
@@ -288,9 +311,12 @@ defmodule JasminEx.Billing.SegmentDispatch do
   defp validate_phase(phase) when phase in @phases, do: {:ok, phase}
   defp validate_phase(_phase), do: {:error, :unsafe_phase}
 
-  defp validate_stop_outcome(nil, phase) when phase in [:planned, :dispatching], do: {:ok, nil}
+  defp validate_stop_outcome(nil, phase) when phase in [:planned, :dispatching, :closed],
+    do: {:ok, nil}
 
-  defp validate_stop_outcome(outcome, :stopped) when outcome in @stop_outcomes, do: {:ok, outcome}
+  defp validate_stop_outcome(:rejected, :stopped), do: {:ok, :rejected}
+
+  defp validate_stop_outcome(outcome, :closed) when outcome in @stop_outcomes, do: {:ok, outcome}
 
   defp validate_stop_outcome(_outcome, _phase), do: {:error, :unsafe_phase}
 
@@ -312,6 +338,12 @@ defmodule JasminEx.Billing.SegmentDispatch do
 
   defp reachable_child_statuses?(:stopped, :rejected, statuses),
     do: stopped_failed_sequence?(statuses)
+
+  defp reachable_child_statuses?(:closed, _outcome, statuses) do
+    reachable_child_statuses?(:planned, nil, statuses) or
+      reachable_child_statuses?(:dispatching, nil, statuses) or
+      reachable_child_statuses?(:stopped, :rejected, statuses)
+  end
 
   defp reachable_child_statuses?(_phase, _outcome, _statuses), do: false
 
