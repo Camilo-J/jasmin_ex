@@ -692,6 +692,7 @@ defmodule JasminEx.Routing.Snapshot do
   defp decode_dispatch_phase("planned"), do: {:ok, :planned}
   defp decode_dispatch_phase("dispatching"), do: {:ok, :dispatching}
   defp decode_dispatch_phase("stopped"), do: {:ok, :stopped}
+  defp decode_dispatch_phase("closed"), do: {:ok, :closed}
   defp decode_dispatch_phase(_phase), do: {:error, :invalid_state}
 
   defp decode_stop_outcome(:null), do: {:ok, nil}

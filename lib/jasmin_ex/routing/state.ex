@@ -174,6 +174,62 @@ defmodule JasminEx.Routing.State do
   def admit_segments_with_dispatch(%__MODULE__{}, _admission, _children, _clock),
     do: {:error, :invalid_bill_id}
 
+  @spec claim_dispatch(t(), term(), term()) :: {:ok, t()} | {:error, atom()}
+  def claim_dispatch(%__MODULE__{} = state, bill_id, gateway_id) when is_binary(bill_id) do
+    update_dispatch(state, bill_id, &SegmentDispatch.claim(&1, gateway_id))
+  end
+
+  def claim_dispatch(%__MODULE__{}, _bill_id, _gateway_id), do: {:error, :invalid_bill_id}
+
+  @spec record_dispatch(t(), term(), term(), term()) ::
+          {:ok, t()} | {:ok, :duplicate} | {:error, atom()}
+  def record_dispatch(%__MODULE__{} = state, bill_id, gateway_id, :queued)
+      when is_binary(bill_id) do
+    update_dispatch(state, bill_id, &SegmentDispatch.confirm_queued(&1, gateway_id))
+  end
+
+  def record_dispatch(%__MODULE__{} = state, bill_id, gateway_id, :rejected)
+      when is_binary(bill_id) do
+    with {:ok, next} <-
+           update_dispatch(state, bill_id, &SegmentDispatch.record_failure(&1, gateway_id)) do
+      recover_dispatch(next, bill_id)
+    end
+  end
+
+  def record_dispatch(%__MODULE__{} = state, bill_id, gateway_id, :uncertain)
+      when is_binary(bill_id) do
+    with {:ok, dispatch} <- fetch_dispatch(state, bill_id),
+         true <- claimed_child?(dispatch, gateway_id) do
+      recover_dispatch(state, bill_id)
+    else
+      false -> {:error, :invalid_dispatch}
+      error -> error
+    end
+  end
+
+  def record_dispatch(%__MODULE__{}, _bill_id, _gateway_id, _outcome),
+    do: {:error, :invalid_bill_id}
+
+  @spec recover_dispatch(t(), term()) :: {:ok, t()} | {:ok, :duplicate} | {:error, atom()}
+  def recover_dispatch(%__MODULE__{} = state, bill_id) when is_binary(bill_id) do
+    case Map.get(state.segment_dispatches, bill_id) do
+      nil -> {:error, :unknown_bill}
+      %SegmentDispatch{phase: :closed} -> {:ok, :duplicate}
+      dispatch -> compensate_dispatch(state, dispatch)
+    end
+  end
+
+  def recover_dispatch(%__MODULE__{}, _bill_id), do: {:error, :invalid_bill_id}
+
+  @spec recover_open_dispatches(t()) :: {:ok, t()} | {:ok, :unchanged} | {:error, atom()}
+  def recover_open_dispatches(%__MODULE__{} = state) do
+    Enum.reduce_while(state.segment_dispatches, {:ok, state, false}, fn {bill_id, dispatch},
+                                                                        {:ok, acc, changed} ->
+      recover_open_one(acc, bill_id, dispatch, changed)
+    end)
+    |> finish_open_recovery()
+  end
+
   @spec settle(t(), term()) ::
           {:ok, t()} | {:ok, :duplicate} | {:ok, :late_ignored} | {:error, atom()}
   def settle(%__MODULE__{} = state, %Settlement{bill_id: bill_id} = settlement) do
@@ -230,6 +286,148 @@ defmodule JasminEx.Routing.State do
   defp put_dispatch(state, %SegmentDispatch{bill_id: bill_id} = dispatch) do
     %{state | segment_dispatches: Map.put(state.segment_dispatches, bill_id, dispatch)}
   end
+
+  defp update_dispatch(state, bill_id, fun) do
+    with {:ok, dispatch} <- fetch_dispatch(state, bill_id),
+         {:ok, next} <- fun.(dispatch) do
+      {:ok, put_dispatch(state, next)}
+    end
+  end
+
+  defp fetch_dispatch(state, bill_id) do
+    case Map.fetch(state.segment_dispatches, bill_id) do
+      {:ok, dispatch} -> {:ok, dispatch}
+      :error -> {:error, :unknown_bill}
+    end
+  end
+
+  defp claimed_child?(%SegmentDispatch{children: children}, gateway_id) do
+    match?(
+      %SegmentDispatch.Child{status: :claimed},
+      Enum.find(children, &(&1.gateway_id == gateway_id))
+    )
+  end
+
+  defp compensate_dispatch(state, dispatch) do
+    with {:ok, next} <- apply_recovery_settlements(state, dispatch),
+         {:ok, closed} <- SegmentDispatch.close(dispatch, close_outcome(dispatch)) do
+      {:ok, put_dispatch(next, closed)}
+    end
+  end
+
+  defp apply_recovery_settlements(state, dispatch) do
+    dispatch
+    |> SegmentDispatch.recovery_actions()
+    |> Enum.with_index(1)
+    |> Enum.reduce_while({:ok, state}, fn {%{action: action}, index}, {:ok, acc} ->
+      case settle_recovery_action(acc, dispatch, action, index) do
+        {:ok, :duplicate} -> {:cont, {:ok, acc}}
+        {:ok, :late_ignored} -> {:cont, {:ok, acc}}
+        {:ok, next} -> {:cont, {:ok, next}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp settle_recovery_action(state, _dispatch, :hold_queued, _index), do: {:ok, state}
+
+  defp settle_recovery_action(state, dispatch, :refund, index) do
+    settle_segment(state, dispatch.bill_id, dispatch.fingerprint, index, :rejected)
+  end
+
+  defp settle_recovery_action(state, dispatch, :reject, index) do
+    settle_segment(state, dispatch.bill_id, dispatch.fingerprint, index, :rejected)
+  end
+
+  defp settle_recovery_action(state, dispatch, :hold_uncertain, index) do
+    preserve_or_hold_claimed(state, dispatch, index)
+  end
+
+  defp preserve_or_hold_claimed(state, dispatch, index) do
+    case {Map.get(state.tombstones, dispatch.bill_id),
+          Map.get(state.reservations, dispatch.bill_id)} do
+      {%Tombstone{} = stone, _reservation} ->
+        preserve_closed_identity(state, dispatch, stone)
+
+      {_stone, %Reservation{} = reservation} ->
+        preserve_open_claimed(state, dispatch, reservation, index)
+
+      {nil, nil} ->
+        {:error, :unknown_bill}
+    end
+  end
+
+  defp preserve_closed_identity(state, dispatch, %Tombstone{fingerprint: fingerprint}) do
+    if fingerprint == dispatch.fingerprint do
+      {:ok, state}
+    else
+      {:error, :billing_conflict}
+    end
+  end
+
+  defp preserve_open_claimed(state, dispatch, reservation, index) do
+    with :ok <- match_dispatch_identity(dispatch, reservation),
+         {:ok, outcome} <- claimed_ledger_outcome(reservation.ledger, index) do
+      hold_claimed_outcome(state, dispatch, index, outcome)
+    end
+  end
+
+  defp match_dispatch_identity(
+         %SegmentDispatch{bill_id: bill_id, fingerprint: fingerprint},
+         %Reservation{
+           bill_id: bill_id,
+           fingerprint: fingerprint,
+           ledger: %SegmentLedger{bill_id: bill_id, fingerprint: fingerprint}
+         }
+       ),
+       do: :ok
+
+  defp match_dispatch_identity(_dispatch, _reservation), do: {:error, :billing_conflict}
+
+  defp claimed_ledger_outcome(%SegmentLedger{count: count, outcomes: outcomes}, index)
+       when is_integer(index) and index >= 1 and index <= count do
+    {:ok, Map.get(outcomes, index)}
+  end
+
+  defp claimed_ledger_outcome(_ledger, _index), do: {:error, :invalid_index}
+
+  defp hold_claimed_outcome(state, _dispatch, _index, outcome)
+       when outcome in [:accepted, :rejected, :uncertain],
+       do: {:ok, state}
+
+  defp hold_claimed_outcome(state, dispatch, index, nil) do
+    settle_segment(state, dispatch.bill_id, dispatch.fingerprint, index, :uncertain)
+  end
+
+  defp hold_claimed_outcome(_state, _dispatch, _index, _outcome),
+    do: {:error, :conflicting_settlement}
+
+  defp close_outcome(dispatch) do
+    statuses = Enum.map(dispatch.children, & &1.status)
+
+    cond do
+      :claimed in statuses -> :uncertain
+      :failed in statuses -> :rejected
+      :queued in statuses -> :uncertain
+      true -> :rejected
+    end
+  end
+
+  defp recover_open_one(state, _bill_id, %SegmentDispatch{phase: :closed}, changed) do
+    {:cont, {:ok, state, changed}}
+  end
+
+  defp recover_open_one(state, bill_id, _dispatch, changed) do
+    case recover_dispatch(state, bill_id) do
+      {:ok, :duplicate} -> {:cont, {:ok, state, changed}}
+      {:ok, next} -> {:cont, {:ok, next, true}}
+      error -> {:halt, error}
+    end
+  end
+
+  defp finish_open_recovery({:ok, _state, false}), do: {:ok, :unchanged}
+  defp finish_open_recovery({:ok, state, true}), do: {:ok, state}
+  defp finish_open_recovery(error), do: error
 
   defp replay_or_admit(
          state,
