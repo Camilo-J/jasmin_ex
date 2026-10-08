@@ -20,7 +20,7 @@ defmodule JasminEx.HttpApi.ApplicationTest do
       Application.children(
         smpp_connectors: [%{name: :connector}],
         smpp_server: [enabled: true, port: 2775],
-        http_api: [enabled: true, port: 0]
+        http_api: [enabled: true, port: 0, concat: :sar, max_segments: 3]
       )
 
     assert [
@@ -34,7 +34,20 @@ defmodule JasminEx.HttpApi.ApplicationTest do
     assert opts[:config].enabled
     assert opts[:config].port == 0
     assert opts[:config].host == {127, 0, 0, 1}
+    assert opts[:config].concat == :sar
+    assert opts[:config].max_segments == 3
     assert opts[:router] == JasminEx.Routing.Router
+
+    assert {:ok,
+            {_flags,
+             [
+               _metrics,
+               %{start: {Bandit, :start_link, [[{:plug, {_router, plug_opts}} | _]]}}
+             ]}} = HttpSupervisor.init(opts)
+
+    assert plug_opts.concat == :sar
+    assert plug_opts.max_segments == 3
+    assert plug_opts.pipeline == JasminEx.MtSubmitPipeline
 
     assert [
              %{id: Connection},
@@ -45,6 +58,16 @@ defmodule JasminEx.HttpApi.ApplicationTest do
     assert no_smpp[:config].port == 1401
     refute Keyword.has_key?(no_smpp, :dlr_store)
     refute Keyword.has_key?(no_smpp, :dlr_config)
+  end
+
+  test "rejects malformed HTTP multipart configuration before assembling children" do
+    assert_raise ArgumentError, "HTTP API concat must be :udh or :sar", fn ->
+      Application.children(http_api: [enabled: true, concat: :invalid])
+    end
+
+    assert_raise ArgumentError, "HTTP API max_segments must be an integer from 1 to 5", fn ->
+      Application.children(http_api: [enabled: true, max_segments: 6])
+    end
   end
 
   test "passes enabled DLR store and config dependencies to HTTP API" do

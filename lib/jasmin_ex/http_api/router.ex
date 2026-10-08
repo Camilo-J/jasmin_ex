@@ -70,10 +70,19 @@ defmodule JasminEx.HttpApi.Router do
          {:ok, input} <- pipeline_input(user, params) do
       pipeline_opts =
         opts
-        |> Map.take([:router, :queue, :id_fun, :dlr_store, :dlr_config, :dlr_clock])
+        |> Map.take([
+          :router,
+          :queue,
+          :id_fun,
+          :concat,
+          :max_segments,
+          :dlr_store,
+          :dlr_config,
+          :dlr_clock
+        ])
         |> Map.put(:dlr_request, dlr)
 
-      {conn, MtSubmitPipeline.submit(input, pipeline_opts)}
+      {conn, pipeline(opts).submit(input, pipeline_opts)}
     else
       {:error, reason} -> {conn, {:error, reason}}
     end
@@ -260,4 +269,6 @@ defmodule JasminEx.HttpApi.Router do
   end
 
   defp opts(conn), do: conn.private.http_api
+
+  defp pipeline(opts), do: Map.get(opts, :pipeline, MtSubmitPipeline)
 end

@@ -52,6 +52,13 @@ defmodule JasminEx.HttpApi.RouterTest do
     def envelopes(agent), do: Agent.get(agent, & &1.envelopes)
   end
 
+  defmodule RecordingPipeline do
+    def submit(input, opts) do
+      send(self(), {:pipeline_submit, input, opts})
+      {:ok, "mid-recording"}
+    end
+  end
+
   describe "threat routing" do
     test "GET /send is 405 and does not submit", %{tmp_dir: tmp_dir} do
       env = start_http(tmp_dir)
@@ -67,9 +74,13 @@ defmodule JasminEx.HttpApi.RouterTest do
 
       tags = request(env, :post, "/send", Map.put(send_fields(), "tags", "promo"))
       tlv = request(env, :post, "/send", Map.put(send_fields(), "tlv", "00"))
+      concat = request(env, :post, "/send", Map.put(send_fields(), "concat", "sar"))
+      max_segments = request(env, :post, "/send", Map.put(send_fields(), "max_segments", "1"))
 
       assert_error(tags, 400, :unknown_field)
       assert_error(tlv, 400, :unknown_field)
+      assert_error(concat, 400, :unknown_field)
+      assert_error(max_segments, 400, :unknown_field)
       assert_no_submit(env)
     end
 
@@ -228,7 +239,7 @@ defmodule JasminEx.HttpApi.RouterTest do
     test "oversized encoded payloads are 400 message_too_long with no side effects", %{
       tmp_dir: tmp_dir
     } do
-      env = start_http(tmp_dir)
+      env = start_http(tmp_dir, concat: :sar, max_segments: 1)
 
       gsm =
         request(
@@ -258,6 +269,36 @@ defmodule JasminEx.HttpApi.RouterTest do
       assert_error(utf16, 400, :message_too_long)
       assert_error(gsm_ext, 400, :message_too_long)
       assert_no_submit(env)
+    end
+
+    test "server multipart settings reach the production pipeline for legacy messages", %{
+      tmp_dir: tmp_dir
+    } do
+      env = start_http(tmp_dir)
+
+      children =
+        JasminEx.Application.children(
+          http_api: [
+            enabled: true,
+            port: 0,
+            concat: :sar,
+            max_segments: 2,
+            router: env.router,
+            queue: {FakeQueue, env.queue},
+            pipeline: RecordingPipeline
+          ]
+        )
+
+      {JasminEx.HttpApi.Supervisor, supervisor_opts} = List.last(children)
+
+      plug_opts = supervisor_opts |> Keyword.put(:metrics, env.metrics) |> supervisor_plug_opts()
+
+      conn = request(%{env | opts: plug_opts}, :post, "/send", send_fields())
+
+      assert conn.status == 200
+      assert conn.resp_body == "mid-recording\n"
+      assert_receive {:pipeline_submit, _input, %{concat: :sar, max_segments: 2}}
+      assert FakeQueue.envelopes(env.queue) == []
     end
   end
 
@@ -776,6 +817,8 @@ defmodule JasminEx.HttpApi.RouterTest do
       id_fun: fn -> id end
     }
 
+    router_opts = Map.merge(router_opts, Map.take(Map.new(opts), [:concat, :max_segments]))
+
     router_opts =
       case Keyword.get(opts, :dlr, :off) do
         :enabled ->
@@ -840,6 +883,17 @@ defmodule JasminEx.HttpApi.RouterTest do
   defp assert_no_submit(env) do
     if env.queue, do: assert(FakeQueue.envelopes(env.queue) == [])
     assert Routing.snapshot(env.router).reservations == %{}
+  end
+
+  defp supervisor_plug_opts(supervisor_opts) do
+    assert {:ok,
+            {_flags,
+             [
+               _metrics,
+               %{start: {Bandit, :start_link, [[{:plug, {_router, plug_opts}} | _]]}}
+             ]}} = JasminEx.HttpApi.Supervisor.init(supervisor_opts)
+
+    plug_opts
   end
 
   defp text_plain?(conn) do

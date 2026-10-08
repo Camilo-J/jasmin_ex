@@ -27,6 +27,7 @@ defmodule JasminEx.HttpApi.Supervisor do
     metrics = Keyword.get(opts, :metrics, Metrics)
     router = Keyword.get(opts, :router, RoutingRouter)
     queue = Keyword.get(opts, :queue)
+    pipeline = Keyword.get(opts, :pipeline, JasminEx.MtSubmitPipeline)
     dlr_store = Keyword.get(opts, :dlr_store)
     dlr_config = Keyword.get(opts, :dlr_config)
 
@@ -41,6 +42,9 @@ defmodule JasminEx.HttpApi.Supervisor do
                 metrics: metrics,
                 router: router,
                 queue: queue,
+                pipeline: pipeline,
+                concat: config.concat,
+                max_segments: config.max_segments,
                 dlr_store: dlr_store,
                 dlr_config: dlr_config
               }},
