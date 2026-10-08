@@ -114,7 +114,7 @@ defmodule JasminEx.Routing.SnapshotTest do
     {:ok, state} = State.put_user(%{persisted_state() | users: %{}}, user)
     config = tmp_config(tmp_dir, "v3")
     assert :ok = Snapshot.write(state, config)
-    assert %{"version" => 5} = config.snapshot_path |> File.read!() |> :json.decode()
+    assert %{"version" => 6} = config.snapshot_path |> File.read!() |> :json.decode()
     refute File.read!(config.snapshot_path) =~ "smpp-secret"
     assert {:ok, restored} = Snapshot.restore(config)
     assert restored.users["u1"].max_bindings == 2
@@ -128,7 +128,7 @@ defmodule JasminEx.Routing.SnapshotTest do
     assert {:error, {:restore_failed, :invalid_state}} =
              Snapshot.restore(write_json(tmp_dir, "bad", bad))
 
-    assert {:error, {:restore_failed, :unsupported_version}} =
+    assert {:error, {:restore_failed, :invalid_state}} =
              Snapshot.restore(write_json(tmp_dir, "v6-legacy", Map.put(legacy(2), "version", 6)))
   end
 
@@ -151,7 +151,7 @@ defmodule JasminEx.Routing.SnapshotTest do
     config = tmp_config(tmp_dir, "v4-dlr")
     assert :ok = Snapshot.write(state, config)
 
-    assert %{"version" => 5, "users" => [encoded]} =
+    assert %{"version" => 6, "users" => [encoded]} =
              config.snapshot_path |> File.read!() |> :json.decode()
 
     assert encoded["set_dlr_level"] == false
@@ -160,8 +160,11 @@ defmodule JasminEx.Routing.SnapshotTest do
     assert restored.users["u1"].set_dlr_level == false
     assert restored.users["u1"].http_set_dlr_method == false
 
-    assert {:error, {:restore_failed, :unsupported_version}} =
+    assert {:error, {:restore_failed, :invalid_state}} =
              Snapshot.restore(write_json(tmp_dir, "v6", Map.put(legacy(2), "version", 6)))
+
+    assert {:error, {:restore_failed, :unsupported_version}} =
+             Snapshot.restore(write_json(tmp_dir, "v7", Map.put(legacy(2), "version", 7)))
   end
 
   test "missing restore stays empty when leftover /tmp/jr-missing snapshot exists", %{

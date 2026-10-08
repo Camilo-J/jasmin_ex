@@ -16,6 +16,7 @@ defmodule JasminEx.Routing.BillingSnapshotTest do
              {0, 0}
 
     assert state.reservations == %{} and state.tombstones == %{}
+    assert state.segment_dispatches == %{}
   end
 
   test "v1_restore_synthesizes_no_billing_activity", %{tmp_dir: dir} do
@@ -23,8 +24,9 @@ defmodule JasminEx.Routing.BillingSnapshotTest do
     extras = %{"reservations" => [open_res()], "tombstones" => [stone()], "users" => [user]}
     assert {:ok, state} = Snapshot.restore(write!(dir, Map.merge(v1(), extras)))
 
-    assert {state.users["u1"].balance_minor, state.reservations, state.tombstones} ==
-             {nil, %{}, %{}}
+    assert {state.users["u1"].balance_minor, state.reservations, state.tombstones,
+            state.segment_dispatches} ==
+             {nil, %{}, %{}, %{}}
   end
 
   test "malformed_v2_billing_fields_fail_closed", %{tmp_dir: dir} do
@@ -88,9 +90,11 @@ defmodule JasminEx.Routing.BillingSnapshotTest do
     extras = Map.put(open_res(), "ledger", segment_ledger())
     assert {:ok, v2_state} = Snapshot.restore(write!(dir, %{v2() | "reservations" => [extras]}))
     assert v2_state.reservations["bill-1"].ledger == nil
+    assert v2_state.segment_dispatches == %{}
 
     assert {:ok, v4_state} = Snapshot.restore(write!(dir, %{v4() | "reservations" => [extras]}))
     assert v4_state.reservations["bill-1"].ledger == nil
+    assert v4_state.segment_dispatches == %{}
   end
 
   test "v5 ledger round-trip retains identity, count, and outcomes", %{tmp_dir: dir} do
@@ -107,6 +111,155 @@ defmodule JasminEx.Routing.BillingSnapshotTest do
     assert {:ok, again} = Snapshot.restore(config)
     assert again.reservations["bill-1"].fingerprint == open.fingerprint
     assert again.reservations["bill-1"].ledger.outcomes == %{1 => :rejected}
+    assert state.segment_dispatches == %{}
+    assert again.segment_dispatches == %{}
+  end
+
+  test "v6 dispatch round-trip retains identity, child ids, and hashes", %{tmp_dir: dir} do
+    config = write!(dir, billed_v6())
+    assert %{"version" => 6} = config.snapshot_path |> File.read!() |> :json.decode()
+    assert {:ok, state} = Snapshot.restore(config)
+    dispatch = state.segment_dispatches["bill-1"]
+    assert dispatch.bill_id == "bill-1"
+    assert dispatch.count == 1
+    assert dispatch.phase == :planned
+    assert dispatch.fingerprint == state.reservations["bill-1"].fingerprint
+    assert dispatch.count == state.reservations["bill-1"].ledger.count
+    assert Enum.map(dispatch.children, & &1.gateway_id) == ["gw-a"]
+    assert hd(dispatch.children).payload_hash == <<2::256>>
+    assert hd(dispatch.children).status == :unattempted
+    assert :ok = Snapshot.write(state, config)
+
+    assert %{"version" => 6, "segment_dispatches" => [_encoded]} =
+             config.snapshot_path |> File.read!() |> :json.decode()
+
+    refute File.read!(config.snapshot_path) =~ "short_message"
+    assert {:ok, again} = Snapshot.restore(config)
+    assert again.segment_dispatches["bill-1"].children == dispatch.children
+    assert again.users["u1"].balance_minor == 300
+  end
+
+  test "v1-v5 extra dispatch keys stay empty; v6 missing field fails closed", %{tmp_dir: dir} do
+    extras = %{"segment_dispatches" => [segment_dispatch()]}
+    assert {:ok, v1_state} = Snapshot.restore(write!(dir, Map.merge(v1(), extras)))
+    assert v1_state.segment_dispatches == %{}
+    assert {:ok, v5_state} = Snapshot.restore(write!(dir, Map.merge(v5(), extras)))
+    assert v5_state.segment_dispatches == %{}
+
+    assert {:error, {:restore_failed, :invalid_state}} =
+             Snapshot.restore(write!(dir, Map.put(v5(), "version", 6)))
+  end
+
+  test "v6 malformed ownership, ids, digest, outcome, and phase fail closed", %{tmp_dir: dir} do
+    Enum.each(
+      [
+        %{v6() | "segment_dispatches" => "nope"},
+        %{billed_v6() | "segment_dispatches" => [Map.delete(segment_dispatch(), "bill_id")]},
+        %{billed_v6() | "segment_dispatches" => [Map.delete(segment_dispatch(), "children")]},
+        %{billed_v6() | "segment_dispatches" => [Map.delete(segment_dispatch(), "phase")]},
+        %{billed_v6() | "segment_dispatches" => [%{segment_dispatch() | "bill_id" => "missing"}]},
+        %{
+          billed_v6()
+          | "segment_dispatches" => [
+              %{segment_dispatch() | "fingerprint" => %{"version" => 1, "digest" => "xxxx"}}
+            ]
+        },
+        %{
+          billed_v6()
+          | "segment_dispatches" => [
+              %{
+                segment_dispatch()
+                | "children" => [
+                    %{"gateway_id" => "gw-a", "payload_hash" => "abcd", "status" => "unattempted"}
+                  ]
+              }
+            ]
+        },
+        %{
+          billed_v6()
+          | "segment_dispatches" => [
+              %{
+                segment_dispatch()
+                | "count" => 2,
+                  "children" => [
+                    %{
+                      "gateway_id" => "gw-a",
+                      "payload_hash" => Base.encode64(<<2::256>>),
+                      "status" => "unattempted"
+                    },
+                    %{
+                      "gateway_id" => "gw-a",
+                      "payload_hash" => Base.encode64(<<3::256>>),
+                      "status" => "unattempted"
+                    }
+                  ]
+              }
+            ]
+        },
+        %{billed_v6() | "segment_dispatches" => [%{segment_dispatch() | "phase" => "closed"}]},
+        %{billed_v6() | "segment_dispatches" => [%{segment_dispatch() | "phase" => "accepted"}]},
+        %{
+          billed_v6()
+          | "segment_dispatches" => [
+              %{
+                segment_dispatch()
+                | "children" => [
+                    %{
+                      "gateway_id" => "gw-a",
+                      "payload_hash" => Base.encode64(<<2::256>>),
+                      "status" => "accepted"
+                    }
+                  ]
+              }
+            ]
+        },
+        %{billed_v6() | "segment_dispatches" => [segment_dispatch(), segment_dispatch()]},
+        billed_v6_two([
+          child_json("gw-a", <<2::256>>, "unattempted"),
+          child_json("gw-b", <<3::256>>, "claimed")
+        ]),
+        billed_v6_two([
+          child_json("gw-a", <<2::256>>, "claimed"),
+          child_json("gw-b", <<3::256>>, "claimed")
+        ]),
+        billed_v6_two([
+          child_json("gw-a", <<2::256>>, "failed"),
+          child_json("gw-b", <<3::256>>, "queued")
+        ])
+        |> put_in(["segment_dispatches", Access.at(0), "phase"], "stopped")
+        |> put_in(["segment_dispatches", Access.at(0), "stop_outcome"], "rejected")
+      ],
+      &assert_closed(dir, &1)
+    )
+  end
+
+  test "v6 restores helper-reachable queued prefix and single claim", %{tmp_dir: dir} do
+    billed =
+      billed_v6_two([
+        child_json("gw-a", <<2::256>>, "queued"),
+        child_json("gw-b", <<3::256>>, "claimed")
+      ])
+
+    assert {:ok, state} = Snapshot.restore(write!(dir, billed))
+    dispatch = state.segment_dispatches["bill-1"]
+    assert dispatch.phase == :dispatching
+    assert Enum.map(dispatch.children, & &1.status) == [:queued, :claimed]
+    assert state.users["u1"].balance_minor == 300
+  end
+
+  test "v6 tombstone-anchored checkpoint restores without changing balances", %{tmp_dir: dir} do
+    dispatch = %{segment_dispatch() | "bill_id" => "bill-t"}
+    billed = billed_v6() |> Map.put("segment_dispatches", [dispatch])
+    assert {:ok, state} = Snapshot.restore(write!(dir, billed))
+    assert state.users["u1"].balance_minor == 300
+    assert state.users["u1"].submit_quota == 1
+    assert state.tombstones["bill-t"].state == :settled_ok
+    assert state.segment_dispatches["bill-t"].bill_id == "bill-t"
+
+    assert state.segment_dispatches["bill-t"].fingerprint ==
+             state.tombstones["bill-t"].fingerprint
+
+    refute Map.has_key?(state.reservations, "bill-t")
   end
 
   test "malformed v5 ledger and incoherent money fail closed", %{tmp_dir: dir} do
@@ -266,6 +419,67 @@ defmodule JasminEx.Routing.BillingSnapshotTest do
       "unit_price" => 100,
       "count" => 1,
       "outcomes" => []
+    }
+  end
+
+  defp v6 do
+    Map.merge(v5(), %{"version" => 6, "segment_dispatches" => []})
+  end
+
+  defp billed_v6 do
+    billed_v5()
+    |> Map.put("version", 6)
+    |> Map.put("segment_dispatches", [segment_dispatch()])
+  end
+
+  defp segment_dispatch do
+    %{
+      "bill_id" => "bill-1",
+      "fingerprint" => @fp,
+      "count" => 1,
+      "phase" => "planned",
+      "stop_outcome" => :null,
+      "children" => [
+        %{
+          "gateway_id" => "gw-a",
+          "payload_hash" => Base.encode64(<<2::256>>),
+          "status" => "unattempted"
+        }
+      ]
+    }
+  end
+
+  defp billed_v6_two(children) do
+    reservation =
+      open_res()
+      |> Map.put("captured_minor", 20)
+      |> Map.put("reserved_minor", 180)
+      |> Map.put("refundable_minor", 180)
+      |> Map.put("ledger", %{segment_ledger() | "count" => 2})
+
+    dispatch = %{
+      "bill_id" => "bill-1",
+      "fingerprint" => @fp,
+      "count" => 2,
+      "phase" => "dispatching",
+      "stop_outcome" => :null,
+      "children" => children
+    }
+
+    v5()
+    |> Map.put("version", 6)
+    |> put_in(["users", Access.at(0), "balance_minor"], 300)
+    |> put_in(["users", Access.at(0), "submit_quota"], 1)
+    |> Map.put("reservations", [reservation])
+    |> Map.put("tombstones", [stone()])
+    |> Map.put("segment_dispatches", [dispatch])
+  end
+
+  defp child_json(gateway_id, hash, status) do
+    %{
+      "gateway_id" => gateway_id,
+      "payload_hash" => Base.encode64(hash),
+      "status" => status
     }
   end
 end
