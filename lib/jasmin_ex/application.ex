@@ -219,7 +219,8 @@ defmodule JasminEx.Application do
          [
            config: http,
            router: Keyword.get(options, :router, Router),
-           queue: Keyword.get(options, :queue)
+           queue: Keyword.get(options, :queue),
+           pipeline: Keyword.get(options, :pipeline, JasminEx.MtSubmitPipeline)
          ] ++ http_dlr_dependencies(dlr_options)}
       ]
     else
