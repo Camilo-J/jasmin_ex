@@ -14,6 +14,7 @@ defmodule JasminEx.HttpApi.SubmitEncodingPathTest do
   alias JasminEx.HttpApi.Metrics
   alias JasminEx.HttpApi.Router
   alias JasminEx.Messaging.Envelope
+  alias JasminEx.MtSubmitPipeline.ConcatReference
   alias JasminEx.Routing
   alias JasminEx.Routing.Config
   alias JasminEx.Routing.ConnectorRef
@@ -23,6 +24,7 @@ defmodule JasminEx.HttpApi.SubmitEncodingPathTest do
   alias JasminEx.Smpp.FakeSMSC
   alias JasminEx.Smpp.PDU
   alias JasminEx.Smpp.PDU.Body
+  alias JasminEx.Smpp.PDU.Tlv
 
   defmodule FakeQueue do
     def enqueue(agent, envelope) do
@@ -74,7 +76,7 @@ defmodule JasminEx.HttpApi.SubmitEncodingPathTest do
     end
   end
 
-  test "254 encoded octets are on the wire and 255 never bills or enqueues", %{tmp_dir: tmp_dir} do
+  test "254 encoded octets are on the wire and 255 uses multipart envelopes", %{tmp_dir: tmp_dir} do
     env = start_http(tmp_dir, id: "mid-254")
     conn = request(env, send_fields(%{"content" => String.duplicate("a", 254)}))
     assert conn.status == 200
@@ -88,10 +90,9 @@ defmodule JasminEx.HttpApi.SubmitEncodingPathTest do
 
     over = start_http(tmp_dir, file: "routing-255.json")
     too_long = request(over, send_fields(%{"content" => String.duplicate("a", 255)}))
-    assert too_long.status == 400
-    assert too_long.resp_body == "error:message_too_long\n"
-    assert FakeQueue.envelopes(over.queue) == []
-    assert Routing.snapshot(over.router).reservations == %{}
+    assert too_long.status == 200
+    assert [%{segment: %{count: 2}}, %{segment: %{count: 2}}] = FakeQueue.envelopes(over.queue)
+    assert Routing.snapshot(over.router).reservations["mid-path"]
   end
 
   test "invalid text, hex syntax, and hex structure never bill, DLR, or enqueue", %{
@@ -118,7 +119,102 @@ defmodule JasminEx.HttpApi.SubmitEncodingPathTest do
     assert dlr_store_empty?(env)
   end
 
+  test "HTTP multipart UDH and SAR envelopes reach FakeSMSC with reassemblable payload bytes", %{
+    tmp_dir: tmp_dir
+  } do
+    content = String.duplicate("a", 255)
+
+    udh = start_http(tmp_dir, file: "routing-udh.json", concat: :udh)
+
+    assert %Plug.Conn{status: 200, resp_body: "mid-path\n"} =
+             request(udh, send_fields(%{"content" => content}))
+
+    [udh_first, udh_second] = FakeQueue.envelopes(udh.queue)
+    assert <<5, 0, 3, reference, 2, 1, first_payload::binary>> = udh_first.submit_sm.short_message
+
+    assert <<5, 0, 3, ^reference, 2, 2, second_payload::binary>> =
+             udh_second.submit_sm.short_message
+
+    assert first_payload <> second_payload == content
+
+    udh_wire = udh_first.submit_sm.short_message
+
+    assert %Body.SubmitSM{esm_class: 0x40, short_message: ^udh_wire} =
+             submit_body_on_fake_smsc(udh_first)
+
+    sar = start_http(tmp_dir, file: "routing-sar.json", concat: :sar)
+
+    assert %Plug.Conn{status: 200, resp_body: "mid-path\n"} =
+             request(sar, send_fields(%{"content" => content}))
+
+    [sar_first, sar_second] = FakeQueue.envelopes(sar.queue)
+    assert sar_first.submit_sm.short_message <> sar_second.submit_sm.short_message == content
+
+    assert %Body.SubmitSM{esm_class: 0, optional_parameters: sar_first_tlvs} =
+             submit_body_on_fake_smsc(sar_first)
+
+    assert %Body.SubmitSM{optional_parameters: sar_second_tlvs} =
+             submit_body_on_fake_smsc(sar_second)
+
+    assert {:ok,
+            [
+              {:sar_msg_ref_num, sar_reference},
+              {:sar_total_segments, 2},
+              {:sar_segment_seqnum, 1}
+            ]} =
+             Tlv.decode(sar_first_tlvs)
+
+    assert {:ok,
+            [
+              {:sar_msg_ref_num, ^sar_reference},
+              {:sar_total_segments, 2},
+              {:sar_segment_seqnum, 2}
+            ]} =
+             Tlv.decode(sar_second_tlvs)
+  end
+
+  test "UCS2 multipart UDH and SAR PDUs preserve encoded payload bytes", %{tmp_dir: tmp_dir} do
+    content = String.duplicate("a", 128)
+    encoded = :binary.copy(<<0x00, 0x61>>, 128)
+
+    for concat <- [:udh, :sar] do
+      env = start_http(tmp_dir, file: "routing-ucs2-#{concat}.json", concat: concat)
+
+      assert %Plug.Conn{status: 200, resp_body: "mid-path\n"} =
+               request(env, send_fields(%{"content" => content, "coding" => "8"}))
+
+      [first, second] = FakeQueue.envelopes(env.queue)
+
+      payloads =
+        case concat do
+          :udh ->
+            assert <<5, 0, 3, _reference, 2, 1, first_payload::binary>> =
+                     first.submit_sm.short_message
+
+            assert <<5, 0, 3, _reference, 2, 2, second_payload::binary>> =
+                     second.submit_sm.short_message
+
+            [first_payload, second_payload]
+
+          :sar ->
+            assert {:ok, _tlvs} = Tlv.decode(first.submit_sm.optional_parameters)
+            assert {:ok, _tlvs} = Tlv.decode(second.submit_sm.optional_parameters)
+            [first.submit_sm.short_message, second.submit_sm.short_message]
+        end
+
+      assert IO.iodata_to_binary(payloads) == encoded
+      assert %Body.SubmitSM{data_coding: :UCS2} = submit_body_on_fake_smsc(first)
+      assert %Body.SubmitSM{data_coding: :UCS2} = submit_body_on_fake_smsc(second)
+    end
+  end
+
   defp submit_on_fake_smsc(envelope) do
+    body = submit_body_on_fake_smsc(envelope)
+    sm = body.short_message
+    {byte_size(sm), sm, body.data_coding}
+  end
+
+  defp submit_body_on_fake_smsc(envelope) do
     {:ok, port, smsc} = FakeSMSC.start_link()
     ref = FakeSMSC.subscribe(smsc)
 
@@ -144,21 +240,17 @@ defmodule JasminEx.HttpApi.SubmitEncodingPathTest do
       assert {:ok, "fake-msg-id"} =
                Client.send_submit_sm(client, struct(Body.SubmitSM, envelope.submit_sm))
 
-      raw_submit_sm(await_submit_bytes(ref))
+      decode_submit_body(await_submit_bytes(ref))
     after
       stop_pid(client)
       stop_pid(smsc)
     end
   end
 
-  defp raw_submit_sm(payload) do
+  defp decode_submit_body(payload) do
     {:ok, %PDU{command: :submit_sm, body: body}} = PDU.decode(payload)
     {:ok, decoded} = Body.decode(:submit_sm, body)
-    sm = decoded.short_message
-    sm_size = byte_size(sm)
-    prefix_size = byte_size(body) - sm_size - 1
-    <<_prefix::binary-size(^prefix_size), sm_length, octets::binary-size(^sm_size)>> = body
-    {sm_length, octets, decoded.data_coding}
+    decoded
   end
 
   defp await_submit_bytes(ref) do
@@ -232,14 +324,18 @@ defmodule JasminEx.HttpApi.SubmitEncodingPathTest do
       )
 
     queue = FakeQueue.start(:ok)
+    {:ok, concat_reference} = ConcatReference.start_link(name: nil)
     {:ok, metrics} = Metrics.start_link()
 
     router_opts = %{
       router: router,
       queue: {FakeQueue, queue},
       metrics: metrics,
-      id_fun: fn -> Keyword.get(opts, :id, "mid-path") end
+      id_fun: fn -> Keyword.get(opts, :id, "mid-path") end,
+      concat_reference: concat_reference
     }
+
+    router_opts = Map.merge(router_opts, Map.take(Map.new(opts), [:concat, :max_segments]))
 
     router_opts =
       case Keyword.get(opts, :dlr, :off) do

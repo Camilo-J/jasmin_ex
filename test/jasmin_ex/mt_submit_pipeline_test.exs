@@ -6,12 +6,33 @@ defmodule JasminEx.MtSubmitPipelineTest do
   alias JasminEx.Dlr.Request, as: DlrRequest
   alias JasminEx.Messaging.Envelope
   alias JasminEx.MtSubmitPipeline
+  alias JasminEx.MtSubmitPipeline.ConcatReference
   alias JasminEx.MtSubmitPipeline.Production
   alias JasminEx.Routing
   alias JasminEx.Routing.Config
   alias JasminEx.Routing.ConnectorRef
   alias JasminEx.Routing.Filter
   alias JasminEx.Routing.Router
+  alias JasminEx.Smpp.PDU.Tlv
+
+  defmodule SnapshotFailingOps do
+    @moduledoc false
+    alias JasminEx.Routing.FileOps
+
+    def fail_dir!(dir), do: :persistent_term.put({__MODULE__, dir}, true)
+    def clear_dir!(dir), do: :persistent_term.erase({__MODULE__, dir})
+    def mkdir_p(path), do: FileOps.mkdir_p(path)
+    def chmod(path, mode), do: FileOps.chmod(path, mode)
+    def read(path), do: FileOps.read(path)
+    def fsync(path), do: FileOps.fsync(path)
+    def rename(from, to), do: FileOps.rename(from, to)
+
+    def write(path, data) do
+      if :persistent_term.get({__MODULE__, Path.dirname(path)}, false),
+        do: {:error, :eio},
+        else: FileOps.write(path, data)
+    end
+  end
 
   test "runs validate, intercept, route, qos, bill, then billed dispatch" do
     {:ok, order} = Agent.start_link(fn -> [] end)
@@ -173,6 +194,21 @@ defmodule JasminEx.MtSubmitPipelineTest do
       Agent.update(log, &(&1 ++ [:enqueue]))
       FakeQueue.enqueue(queue, envelope)
     end
+  end
+
+  defmodule ScriptedQueue do
+    def enqueue(agent, envelope) do
+      Agent.get_and_update(agent, fn %{replies: [reply | replies]} = state ->
+        {reply, %{state | replies: replies, envelopes: state.envelopes ++ [envelope]}}
+      end)
+    end
+
+    def start(replies) do
+      {:ok, pid} = Agent.start_link(fn -> %{replies: replies, envelopes: []} end)
+      pid
+    end
+
+    def envelopes(agent), do: Agent.get(agent, & &1.envelopes)
   end
 
   defmodule DlrClock do
@@ -342,14 +378,34 @@ defmodule JasminEx.MtSubmitPipelineTest do
       assert Routing.snapshot(router).reservations == %{}
     end
 
-    test "255 encoded GSM octets are message_too_long before billing", %{tmp_dir: tmp_dir} do
+    test "255 encoded GSM octets use multipart billing and dispatch", %{tmp_dir: tmp_dir} do
       {router, queue} = start_pipeline(tmp_dir)
       opts = opts(router, queue, "mid-long")
       input = Map.put(valid_input(), :content, String.duplicate("a", 255))
+      {:ok, references} = Agent.start_link(fn -> 0 end)
 
-      assert {:error, {:validate, :message_too_long}} = MtSubmitPipeline.submit(input, opts)
-      assert FakeQueue.envelopes(queue) == []
-      assert Routing.snapshot(router).reservations == %{}
+      reference_allocator = fn ->
+        Agent.get_and_update(references, fn reference ->
+          next = reference + 1
+          {{:ok, next}, next}
+        end)
+      end
+
+      assert {:ok, "mid-long"} =
+               MtSubmitPipeline.submit(
+                 input,
+                 opts
+                 |> Map.put(:max_attempts, 7)
+                 |> Map.put(:reference_allocator, reference_allocator)
+               )
+
+      assert [
+               %Envelope{max_attempts: 7, segment: %{count: 2}},
+               %Envelope{max_attempts: 7, segment: %{count: 2}}
+             ] =
+               FakeQueue.envelopes(queue)
+
+      assert Routing.snapshot(router).reservations["mid-long"].ledger.count == 2
     end
 
     test "254 encoded GSM octets are accepted", %{tmp_dir: tmp_dir} do
@@ -364,6 +420,161 @@ defmodule JasminEx.MtSubmitPipelineTest do
 
       [envelope] = FakeQueue.envelopes(queue)
       assert byte_size(envelope.submit_sm.short_message) == 254
+    end
+
+    test "legacy messages never allocate a multipart reference", %{tmp_dir: tmp_dir} do
+      {router, queue} = start_pipeline(tmp_dir)
+      parent = self()
+
+      opts =
+        opts(router, queue, "mid-legacy")
+        |> Map.put(:reference_allocator, fn ->
+          send(parent, :allocated)
+          {:ok, 1}
+        end)
+
+      assert {:ok, "mid-legacy"} = MtSubmitPipeline.submit(valid_input(), opts)
+      refute_receive :allocated
+    end
+
+    test "an unavailable multipart allocator leaves billing and queue untouched", %{
+      tmp_dir: tmp_dir
+    } do
+      {router, queue} = start_pipeline(tmp_dir)
+      before = Routing.snapshot(router)
+
+      assert {:error, {:bill, :concat_reference_unavailable}} =
+               MtSubmitPipeline.submit(
+                 Map.put(valid_input(), :content, String.duplicate("a", 255)),
+                 opts(router, queue, "mid-unavailable")
+                 |> Map.put(:reference_allocator, fn -> {:error, :unavailable} end)
+               )
+
+      assert FakeQueue.envelopes(queue) == []
+      assert Routing.snapshot(router) == before
+    end
+
+    test "allocator callback faults fail closed before multipart admission", %{tmp_dir: tmp_dir} do
+      callbacks = [
+        raised: fn -> raise "probe" end,
+        exited: fn -> exit(:probe) end,
+        thrown: fn -> throw(:probe) end,
+        malformed: fn -> :probe end
+      ]
+
+      for {name, callback} <- callbacks do
+        {router, queue} = start_pipeline(tmp_dir, file: "routing-#{name}.json")
+        before = Routing.snapshot(router)
+
+        task =
+          Task.async(fn ->
+            MtSubmitPipeline.submit(
+              Map.put(valid_input(), :content, String.duplicate("a", 255)),
+              opts(router, queue, "mid-#{name}")
+              |> Map.put(:reference_allocator, callback)
+            )
+          end)
+
+        assert {:ok, {:error, {:bill, :concat_reference_unavailable}}} = Task.yield(task)
+        assert FakeQueue.envelopes(queue) == []
+        assert Routing.snapshot(router) == before
+      end
+    end
+
+    test "admission snapshot failure queues nothing and accepts a retry with a new callback plan",
+         %{
+           tmp_dir: tmp_dir
+         } do
+      {router, queue} =
+        start_pipeline(tmp_dir,
+          file: "routing-snapshot-failure.json",
+          file_ops: SnapshotFailingOps
+        )
+
+      {:ok, references} = Agent.start_link(fn -> 0 end)
+
+      callback = fn ->
+        Agent.get_and_update(references, fn reference ->
+          next = reference + 1
+          {{:ok, next}, next}
+        end)
+      end
+
+      before = Routing.snapshot(router)
+      SnapshotFailingOps.fail_dir!(tmp_dir)
+      on_exit(fn -> SnapshotFailingOps.clear_dir!(tmp_dir) end)
+
+      assert {:error, {:dispatch, :snapshot_failed}} =
+               MtSubmitPipeline.submit(
+                 Map.put(valid_input(), :content, String.duplicate("a", 255)),
+                 opts(router, queue, "mid-snapshot")
+                 |> Map.put(:reference_allocator, callback)
+               )
+
+      assert FakeQueue.envelopes(queue) == []
+      assert Routing.snapshot(router) == before
+
+      SnapshotFailingOps.clear_dir!(tmp_dir)
+
+      assert {:ok, "mid-snapshot"} =
+               MtSubmitPipeline.submit(
+                 Map.put(valid_input(), :content, String.duplicate("a", 255)),
+                 opts(router, queue, "mid-snapshot")
+                 |> Map.put(:reference_allocator, callback)
+               )
+
+      assert [first, second] = FakeQueue.envelopes(queue)
+      assert <<5, 0, 3, 2, 2, 1, _::binary>> = first.submit_sm.short_message
+      assert <<5, 0, 3, 2, 2, 2, _::binary>> = second.submit_sm.short_message
+    end
+
+    test "one allocator sequences UDH and SAR multipart references", %{tmp_dir: tmp_dir} do
+      {router, queue} = start_pipeline(tmp_dir, submit_quota: 5)
+      {:ok, allocator} = ConcatReference.start_link(name: nil)
+      input = Map.put(valid_input(), :content, String.duplicate("a", 255))
+
+      assert {:ok, "mid-udh"} =
+               MtSubmitPipeline.submit(
+                 input,
+                 opts(router, queue, "mid-udh")
+                 |> Map.merge(%{concat: :udh, concat_reference: allocator})
+               )
+
+      assert {:ok, "mid-sar"} =
+               MtSubmitPipeline.submit(
+                 input,
+                 opts(router, queue, "mid-sar")
+                 |> Map.merge(%{concat: :sar, concat_reference: allocator})
+               )
+
+      [udh_first, _udh_second, sar_first, _sar_second] = FakeQueue.envelopes(queue)
+      assert <<5, 0, 3, 1, 2, 1, _payload::binary>> = udh_first.submit_sm.short_message
+
+      assert {:ok, [{:sar_msg_ref_num, 2} | _rest]} =
+               Tlv.decode(sar_first.submit_sm.optional_parameters)
+    end
+
+    test "multipart pipeline dispatch stops on a definitive rejection and refunds its suffix", %{
+      tmp_dir: tmp_dir
+    } do
+      {router, _queue} = start_pipeline(tmp_dir)
+      queue = ScriptedQueue.start([:ok, {:error, :non_ok}])
+      input = Map.put(valid_input(), :content, String.duplicate("a", 255))
+
+      assert {:error, {:dispatch, :non_ok}} =
+               MtSubmitPipeline.submit(
+                 input,
+                 opts(router, {ScriptedQueue, queue}, "mid-partial")
+                 |> Map.put(:queue, {ScriptedQueue, queue})
+                 |> Map.put(:reference_allocator, fn -> {:ok, 9} end)
+               )
+
+      assert [first, second] = ScriptedQueue.envelopes(queue)
+      assert first.segment.index == 1
+      assert second.segment.index == 2
+      assert Routing.snapshot(router).segment_dispatches["mid-partial"].phase == :closed
+      assert Routing.snapshot(router).users["u1"].balance_minor == 400
+      assert Routing.snapshot(router).users["u1"].submit_quota == 2
     end
 
     test "hex with invalid UCS2 structure is invalid_content not malformed_hex", %{
@@ -646,7 +857,10 @@ defmodule JasminEx.MtSubmitPipelineTest do
 
   defp start_pipeline(tmp_dir, opts \\ []) do
     config =
-      Config.new(snapshot_path: Path.join(tmp_dir, Keyword.get(opts, :file, "routing.json")))
+      Config.new(
+        snapshot_path: Path.join(tmp_dir, Keyword.get(opts, :file, "routing.json")),
+        file_ops: Keyword.get(opts, :file_ops)
+      )
 
     router = start_supervised!({Router, name: nil, config: config}, id: make_ref())
     {:ok, group} = Routing.put_group(router, gid: "ops")

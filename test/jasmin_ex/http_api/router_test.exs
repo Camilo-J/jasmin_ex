@@ -10,6 +10,7 @@ defmodule JasminEx.HttpApi.RouterTest do
   alias JasminEx.Dlr.Config, as: DlrConfig
   alias JasminEx.HttpApi.Metrics
   alias JasminEx.HttpApi.Router
+  alias JasminEx.MtSubmitPipeline.ConcatReference
   alias JasminEx.Routing
   alias JasminEx.Routing.Config
   alias JasminEx.Routing.ConnectorRef
@@ -271,6 +272,28 @@ defmodule JasminEx.HttpApi.RouterTest do
       assert_no_submit(env)
     end
 
+    test "multipart DLR is rejected before billing or publication", %{tmp_dir: tmp_dir} do
+      env = start_http(tmp_dir, dlr: :enabled, concat: :udh, max_segments: 5)
+      before = billing_view(Routing.snapshot(env.router))
+
+      conn =
+        request(
+          env,
+          :post,
+          "/send",
+          Map.merge(send_fields(), %{
+            "content" => String.duplicate("a", 255),
+            "dlr" => "yes",
+            "dlr-url" => "http://example.com/dlr"
+          })
+        )
+
+      assert_error(conn, 400, :multipart_dlr_not_supported)
+      assert FakeQueue.envelopes(env.queue) == []
+      assert billing_view(Routing.snapshot(env.router)) == before
+      assert dlr_empty?(env)
+    end
+
     test "server multipart settings reach the production pipeline for legacy messages", %{
       tmp_dir: tmp_dir
     } do
@@ -376,7 +399,7 @@ defmodule JasminEx.HttpApi.RouterTest do
       assert byte_size(u.submit_sm.short_message) == 254
     end
 
-    test "hex coding 2 accepts 254 octets including NUL and rejects 255", %{tmp_dir: tmp_dir} do
+    test "hex coding 2 accepts 254 octets including NUL and segments 255", %{tmp_dir: tmp_dir} do
       wire254 = <<0>> <> :binary.copy(<<0xFF>>, 253)
       env = start_http(tmp_dir, file: "routing-hex254.json", id: "mid-hex254")
 
@@ -392,8 +415,10 @@ defmodule JasminEx.HttpApi.RouterTest do
 
       too_long = request(env255, :post, "/send", hex_fields(Base.encode16(wire255), "2"))
 
-      assert_error(too_long, 400, :message_too_long)
-      assert_no_submit(env255)
+      assert too_long.status == 200
+
+      assert [%{segment: %{count: 2}}, %{segment: %{count: 2}}] =
+               FakeQueue.envelopes(env255.queue)
     end
 
     test "Filter.Content matches original text, not UCS2 wire bytes", %{tmp_dir: tmp_dir} do
@@ -808,13 +833,15 @@ defmodule JasminEx.HttpApi.RouterTest do
       end
 
     {:ok, metrics} = Metrics.start_link()
+    {:ok, concat_reference} = ConcatReference.start_link(name: nil)
     id = Keyword.get(opts, :id, "mid-http")
 
     router_opts = %{
       router: router,
       queue: if(queue, do: {FakeQueue, queue}),
       metrics: metrics,
-      id_fun: fn -> id end
+      id_fun: fn -> id end,
+      concat_reference: concat_reference
     }
 
     router_opts = Map.merge(router_opts, Map.take(Map.new(opts), [:concat, :max_segments]))
@@ -890,6 +917,7 @@ defmodule JasminEx.HttpApi.RouterTest do
             {_flags,
              [
                _metrics,
+               _concat_reference,
                %{start: {Bandit, :start_link, [[{:plug, {_router, plug_opts}} | _]]}}
              ]}} = JasminEx.HttpApi.Supervisor.init(supervisor_opts)
 

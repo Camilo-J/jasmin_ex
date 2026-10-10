@@ -6,7 +6,9 @@ defmodule JasminEx.MtSubmitPipeline.Segmentation do
   Multipart plans require a caller-owned reference; no reference is generated here.
   SAR plans reserve a seven-octet handset UDH for a sixteen-bit reference.
   See `docs/http-long-messages.md` for provider assumptions and result fields.
-  This planner is not connected to HTTP submission or transport.
+  The production HTTP pipeline uses this planner for encoded multipart payloads before
+  segment-aware admission and queue dispatch. This module remains a pure planner; HTTP
+  policy, reference allocation, billing and transport are owned by their respective layers.
   """
 
   alias JasminEx.Smpp.PDU.Coding

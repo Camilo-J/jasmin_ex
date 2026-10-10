@@ -42,7 +42,7 @@ defmodule JasminEx.HttpApi.Router do
 
   post "/send" do
     {conn, result} = send_request(conn)
-    finish(conn, :send, Response.from(result))
+    finish(conn, :send, send_response(result))
   end
 
   post "/rate" do
@@ -76,6 +76,7 @@ defmodule JasminEx.HttpApi.Router do
           :id_fun,
           :concat,
           :max_segments,
+          :concat_reference,
           :dlr_store,
           :dlr_config,
           :dlr_clock
@@ -128,8 +129,14 @@ defmodule JasminEx.HttpApi.Router do
   defp rate_content(params, input) do
     if Map.has_key?(params, "content") or Map.has_key?(params, "hex-content") do
       case Production.validate_payload(input) do
-        {:ok, payload} -> {:ok, payload.content}
-        {:error, reason} -> {:error, reason}
+        {:ok, %{encoded_short_message: encoded}} when byte_size(encoded) > 254 ->
+          {:error, :message_too_long}
+
+        {:ok, payload} ->
+          {:ok, payload.content}
+
+        {:error, reason} ->
+          {:error, reason}
       end
     else
       {:ok, ""}
@@ -241,6 +248,11 @@ defmodule JasminEx.HttpApi.Router do
     do: :ok
 
   defp require_dlr_available(_opts, %DlrRequest{enabled: true}), do: {:error, :dlr_unavailable}
+
+  defp send_response({:error, {:bill, :multipart_dlr_not_supported}}),
+    do: {400, "error:multipart_dlr_not_supported\n"}
+
+  defp send_response(result), do: Response.from(result)
 
   defp require_param(params, key, reason) do
     case Map.get(params, key) do
