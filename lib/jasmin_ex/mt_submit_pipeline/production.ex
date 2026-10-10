@@ -3,6 +3,7 @@ defmodule JasminEx.MtSubmitPipeline.Production do
 
   alias JasminEx.Billing.Admission
   alias JasminEx.Billing.Bill
+  alias JasminEx.Billing.Fingerprint
   alias JasminEx.Billing.Settlement
   alias JasminEx.Dlr.Config, as: DlrConfig
   alias JasminEx.Dlr.Map, as: DlrMap
@@ -10,10 +11,14 @@ defmodule JasminEx.MtSubmitPipeline.Production do
   alias JasminEx.Messaging.Envelope
   alias JasminEx.Messaging.RabbitMQ.Publisher
   alias JasminEx.Messaging.WorkQueue
+  alias JasminEx.MtSubmitPipeline.ConcatReference
+  alias JasminEx.MtSubmitPipeline.Segmentation
+  alias JasminEx.MtSubmitPipeline.SegmentDispatch
   alias JasminEx.Routing
   alias JasminEx.Routing.Routable
   alias JasminEx.Routing.RouteTable
   alias JasminEx.Smpp.PDU.Coding
+  alias JasminEx.Smpp.PDU.Tlv
 
   @allowed_keys MapSet.new([:uid, :to, :from, :content, :hex_content, :coding])
   @allowed_coding [0, 1, 2, 3, 8]
@@ -85,18 +90,19 @@ defmodule JasminEx.MtSubmitPipeline.Production do
     route = message.route
     bill_id = message_id(opts)
 
-    with {:ok, bill} <-
+    with {:ok, message} <- prepare_multipart(message, opts),
+         {:ok, bill} <-
            Bill.new(
              bill_id: bill_id,
              uid: message.uid,
              route_order: route.order,
              rate_minor: route.rate_minor,
-             precharge_percent: route.precharge_percent
+             precharge_percent: route.precharge_percent,
+             segment_count: segment_count(message)
            ),
          {:ok, admission} <-
-           Admission.new(bill: bill, ttl_ms: Map.get(opts, :ttl_ms, @default_ttl_ms)),
-         {:ok, reservation} <- Routing.admit(router, admission) do
-      {:ok, Map.merge(message, %{bill_id: bill_id, reservation: reservation})}
+           Admission.new(bill: bill, ttl_ms: Map.get(opts, :ttl_ms, @default_ttl_ms)) do
+      admit_message(message, router, bill_id, admission)
     end
   end
 
@@ -127,6 +133,13 @@ defmodule JasminEx.MtSubmitPipeline.Production do
   end
 
   def dispatch(message, router, queue, opts) do
+    case Map.get(message, :multipart) do
+      nil -> dispatch_legacy(message, router, queue, opts)
+      multipart -> dispatch_multipart(message, router, queue, opts, multipart)
+    end
+  end
+
+  defp dispatch_legacy(message, router, queue, opts) do
     case envelope(message, opts) do
       {:ok, envelope} ->
         dispatch_registered(message, router, queue, opts, envelope)
@@ -134,6 +147,13 @@ defmodule JasminEx.MtSubmitPipeline.Production do
       {:error, reason} ->
         _ = compensate(router, message, :non_ok)
         {:error, reason}
+    end
+  end
+
+  defp dispatch_multipart(message, router, queue, opts, multipart) do
+    case child_envelopes(message, opts, multipart) do
+      {:ok, envelopes} -> SegmentDispatch.run(router, queue, message.admission, envelopes)
+      error -> error
     end
   end
 
@@ -180,6 +200,143 @@ defmodule JasminEx.MtSubmitPipeline.Production do
 
     if request_receipt?(opts), do: Map.put(submit, :registered_delivery, 1), else: submit
   end
+
+  defp prepare_multipart(%{encoded_short_message: encoded} = message, _opts)
+       when byte_size(encoded) <= @max_encoded_octets,
+       do: {:ok, message}
+
+  defp prepare_multipart(message, opts) do
+    options = [
+      concat: Map.get(opts, :concat, :udh),
+      max_segments: Map.get(opts, :max_segments, 5)
+    ]
+
+    with {:ok, _template} <- plan(message, options ++ [reference: 1]),
+         :ok <- reject_multipart_dlr(opts),
+         {:ok, reference} <- allocate_reference(opts),
+         {:ok, plan} <- plan(message, options ++ [reference: reference]) do
+      {:ok, Map.put(message, :multipart, %{plan: plan, reference: reference})}
+    end
+  end
+
+  defp plan(message, options) do
+    case Segmentation.plan(message.encoded_short_message, message.coding, options) do
+      {:error, {:too_many_segments, _actual, _maximum}} -> {:error, :message_too_long}
+      other -> other
+    end
+  end
+
+  defp reject_multipart_dlr(%{dlr_request: %DlrRequest{enabled: true}}),
+    do: {:error, :multipart_dlr_not_supported}
+
+  defp reject_multipart_dlr(_opts), do: :ok
+
+  defp allocate_reference(%{reference_allocator: allocator}) when is_function(allocator, 0) do
+    case allocator.() do
+      {:ok, reference} when reference in 1..255 -> {:ok, reference}
+      _other -> {:error, :concat_reference_unavailable}
+    end
+  rescue
+    _error -> {:error, :concat_reference_unavailable}
+  catch
+    :exit, _reason -> {:error, :concat_reference_unavailable}
+    :throw, _value -> {:error, :concat_reference_unavailable}
+  end
+
+  defp allocate_reference(opts) do
+    opts
+    |> Map.get(:concat_reference, ConcatReference)
+    |> ConcatReference.next()
+    |> case do
+      {:ok, reference} when reference in 1..255 -> {:ok, reference}
+      _other -> {:error, :concat_reference_unavailable}
+    end
+  end
+
+  defp admit_message(%{multipart: %{}} = message, _router, bill_id, admission),
+    do: {:ok, Map.merge(message, %{bill_id: bill_id, admission: admission})}
+
+  defp admit_message(message, router, bill_id, admission) do
+    with {:ok, reservation} <- Routing.admit(router, admission) do
+      {:ok, Map.merge(message, %{bill_id: bill_id, reservation: reservation})}
+    end
+  end
+
+  defp segment_count(%{multipart: %{plan: %{count: count}}}), do: count
+  defp segment_count(_message), do: 1
+
+  defp child_envelopes(message, opts, %{plan: %{segments: segments}}) do
+    {:ok, fingerprint} = Fingerprint.compute(message.admission.bill)
+    now = DateTime.utc_now()
+    ttl_ms = Map.get(opts, :ttl_ms, @default_ttl_ms)
+
+    Enum.reduce_while(segments, {:ok, []}, fn segment, {:ok, envelopes} ->
+      case child_envelope(message, opts, fingerprint, now, ttl_ms, segment) do
+        {:ok, envelope} -> {:cont, {:ok, [envelope | envelopes]}}
+        error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, envelopes} -> {:ok, Enum.reverse(envelopes)}
+      error -> error
+    end
+  end
+
+  defp child_envelope(message, opts, fingerprint, now, ttl_ms, segment) do
+    case segment_submit_sm(message, segment) do
+      {:ok, submit_sm} ->
+        Envelope.new(%{
+          gateway_id: "#{message.bill_id}:#{segment.index}",
+          connector_id: message.connector_id,
+          attempt: 1,
+          max_attempts: Map.get(opts, :max_attempts, @default_max_attempts),
+          enqueued_at: DateTime.to_iso8601(now),
+          expires_at: DateTime.to_iso8601(DateTime.add(now, ttl_ms, :millisecond)),
+          submit_sm: submit_sm,
+          segment: %{
+            bill_id: message.bill_id,
+            index: segment.index,
+            count: segment.count,
+            fingerprint_version: fingerprint.version,
+            fingerprint_digest_base64: Base.encode64(fingerprint.digest)
+          }
+        })
+
+      error ->
+        error
+    end
+  end
+
+  defp segment_submit_sm(message, segment) do
+    submit = %{
+      source_addr: message.from,
+      destination_addr: message.to,
+      short_message: segment.short_message,
+      data_coding: message.coding,
+      esm_class: segment.esm_class
+    }
+
+    case sar_optional_parameters(segment) do
+      {:ok, <<>>} ->
+        {:ok, submit}
+
+      {:ok, optional_parameters} ->
+        {:ok, Map.put(submit, :optional_parameters, optional_parameters)}
+
+      error ->
+        error
+    end
+  end
+
+  defp sar_optional_parameters(%{sar_msg_ref_num: reference} = segment) do
+    Tlv.encode(
+      sar_msg_ref_num: reference,
+      sar_total_segments: segment.sar_total_segments,
+      sar_segment_seqnum: segment.sar_segment_seqnum
+    )
+  end
+
+  defp sar_optional_parameters(_segment), do: {:ok, <<>>}
 
   defp request_receipt?(%{dlr_request: %DlrRequest{request_receipt: true}}), do: true
   defp request_receipt?(_opts), do: false
@@ -284,13 +441,7 @@ defmodule JasminEx.MtSubmitPipeline.Production do
   end
 
   defp encoded_short_message(input, content, coding) do
-    with {:ok, encoded} <- wire_bytes(input, content, coding) do
-      if byte_size(encoded) > @max_encoded_octets do
-        {:error, :message_too_long}
-      else
-        {:ok, encoded}
-      end
-    end
+    wire_bytes(input, content, coding)
   end
 
   defp wire_bytes(input, content, coding) do

@@ -4,6 +4,7 @@ defmodule JasminEx.HttpApi.Supervisor do
 
   alias JasminEx.HttpApi.Metrics
   alias JasminEx.HttpApi.Router
+  alias JasminEx.MtSubmitPipeline.ConcatReference
   alias JasminEx.Routing.Router, as: RoutingRouter
 
   @spec start_link(keyword()) :: Supervisor.on_start()
@@ -28,12 +29,14 @@ defmodule JasminEx.HttpApi.Supervisor do
     router = Keyword.get(opts, :router, RoutingRouter)
     queue = Keyword.get(opts, :queue)
     pipeline = Keyword.get(opts, :pipeline, JasminEx.MtSubmitPipeline)
+    concat_reference = Keyword.get(opts, :concat_reference, ConcatReference)
     dlr_store = Keyword.get(opts, :dlr_store)
     dlr_config = Keyword.get(opts, :dlr_config)
 
     Supervisor.init(
       [
         %{id: Metrics, start: {Metrics, :start_link, [[name: metrics]]}},
+        {ConcatReference, name: concat_reference},
         {Bandit,
          [
            plug:
@@ -43,6 +46,7 @@ defmodule JasminEx.HttpApi.Supervisor do
                 router: router,
                 queue: queue,
                 pipeline: pipeline,
+                concat_reference: concat_reference,
                 concat: config.concat,
                 max_segments: config.max_segments,
                 dlr_store: dlr_store,

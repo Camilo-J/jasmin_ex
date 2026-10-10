@@ -42,12 +42,14 @@ defmodule JasminEx.HttpApi.ApplicationTest do
             {_flags,
              [
                _metrics,
+               _concat_reference,
                %{start: {Bandit, :start_link, [[{:plug, {_router, plug_opts}} | _]]}}
              ]}} = HttpSupervisor.init(opts)
 
     assert plug_opts.concat == :sar
     assert plug_opts.max_segments == 3
     assert plug_opts.pipeline == JasminEx.MtSubmitPipeline
+    assert plug_opts.concat_reference == JasminEx.MtSubmitPipeline.ConcatReference
 
     assert [
              %{id: Connection},
