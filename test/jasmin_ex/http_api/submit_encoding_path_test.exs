@@ -24,6 +24,7 @@ defmodule JasminEx.HttpApi.SubmitEncodingPathTest do
   alias JasminEx.Smpp.FakeSMSC
   alias JasminEx.Smpp.PDU
   alias JasminEx.Smpp.PDU.Body
+  alias JasminEx.Smpp.PDU.Coding
   alias JasminEx.Smpp.PDU.Tlv
 
   defmodule FakeQueue do
@@ -206,6 +207,117 @@ defmodule JasminEx.HttpApi.SubmitEncodingPathTest do
       assert %Body.SubmitSM{data_coding: :UCS2} = submit_body_on_fake_smsc(first)
       assert %Body.SubmitSM{data_coding: :UCS2} = submit_body_on_fake_smsc(second)
     end
+  end
+
+  test "HTTP multipart GSM extension pairs survive UDH and SAR wire boundaries", %{
+    tmp_dir: tmp_dir
+  } do
+    for {concat, capacity} <- [udh: 153, sar: 152],
+        prefix_size <- [capacity - 2, capacity - 1, capacity] do
+      prefix = String.duplicate("a", prefix_size)
+      suffix = String.duplicate("b", 110)
+      token = <<0x1B, 0x65>>
+
+      expected_parts =
+        if prefix_size + 2 <= capacity,
+          do: [prefix <> token, suffix],
+          else: [prefix, token <> suffix]
+
+      assert_boundary_wire(
+        tmp_dir,
+        "gsm-#{concat}-#{prefix_size}",
+        concat,
+        0,
+        prefix <> "€" <> suffix,
+        expected_parts,
+        capacity
+      )
+    end
+  end
+
+  test "HTTP multipart UTF-16 surrogate pairs survive UDH and SAR wire boundaries", %{
+    tmp_dir: tmp_dir
+  } do
+    for {concat, capacity} <- [udh: 134, sar: 132],
+        prefix_count <- [div(capacity, 2) - 2, div(capacity, 2) - 1, div(capacity, 2)] do
+      prefix = :binary.copy(<<0x00, 0x61>>, prefix_count)
+      suffix = :binary.copy(<<0x00, 0x62>>, 62)
+      token = <<0xD8, 0x3D, 0xDE, 0x80>>
+
+      expected_parts =
+        if byte_size(prefix) + 4 <= capacity,
+          do: [prefix <> token, suffix],
+          else: [prefix, token <> suffix]
+
+      assert_boundary_wire(
+        tmp_dir,
+        "ucs2-#{concat}-#{prefix_count}",
+        concat,
+        8,
+        String.duplicate("a", prefix_count) <> "🚀" <> String.duplicate("b", 62),
+        expected_parts,
+        capacity
+      )
+    end
+  end
+
+  defp assert_boundary_wire(tmp_dir, name, concat, coding, content, expected_parts, capacity) do
+    env = start_http(tmp_dir, file: "routing-#{name}.json", concat: concat, id: name)
+    expected_encoded = IO.iodata_to_binary(expected_parts)
+    assert byte_size(expected_encoded) > 254
+
+    assert %Plug.Conn{status: 200, resp_body: response} =
+             request(env, send_fields(%{"content" => content, "coding" => to_string(coding)}))
+
+    assert response == name <> "\n"
+    envelopes = FakeQueue.envelopes(env.queue)
+    assert length(envelopes) == 2
+
+    wire_parts =
+      for {envelope, index} <- Enum.with_index(envelopes, 1) do
+        assert envelope.segment.index == index
+        assert envelope.segment.count == 2
+        assert {:ok, encoded} = Envelope.encode(envelope)
+        assert {:ok, decoded} = Envelope.decode(encoded)
+        assert decoded.segment == envelope.segment
+        assert decoded.submit_sm.short_message == envelope.submit_sm.short_message
+
+        body = submit_body_on_fake_smsc(decoded)
+        assert body.short_message == decoded.submit_sm.short_message
+        assert body.data_coding == if(coding == 0, do: :SMSC_DEFAULT_ALPHABET, else: :UCS2)
+
+        {reference, payload} =
+          case concat do
+            :udh ->
+              assert body.esm_class == 0x40
+              assert <<5, 0, 3, reference, 2, ^index, payload::binary>> = body.short_message
+              assert byte_size(body.short_message) <= capacity + 6
+              assert {:ok, []} = Tlv.decode(body.optional_parameters)
+              {reference, payload}
+
+            :sar ->
+              assert body.esm_class == 0
+
+              assert {:ok,
+                      [
+                        {:sar_msg_ref_num, reference},
+                        {:sar_total_segments, 2},
+                        {:sar_segment_seqnum, ^index}
+                      ]} = Tlv.decode(body.optional_parameters)
+
+              {reference, body.short_message}
+          end
+
+        assert reference in 1..255
+        assert byte_size(payload) <= capacity
+        assert payload == Enum.at(expected_parts, index - 1)
+        assert {:ok, _text} = Coding.decode_short_message(coding, payload)
+        {reference, payload}
+      end
+
+    assert [{reference, _first}, {reference, _second}] = wire_parts
+    assert wire_parts |> Enum.map(&elem(&1, 1)) |> IO.iodata_to_binary() == expected_encoded
+    assert {:ok, ^content} = Coding.decode_short_message(coding, expected_encoded)
   end
 
   defp submit_on_fake_smsc(envelope) do
