@@ -479,7 +479,8 @@ defmodule JasminEx.Smpp.Client do
     %{
       connector_id: connector_id,
       publisher: {module, context},
-      dlr_expiry: config.dlr_expiry
+      dlr_lifetime_s: Config.dlr_lifetime_s(config),
+      correlation_group: config.dlr_correlation_group
     }
   end
 

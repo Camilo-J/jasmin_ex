@@ -115,7 +115,8 @@ defmodule JasminEx.Dlr.Lookup do
 
   defp reverse(event, request) do
     %{
-      connector_id: event.connector_id,
+      connector_id: request.connector_id,
+      correlation_group: request.correlation_group,
       raw_smsc_id: event.raw_smsc_id,
       gateway_id: request.gateway_id,
       expiry_s: request.expiry_s
@@ -140,8 +141,10 @@ defmodule JasminEx.Dlr.Lookup do
       else: {:terminal, :connector_mismatch}
   end
 
+  # Any connector of the submitting connector's correlation group may deliver
+  # the receipt.
   defp match_receipt(event, record) do
-    if event.connector_id == record.connector_id,
+    if event.correlation_group == record.correlation_group,
       do: :ok,
       else: {:terminal, :connector_mismatch}
   end

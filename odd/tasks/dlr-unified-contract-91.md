@@ -1,0 +1,48 @@
+# Issue 91 — Unified DLR contract (single and multipart)
+
+Objective: implement the agreed unified JSON DLR contract in `docs/dlr-handling.md` ("Multipart DLR — agreed design" and "Implementation decisions") and lift the `multipart_dlr_not_supported` guard.
+Branch: `feat/dlr-unified-contract-91` from `main` `1f9dfed`. Delivery: stacked-to-main in batches (user left batching to the agent, L5): PR-A T1-T3 groundwork, PR-B T4 JSON contract, PR-C T5-T6 aggregation, PR-D T7-T8 closure and wake-up, PR-E T9 activation. Forecast about 3500 authored lines over 9 slices. Runner: `mix test`; integration: `mix test --include integration <file>`.
+
+## Specs
+
+- S1 Callback transport: "POST with JSON only for both single-message and multipart DLR callbacks", `Content-Type: application/json`. "GET callbacks and POST form encoding are not supported by the new contract; there is no optional legacy transport or automatic fallback." Acknowledgement unchanged: status below 400 and trimmed body `ACK/Jasmin`; HTTP 404 terminal; other failures keep the retry policy.
+- S2 Payload shape (design doc "Callback contract"): `schema_version` (`1`), `id`, `connector` (submitting gateway connector, omitted only when no submit was proven), `level` (`1` or `2`), `status`, `status_origin` (always `gateway`), `reason` when applicable, `total_segments`, `segments` in index order. Segment fields: `index` (one-based), `id_smsc`, `message_status`, `err`, and for delivery `sub`, `dlvrd`, `subdate`, `donedate`, `text`, `received_at` (UTC ISO 8601 with `Z`). Missing evidence is omitted; `ND` and empty `text` are missing evidence. No root `id_smsc`, no `message_status` at root, no raw SMSC id in `connector`.
+- S3 Stages: level `1` acceptance, `2` delivery, `3` both as separate callbacks; "There is no callback with `level: 3` combining the stages." One closed result per `(id, level)`; retries keep the same payload.
+- S4 Acceptance: `ACCEPTED` when every required segment has a successful `submit_sm_resp`; `FAILED` on definitive rejection or proven inability to send; otherwise `UNRESOLVED`. Per-segment wait is `response_timeout_ms` (default 5,000 ms). No automatic retransmission.
+- S5 Delivery: `DELIVERED` when every segment has a `DELIVRD` receipt; `FAILED` immediately on a definitive failure (including a definitive submission failure); `UNRESOLVED` with reason `DLR_TIMEOUT` at the deadline, or with reason `SUBMIT_UNCONFIRMED` before it when every segment is decided or can never be correlated and none failed. Last observed receipt wins while open; closed results never reopen or produce a replacement callback.
+- S6 Deadline: default 3600 s from the timestamp in the first segment's pre-send `:dispatching` journal record; later segments do not restart it; recovery does not restart it.
+- S7 Configuration: global `:dlr` `dlr_deadline_s` and `dlr_closed_retention_s` (default `3600`); connector overrides `dlr_deadline`, `dlr_closed_retention`; connector `dlr_correlation_group` defaulting to its connector id. A message uses the values of the connector that submitted it. `dlr_expiry_s` and connector `dlr_expiry` are removed.
+- S8 Correlation group: reverse key is `(correlation group, normalized SMSC id)`; a receipt on any connector of the group matches. Reused SMSC id: taken over only if the holder is closed; if open, keep the mapping, the new segment becomes uncorrelatable, log and count the collision.
+- S9 Closed-state record: write closed record with `status`, `reason`, `closed_at`, frozen payload and pending flag; publish to `dlr_thrower.http`; after broker confirm shrink to marker (`status`, `reason`, `closed_at`) and delete frozen payload and segment evidence; marker and reverse keys expire at `closed_at` + retention. Recovery republishes the frozen payload. Late receipt during the window is only logged and counted; after it, an orphan.
+- S10 Deadline wake-up: one durable wake-up per message on first dispatch; tiered quorum wait queues `<queue_prefix>.deadline.wait.{1h,10m,1m,10s}` (reject-publish, at-least-once dead-lettering) into `<queue_prefix>.deadline`, work queue declared first; consumer closes `UNRESOLVED`/`DLR_TIMEOUT` if open and past deadline, otherwise re-tiers; never cancelled; trigger acked only after the record is shrunk.
+- S11 Open records carry a safety TTL of deadline + retention + fixed 1 h margin.
+- S12 Capacity: integration test against real Redis measuring `MEMORY USAGE` of an open message, a segment, reverse keys and a closed marker; figures documented.
+- S13 Multipart requests with DLR are accepted (guard `multipart_dlr_not_supported` removed); docs updated; no changelog (Conventional Commits record the breaking change).
+
+## Tasks
+
+| ID | Specs | Work | Route | Status | Commit |
+|---|---|---|---|---|---|
+| T1 | S7 | Config swap: add deadline/retention/group, remove `dlr_expiry*`, rewire injection and per-connector lookup | inline | done (RED 17 failing → GREEN; full suite 976 passed) | `5c0d2bc` (assess: medium, under_budget) |
+| T2 | S6 | Add dispatch timestamp to the `:dispatching` journal record and codec | inline | done (RED 4 failing → GREEN; full suite 980 passed) | `0dd7960` (assess: medium, under_budget) |
+| T3 | S8 | Correlation group in reverse key and receipt matching; reused-id rule for open holders | inline | done (RED 9 failing → GREEN; full suite 988 passed) | see L8 |
+| T4 | S1-S3 | JSON payload v1 builder, POST JSON thrower, `HttpJob` reshape, drop GET/form (single segment) | inline | pending | |
+| T5 | S4, S11 | Open aggregation record and acceptance closure (level 1) | inline | pending | |
+| T6 | S5 | Delivery aggregation and early closure (level 2) | inline | pending | |
+| T7 | S8, S9 | Closed-state record, publish confirm, shrink, recovery, late receipts | inline | pending | |
+| T8 | S10 | Deadline wait-queue topology, wake-up publish, deadline worker | inline | pending | |
+| T9 | S12, S13 | Lift multipart guard, e2e, capacity test, docs | inline | pending | |
+
+Order: T1 → T2 → T3 → T4 → T5 → T6 → T7 → T8 → T9 (T2, T4 and the T8 topology are independent of T3).
+
+## Log
+
+- L1 (2026-11-14) User: "Hola, valida donde nos quedamos en la ultima session. Entiendo que estabamos listo para implementar, verda?" — then "Perfecto, si actualiza la rama. Y vamos con esos detalles de implementacion".
+- L2 (2026-11-14) User on changelog and `dlr_expiry`: "ENtiendo, sobre el CHANGELOG, en si este proyecto se esta construyendo y no hay nadie usandol, asi que no se si trackear. Sobre el dlr_expiry, si diria quitarlo entonces, ya que con el nuevo diseño seria irrelevante como mencionas." Decisions recorded in the design doc "Implementation decisions".
+- L3 (2026-11-14) Code map: reverse mapping written by `LookupPlan.apply_reverse` on `dlr.submit_sm_resp`; `SettlementJournal.Record` has no timestamp; `StateStore` only has `fetch`/`put` (PX TTL)/`delete`, no atomic ops; callbacks are GET/form with fixed string fields in `HttpJob`; `Client.wait_queue_declare_opts/1` hardcodes 5 s TTL; `Dlr.Worker.allowed?/2` whitelists routing keys; `:dlr_expiry_fun` is never set, so per-connector expiry never reached `DlrMap.register` today.
+- L4 Open technical premise for T5: aggregation updates use non-atomic fetch-then-put; DLR workers use `prefetch_count: 1`, but concurrency across nodes and between acceptance/receipt paths must be verified before choosing per-message serialization or an atomic StateStore operation.
+- L5 (2026-11-14) User: "Perfecto, vamos con ello. Si quieres tambien para mayor facilidad y revision podemos ir por lotes a main. Esto te dejo a desicion tuya".
+- L6 T1: `Dlr.Config` gains `dlr_deadline_s`, `dlr_closed_retention_s`, `with_connectors/2`, `windows/2`, `lifetime_s/2`; `Client.Config` gains `dlr_deadline`, `dlr_closed_retention`, `dlr_correlation_group`, `dlr_lifetime_s/1`. Interim correlation lifetime = deadline + retention (2 h default, was 24 h) until T5-T7 replace it. `outcome_retention_ms/2` kept (takes the lifetime). Checks: format, credo strict, dialyzer, `mix test` 976 passed / 30 excluded. Risk: none (requested config change).
+- L7 T2: `SettlementJournal.dispatching/3` stores `dispatched_at_ms` taken from the worker clock just before the pre-send write; the codec writes it only when set, decodes records without it as `nil`, and rejects non-integer or negative values. Additive field: older readers ignore unknown keys. Checks: format, credo strict, dialyzer, `mix test` 980 passed / 30 excluded. Risk: none (additive optional persisted field, both directions tested).
+- L8 T3: reverse key is `(correlation_group, normalized SMSC id)`; request, reverse, plan and receipt-event records carry `correlation_group`, defaulting to the connector id when absent (older records and in-flight events keep working, key bytes unchanged by default). Receipts match when groups are equal. Reused id: interim "closed" = holder's request record missing (deleted on final receipt or expired) → take over; open holder keeps the mapping, the new submit is terminal `reverse_collision`, logged and emitted as `[:jasmin_ex, :dlr, :reverse_collision]`. T7 replaces the interim closed test with the closed marker. Checks: format, credo strict, dialyzer, `mix test` 988 passed / 30 excluded. Risk: none (requested behavior; additive optional persisted fields tested both ways).
+- Next: assess and open PR-A (T1-T3), then T4.

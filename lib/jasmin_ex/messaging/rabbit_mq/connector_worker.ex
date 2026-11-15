@@ -230,9 +230,11 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
 
   defp dispatchable?(_state), do: false
 
-  defp persist_dispatching(%{store: {module, _} = store, config: config}, envelope)
+  defp persist_dispatching(%{store: {module, _} = store, config: config} = state, envelope)
        when is_atom(module) do
-    record = SettlementJournal.dispatching(envelope.gateway_id, envelope.attempt)
+    record =
+      SettlementJournal.dispatching(envelope.gateway_id, envelope.attempt, observed_at_ms(state))
+
     StateStoreJournal.write(store, record, config.default_expiry_ms)
   end
 
@@ -248,7 +250,7 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
       observed_at_ms: observed_at_ms(state)
     }
 
-    ttl = state.dlr_outcome_ttl_ms || SettlementJournal.outcome_retention_ms(86_400)
+    ttl = state.dlr_outcome_ttl_ms || SettlementJournal.outcome_retention_ms(7_200)
 
     with {:ok, record} <-
            StateStoreJournal.read(state.store, envelope.gateway_id, envelope.attempt),

@@ -243,7 +243,8 @@ defmodule JasminEx.Smpp.ConnectorSupervisor.Instance do
              name: LifecycleForwarder.worker_name(connector_id),
              dlr_enabled:
                Keyword.get(opts, :dlr_enabled, Keyword.get(messaging, :dlr_enabled, false)),
-             dlr_outcome_ttl_ms: SettlementJournal.outcome_retention_ms(client_config.dlr_expiry),
+             dlr_outcome_ttl_ms:
+               SettlementJournal.outcome_retention_ms(Config.dlr_lifetime_s(client_config)),
              dlr_publisher:
                Keyword.get(
                  opts,

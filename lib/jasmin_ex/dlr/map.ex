@@ -13,10 +13,14 @@ defmodule JasminEx.Dlr.Map do
     <<"DLR", 1, "req", byte_size(gateway_id)::32, gateway_id::binary>>
   end
 
+  @doc """
+  Reverse key of a correlation group and normalized SMSC id. A connector
+  without a declared group is its own group, so its key is unchanged.
+  """
   @spec reverse_key(binary(), binary()) :: binary()
-  def reverse_key(connector_id, normalized)
-      when is_binary(connector_id) and is_binary(normalized) do
-    <<"DLR", 1, "rev", byte_size(connector_id)::32, connector_id::binary,
+  def reverse_key(correlation_group, normalized)
+      when is_binary(correlation_group) and is_binary(normalized) do
+    <<"DLR", 1, "rev", byte_size(correlation_group)::32, correlation_group::binary,
       byte_size(normalized)::32, normalized::binary>>
   end
 
@@ -63,20 +67,37 @@ defmodule JasminEx.Dlr.Map do
 
   @spec fetch_reverse(StateStore.store(), binary(), binary(), {module(), term()}) ::
           {:ok, map()} | :missing | {:error, term()}
-  def fetch_reverse(store, connector_id, raw_smsc_id, clock)
-      when is_binary(connector_id) and is_binary(raw_smsc_id) do
+  def fetch_reverse(store, correlation_group, raw_smsc_id, clock)
+      when is_binary(correlation_group) and is_binary(raw_smsc_id) do
     with {:ok, normalized} <- normalize_smsc_id(raw_smsc_id) do
-      fetch_typed(store, reverse_key(connector_id, normalized), @reverse_kind, clock)
+      fetch_typed(store, reverse_key(correlation_group, normalized), @reverse_kind, clock)
     end
   end
 
   defp write_reverse(store, record, clock) do
-    key = reverse_key(record.connector_id, record.normalized_smsc_id)
+    key = reverse_key(record.correlation_group, record.normalized_smsc_id)
 
     case fetch_typed(store, key, @reverse_kind, clock) do
       :missing -> persist_reverse(store, key, record, clock)
-      {:ok, existing} -> compare_reverse(existing, record)
+      {:ok, existing} -> reuse_or_compare(store, key, existing, record, clock)
       {:error, _reason} = error -> error
+    end
+  end
+
+  # An SMSC may reuse a message id within a correlation group. A new message
+  # takes the mapping over only from a closed message, whose request record is
+  # gone; an open holder keeps it and the new message cannot be correlated.
+  defp reuse_or_compare(store, key, existing, record, clock) do
+    case compare_reverse(existing, record) do
+      :ok ->
+        :ok
+
+      {:error, :reverse_collision} = collision ->
+        case fetch_request(store, existing.gateway_id, clock) do
+          :missing -> persist_reverse(store, key, record, clock)
+          {:ok, _open} -> collision
+          {:error, _reason} = error -> error
+        end
     end
   end
 
@@ -132,6 +153,7 @@ defmodule JasminEx.Dlr.Map do
   defp build_request(attrs, now_ms) do
     with {:ok, gateway_id} <- required_binary(attrs, :gateway_id),
          {:ok, connector_id} <- required_binary(attrs, :connector_id),
+         {:ok, correlation_group} <- correlation_group(attrs, connector_id),
          {:ok, url} <- required_binary(attrs, :url),
          {:ok, level} <- required_level(attrs),
          {:ok, method} <- required_method(attrs),
@@ -143,6 +165,7 @@ defmodule JasminEx.Dlr.Map do
          gateway_id: gateway_id,
          source: @source,
          connector_id: connector_id,
+         correlation_group: correlation_group,
          url: url,
          level: level,
          method: method,
@@ -155,6 +178,7 @@ defmodule JasminEx.Dlr.Map do
 
   defp build_reverse(attrs, now_ms) do
     with {:ok, connector_id} <- required_binary(attrs, :connector_id),
+         {:ok, correlation_group} <- correlation_group(attrs, connector_id),
          {:ok, raw_smsc_id} <- required_binary(attrs, :raw_smsc_id),
          {:ok, gateway_id} <- required_binary(attrs, :gateway_id),
          {:ok, normalized} <- normalize_smsc_id(raw_smsc_id),
@@ -164,6 +188,7 @@ defmodule JasminEx.Dlr.Map do
          version: 1,
          kind: @reverse_kind,
          connector_id: connector_id,
+         correlation_group: correlation_group,
          raw_smsc_id: raw_smsc_id,
          normalized_smsc_id: normalized,
          gateway_id: gateway_id,
@@ -212,6 +237,7 @@ defmodule JasminEx.Dlr.Map do
   defp record_from(map, @request_kind) do
     with gateway_id when is_binary(gateway_id) <- map["gateway_id"],
          connector_id when is_binary(connector_id) <- map["connector_id"],
+         {:ok, correlation_group} <- stored_group(map, connector_id),
          url when is_binary(url) <- map["url"],
          level when level in [1, 2, 3] <- map["level"],
          method when method in ["GET", "POST"] <- map["method"],
@@ -223,6 +249,7 @@ defmodule JasminEx.Dlr.Map do
          gateway_id: gateway_id,
          source: @source,
          connector_id: connector_id,
+         correlation_group: correlation_group,
          url: url,
          level: level,
          method: method,
@@ -237,6 +264,7 @@ defmodule JasminEx.Dlr.Map do
 
   defp record_from(map, @reverse_kind) do
     with connector_id when is_binary(connector_id) <- map["connector_id"],
+         {:ok, correlation_group} <- stored_group(map, connector_id),
          raw_smsc_id when is_binary(raw_smsc_id) <- map["raw_smsc_id"],
          normalized when is_binary(normalized) <- map["normalized_smsc_id"],
          gateway_id when is_binary(gateway_id) <- map["gateway_id"],
@@ -245,6 +273,7 @@ defmodule JasminEx.Dlr.Map do
       {:ok,
        %{
          connector_id: connector_id,
+         correlation_group: correlation_group,
          raw_smsc_id: raw_smsc_id,
          normalized_smsc_id: normalized,
          gateway_id: gateway_id,
@@ -254,6 +283,21 @@ defmodule JasminEx.Dlr.Map do
        }}
     else
       _ -> {:error, {:malformed_map, :invalid_state}}
+    end
+  end
+
+  defp correlation_group(attrs, connector_id) do
+    case Map.get(attrs, :correlation_group, connector_id) do
+      group when is_binary(group) and group != "" -> {:ok, group}
+      _invalid -> {:error, {:invalid_argument, :correlation_group}}
+    end
+  end
+
+  # Records written before correlation groups existed belong to their connector.
+  defp stored_group(map, connector_id) do
+    case Map.get(map, "correlation_group", connector_id) do
+      group when is_binary(group) and group != "" -> {:ok, group}
+      _invalid -> :error
     end
   end
 

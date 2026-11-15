@@ -89,6 +89,78 @@ defmodule JasminEx.Dlr.LookupPlanTest do
     assert {:ok, %{phase: :complete}} = LookupPlan.fetch(store, "event-submit", clock)
   end
 
+  test "a receipt on another connector of the same correlation group reaches the message" do
+    {:ok, agent} = Agent.start_link(fn -> %{entries: %{}, events: []} end)
+    store = {Store, agent}
+    clock = {Clock, 1_000}
+    test = self()
+
+    :ok =
+      DlrMap.register(store, request_fixture(%{level: 2, correlation_group: "smsc-x"}), clock)
+
+    publisher = fn job ->
+      send(test, {:published, job})
+      :ok
+    end
+
+    context = [store: store, clock: clock, publisher: publisher]
+    assert :ok = LookupPlan.process_event(submit_event(), context)
+    assert {:ok, %{connector_id: "c1"}} = DlrMap.fetch_reverse(store, "smsc-x", "00ab12", clock)
+
+    assert :ok =
+             LookupPlan.process_event(
+               receipt_event(%{connector_id: "c2", correlation_group: "smsc-x"}),
+               context
+             )
+
+    assert_receive {:published, %{gateway_id: "G1", level: 2}}
+
+    assert :retry =
+             LookupPlan.process_event(
+               receipt_event(%{
+                 event_id: "event-other",
+                 connector_id: "c3",
+                 correlation_group: "c3"
+               }),
+               context
+             )
+
+    refute_receive {:published, _job}
+  end
+
+  test "a reused SMSC id held by an open message is logged and counted, not taken over" do
+    {:ok, agent} = Agent.start_link(fn -> %{entries: %{}, events: []} end)
+    store = {Store, agent}
+    clock = {Clock, 1_000}
+    handler_id = {__MODULE__, :reverse_collision, self()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:jasmin_ex, :dlr, :reverse_collision],
+        fn _event, _measurements, metadata, pid -> send(pid, {:collision, metadata}) end,
+        self()
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    :ok = DlrMap.register(store, request_fixture(%{level: 2}), clock)
+    :ok = DlrMap.register(store, request_fixture(%{gateway_id: "G2", level: 2}), clock)
+    context = [store: store, clock: clock, publisher: fn _job -> :ok end]
+    assert :ok = LookupPlan.process_event(submit_event(), context)
+
+    second = %{submit_event() | event_id: "event-submit-2", gateway_id: "G2"}
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :terminal = LookupPlan.process_event(second, context)
+      end)
+
+    assert log =~ "DLR reverse mapping collision"
+    assert_receive {:collision, %{connector_id: "c1", reason_class: :reverse_collision}}
+    assert {:ok, %{gateway_id: "G1"}} = DlrMap.fetch_reverse(store, "c1", "00ab12", clock)
+  end
+
   test "forwarded replay retries cleanup without publishing the callback again" do
     {:ok, agent} = Agent.start_link(fn -> %{entries: %{}, events: []} end)
     store = {Store, agent}
@@ -232,5 +304,28 @@ defmodule JasminEx.Dlr.LookupPlanTest do
       observed_at_ms: 1_000,
       deadline_ms: 80_000
     }
+  end
+
+  defp receipt_event(overrides) do
+    Map.merge(
+      %{
+        kind: :deliver_sm,
+        event_id: "event-receipt",
+        connector_id: "c1",
+        correlation_group: "c1",
+        raw_smsc_id: "00ab12",
+        normalized_smsc_id: "AB12",
+        status: "DELIVRD",
+        sub: "001",
+        dlvrd: "001",
+        subdate: "2601011200",
+        donedate: "2601011201",
+        err: "000",
+        text: "hello",
+        observed_at_ms: 1_000,
+        deadline_ms: 80_000
+      },
+      overrides
+    )
   end
 end

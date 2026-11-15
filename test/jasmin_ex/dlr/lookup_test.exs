@@ -6,6 +6,7 @@ defmodule JasminEx.Dlr.LookupTest do
   @request %{
     gateway_id: "G1",
     connector_id: "c1",
+    correlation_group: "c1",
     url: "https://example.com/dlr",
     level: 1,
     method: "POST",
@@ -71,7 +72,7 @@ defmodule JasminEx.Dlr.LookupTest do
 
   test "final receipt creates level 2 callback using Python-compatible connector fields" do
     event = receipt_event()
-    reverse = {:ok, %{gateway_id: "G1", connector_id: "c1"}}
+    reverse = {:ok, %{gateway_id: "G1", connector_id: "c1", correlation_group: "c1"}}
     request = {:ok, %{@request | level: 3}}
 
     assert {:ok, plan} = Lookup.plan(event, reverse: reverse, request: request)
@@ -85,7 +86,7 @@ defmodule JasminEx.Dlr.LookupTest do
 
   test "non-final receipt keeps correlation and level 1 requests do not receive receipts" do
     event = %{receipt_event() | status: "ACCEPTD"}
-    reverse = {:ok, %{gateway_id: "G1", connector_id: "c1"}}
+    reverse = {:ok, %{gateway_id: "G1", connector_id: "c1", correlation_group: "c1"}}
 
     assert {:ok, plan} =
              Lookup.plan(event, reverse: reverse, request: {:ok, %{@request | level: 2}})
@@ -137,6 +138,7 @@ defmodule JasminEx.Dlr.LookupTest do
       kind: :deliver_sm,
       event_id: "event-receipt",
       connector_id: "c1",
+      correlation_group: "c1",
       raw_smsc_id: "00ab12",
       normalized_smsc_id: "AB12",
       status: "DELIVRD",

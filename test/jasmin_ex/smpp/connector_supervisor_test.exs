@@ -42,7 +42,7 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
              worker_opts[:config]
 
     assert worker_opts[:dlr_enabled] == false
-    assert worker_opts[:dlr_outcome_ttl_ms] == SettlementJournal.outcome_retention_ms(86_400)
+    assert worker_opts[:dlr_outcome_ttl_ms] == SettlementJournal.outcome_retention_ms(7_200)
     assert worker_opts[:router] == JasminEx.Routing.Router
     assert is_function(worker_opts[:settle_segment], 4)
   end
@@ -64,16 +64,17 @@ defmodule JasminEx.Smpp.ConnectorSupervisorTest do
     assert is_function(worker_opts[:settle_segment], 4)
   end
 
-  test "passes connector dlr_expiry into worker outcome retention when DLR is enabled" do
+  test "passes connector DLR windows into worker outcome retention when DLR is enabled" do
     opts =
       connector_config(1111)
-      |> Keyword.put(:dlr_expiry, 3600)
+      |> Keyword.put(:dlr_deadline, 600)
+      |> Keyword.put(:dlr_closed_retention, 300)
       |> Keyword.put(:messaging, enabled_messaging() ++ [dlr_enabled: true])
 
     assert {:ok, {_flags, [_forwarder, _client, worker]}} = Instance.init(opts)
     assert {Instance, :start_worker, [worker_opts, "connector-1111"]} = worker.start
     assert worker_opts[:dlr_enabled] == true
-    assert worker_opts[:dlr_outcome_ttl_ms] == SettlementJournal.outcome_retention_ms(3600)
+    assert worker_opts[:dlr_outcome_ttl_ms] == SettlementJournal.outcome_retention_ms(900)
   end
 
   test "locate does not unsupervised-start or treat a start error as a pid" do

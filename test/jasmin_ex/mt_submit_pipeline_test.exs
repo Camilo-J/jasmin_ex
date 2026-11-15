@@ -706,7 +706,7 @@ defmodule JasminEx.MtSubmitPipelineTest do
       assert record.level == 1
       assert record.method == "POST"
       assert record.connector_id == "smpp-t"
-      assert record.expiry_s == 86_400
+      assert record.expiry_s == 7_200
       assert [%Envelope{gateway_id: "mid-map"}] = FakeQueue.envelopes(queue)
       assert Routing.snapshot(router).reservations["mid-map"].state == :open
     end
@@ -818,18 +818,26 @@ defmodule JasminEx.MtSubmitPipelineTest do
       assert Map.get(envelope.submit_sm, :registered_delivery, 0) == 0
     end
 
-    test "connector expiry comes from injected lookup not the form", %{tmp_dir: tmp_dir} do
+    test "correlation lifetime comes from the submitting connector's DLR windows",
+         %{tmp_dir: tmp_dir} do
       {router, queue} = start_pipeline(tmp_dir)
       {store, log} = dlr_store()
       dlr = dlr_request!(%{"dlr" => "yes", "dlr-url" => "http://example.com/dlr"})
 
+      config =
+        DlrConfig.new(enabled: true, dlr_closed_retention_s: 300)
+        |> DlrConfig.with_connectors([
+          [connector_id: "smpp-t", dlr_deadline: 600, dlr_correlation_group: "smsc-x"]
+        ])
+
       opts =
         dlr_opts(router, queue, "mid-ttl", store, log, dlr)
-        |> Map.put(:dlr_expiry_fun, fn "smpp-t" -> 3600 end)
+        |> Map.put(:dlr_config, config)
 
       assert {:ok, "mid-ttl"} = MtSubmitPipeline.submit(valid_input(), opts)
       assert {:ok, record} = DlrMap.fetch_request(store, "mid-ttl", {DlrClock, 1_000})
-      assert record.expiry_s == 3600
+      assert record.expiry_s == 900
+      assert record.correlation_group == "smsc-x"
     end
 
     test "ambiguous enqueue leaves the billing reservation open", %{tmp_dir: tmp_dir} do

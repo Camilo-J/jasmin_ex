@@ -191,6 +191,56 @@ defmodule JasminEx.Dlr.MapTest do
                DlrMap.put_reverse(store, reverse_attrs(%{raw_smsc_id: ""}), {Clock, 0})
     end
 
+    test "connectors in one correlation group share the reverse key", %{store: store} do
+      assert :ok =
+               DlrMap.put_reverse(
+                 store,
+                 reverse_attrs(%{connector_id: "c1", correlation_group: "smsc-x"}),
+                 {Clock, 0}
+               )
+
+      assert {:ok, record} = DlrMap.fetch_reverse(store, "smsc-x", "00ab12", {Clock, 0})
+      assert record.gateway_id == "G1"
+      assert record.connector_id == "c1"
+      assert record.correlation_group == "smsc-x"
+      assert :missing = DlrMap.fetch_reverse(store, "c1", "00ab12", {Clock, 0})
+    end
+
+    test "records without a correlation group default to their connector", %{
+      store: store,
+      table: table
+    } do
+      legacy =
+        encode(%{
+          "version" => 1,
+          "kind" => "reverse",
+          "connector_id" => "c1",
+          "raw_smsc_id" => "00ab12",
+          "normalized_smsc_id" => "AB12",
+          "gateway_id" => "G1",
+          "source" => "httpapi",
+          "created_at_ms" => 0,
+          "expires_at_ms" => 10_000
+        })
+
+      :ets.insert(table, {DlrMap.reverse_key("c1", "AB12"), legacy, 10_000})
+
+      assert {:ok, %{correlation_group: "c1"}} =
+               DlrMap.fetch_reverse(store, "c1", "00ab12", {Clock, 0})
+
+      assert :ok = DlrMap.register(store, request_attrs(), {Clock, 0})
+      assert {:ok, %{correlation_group: "c1"}} = DlrMap.fetch_request(store, "G1", {Clock, 0})
+
+      assert :ok =
+               DlrMap.register(
+                 store,
+                 request_attrs(%{gateway_id: "G2", correlation_group: "smsc-x"}),
+                 {Clock, 0}
+               )
+
+      assert {:ok, %{correlation_group: "smsc-x"}} = DlrMap.fetch_request(store, "G2", {Clock, 0})
+    end
+
     test "two connectors sharing an SMSC ID do not collide", %{store: store} do
       assert :ok = DlrMap.put_reverse(store, reverse_attrs(%{connector_id: "c1"}), {Clock, 0})
 
@@ -226,6 +276,7 @@ defmodule JasminEx.Dlr.MapTest do
       store: store,
       table: table
     } do
+      assert :ok = DlrMap.register(store, request_attrs(%{level: 2}), {Clock, 0})
       assert :ok = DlrMap.put_reverse(store, reverse_attrs(), {Clock, 0})
       before = :ets.tab2list(table)
       assert :ok = DlrMap.put_reverse(store, reverse_attrs(), {Clock, 1_000})
@@ -235,6 +286,16 @@ defmodule JasminEx.Dlr.MapTest do
                DlrMap.put_reverse(store, reverse_attrs(%{gateway_id: "G-other"}), {Clock, 0})
 
       assert :ets.tab2list(table) == before
+    end
+
+    test "a reused SMSC id is taken over when the holding message is closed", %{store: store} do
+      assert :ok = DlrMap.put_reverse(store, reverse_attrs(), {Clock, 0})
+
+      assert :ok =
+               DlrMap.put_reverse(store, reverse_attrs(%{gateway_id: "G-new"}), {Clock, 1_000})
+
+      assert {:ok, record} = DlrMap.fetch_reverse(store, "c1", "00ab12", {Clock, 1_000})
+      assert record.gateway_id == "G-new"
     end
 
     test "malformed reverse value is terminal and is never overwritten" do

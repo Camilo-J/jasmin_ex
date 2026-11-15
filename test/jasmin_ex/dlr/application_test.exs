@@ -3,6 +3,7 @@ defmodule JasminEx.Dlr.ApplicationTest do
 
   alias JasminEx.Application
   alias JasminEx.Dlr.Config
+  alias JasminEx.Dlr.Event
   alias JasminEx.Dlr.Readiness
   alias JasminEx.Dlr.Supervisor, as: DlrSupervisor
   alias JasminEx.Messaging.RabbitMQ.Connection
@@ -174,6 +175,67 @@ defmodule JasminEx.Dlr.ApplicationTest do
     assert configured[:dlr_enabled] == true
     assert configured[:dlr_publisher] == {TopicPublisher, TopicPublisher}
     assert is_function(configured[:dlr_known_publisher], 2)
+    assert configured[:dlr_deadline] == 3_600
+    assert configured[:dlr_closed_retention] == 3_600
+    refute Keyword.has_key?(configured, :dlr_expiry)
+  end
+
+  test "connector DLR windows win over the global ones for injection and known responses" do
+    connector = [
+      connector_id: "c1",
+      host: ~c"127.0.0.1",
+      port: 2775,
+      system_id: "u",
+      password: "p",
+      system_type: "t",
+      bind_as: :transceiver,
+      dlr_deadline: 120
+    ]
+
+    children =
+      Application.children(
+        messaging: @messaging,
+        dlr: [
+          enabled: true,
+          dlr_deadline_s: 600,
+          dlr_closed_retention_s: 300,
+          publisher: {__MODULE__.SendingPublisher, self()}
+        ],
+        smpp_connectors: [connector]
+      )
+
+    assert {ConnectorSupervisor, [configured]} =
+             Enum.find(children, fn
+               {module, _opts} -> module == ConnectorSupervisor
+               _ -> false
+             end)
+
+    assert configured[:dlr_deadline] == 120
+    assert configured[:dlr_closed_retention] == 300
+
+    known =
+      IO.iodata_to_binary(
+        :json.encode(%{
+          "gateway_id" => "g1",
+          "connector_id" => "c1",
+          "attempt" => 1,
+          "status" => "ESME_ROK",
+          "smsc_id" => "abc",
+          "observed_at_ms" => 1_000
+        })
+      )
+
+    assert :ok = configured[:dlr_known_publisher].("dlr.submit_sm_resp", known)
+    assert_receive {:published, "dlr.submit_sm_resp", payload}
+    assert {:ok, event} = Event.decode(payload)
+    assert event.deadline_ms == 1_000 + (120 + 300) * 1_000
+  end
+
+  defmodule SendingPublisher do
+    def publish(pid, key, payload) do
+      send(pid, {:published, key, payload})
+      :ok
+    end
   end
 
   test "passes only explicit DLR dependency overrides" do
