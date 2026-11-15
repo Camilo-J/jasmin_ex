@@ -33,6 +33,7 @@ defmodule JasminEx.Messaging.StateStoreJournal do
             "evidence" => evidence
           }
           |> maybe_put_known_response(record.known_response)
+          |> maybe_put_dispatched_at(record.dispatched_at_ms)
 
         {:ok, payload |> :json.encode() |> IO.iodata_to_binary()}
 
@@ -56,14 +57,16 @@ defmodule JasminEx.Messaging.StateStoreJournal do
            is_binary(gateway_id) and is_integer(attempt) and attempt > 0 and is_map(evidence),
          {:ok, state} <- known_state(state),
          {:ok, evidence} <- SettlementJournal.canonicalize_evidence(evidence),
-         {:ok, known_response} <- decode_known_response(map) do
+         {:ok, known_response} <- decode_known_response(map),
+         {:ok, dispatched_at_ms} <- decode_dispatched_at(map) do
       {:ok,
        %Record{
          gateway_id: gateway_id,
          attempt: attempt,
          state: state,
          evidence: evidence,
-         known_response: known_response
+         known_response: known_response,
+         dispatched_at_ms: dispatched_at_ms
        }}
     else
       _ -> {:error, :invalid_journal_record}
@@ -76,6 +79,19 @@ defmodule JasminEx.Messaging.StateStoreJournal do
 
   defp maybe_put_known_response(payload, known) when is_map(known),
     do: Map.put(payload, "known_response", known)
+
+  defp maybe_put_dispatched_at(payload, nil), do: payload
+
+  defp maybe_put_dispatched_at(payload, dispatched_at_ms),
+    do: Map.put(payload, "dispatched_at_ms", dispatched_at_ms)
+
+  defp decode_dispatched_at(map) do
+    case Map.get(map, "dispatched_at_ms") do
+      nil -> {:ok, nil}
+      ms when is_integer(ms) and ms >= 0 -> {:ok, ms}
+      _other -> {:error, :invalid_journal_record}
+    end
+  end
 
   defp decode_known_response(map) when is_map(map) do
     case Map.get(map, "known_response") do

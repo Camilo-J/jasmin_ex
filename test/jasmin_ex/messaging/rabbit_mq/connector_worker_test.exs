@@ -314,6 +314,34 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorkerTest do
     stop(worker, agent)
   end
 
+  test "the pre-send dispatching record carries the dispatch time", %{config: config} do
+    {store, _} = journal_store()
+    test = self()
+
+    submit = fn env ->
+      send(test, {:submit_seen, StateStoreJournal.read(store, env.gateway_id, env.attempt)})
+      {:ok, "smsc-time"}
+    end
+
+    {worker, agent} =
+      start_bound(config, "alpha",
+        store: store,
+        submit: submit,
+        dlr_clock: {__MODULE__.FixedClock, 42_000}
+      )
+
+    {_envelope, payload} = valid_payload(%{gateway_id: "gw-time", attempt: 1})
+    assert :ok = Fake.deliver(agent, payload)
+    assert ConnectorWorker.inflight(worker) == nil
+
+    assert_received {:submit_seen, {:ok, %{state: :dispatching, dispatched_at_ms: 42_000}}}
+    stop(worker, agent)
+  end
+
+  defmodule FixedClock do
+    def now_ms(ms), do: ms
+  end
+
   test "journals a valid envelope before submit and acks known success", %{config: config} do
     {store, _} = journal_store()
     test = self()

@@ -5,12 +5,29 @@ defmodule JasminEx.Messaging.SettlementJournal do
     @moduledoc false
 
     @enforce_keys [:gateway_id, :attempt, :state]
-    defstruct [:gateway_id, :attempt, :state, evidence: %{}, known_response: nil]
+    defstruct [
+      :gateway_id,
+      :attempt,
+      :state,
+      evidence: %{},
+      known_response: nil,
+      dispatched_at_ms: nil
+    ]
   end
 
-  def dispatching(gateway_id, attempt)
-      when is_binary(gateway_id) and is_integer(attempt) and attempt > 0 do
-    %Record{gateway_id: gateway_id, attempt: attempt, state: :dispatching}
+  @doc """
+  Builds the pre-send record. `dispatched_at_ms` is the wall-clock time taken
+  just before the record is written, so it never lags the actual submit.
+  """
+  def dispatching(gateway_id, attempt, dispatched_at_ms \\ nil)
+      when is_binary(gateway_id) and is_integer(attempt) and attempt > 0 and
+             (is_nil(dispatched_at_ms) or (is_integer(dispatched_at_ms) and dispatched_at_ms >= 0)) do
+    %Record{
+      gateway_id: gateway_id,
+      attempt: attempt,
+      state: :dispatching,
+      dispatched_at_ms: dispatched_at_ms
+    }
   end
 
   def record_outcome(%Record{state: :dispatching} = record, {state, evidence})

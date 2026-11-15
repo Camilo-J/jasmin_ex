@@ -146,6 +146,39 @@ defmodule JasminEx.Messaging.SettlementJournalTest do
     assert reloaded.known_response["status"] == "ESME_RINVDESTADR"
   end
 
+  test "the dispatch time survives outcomes and storage", %{store: store} do
+    dispatching = SettlementJournal.dispatching("gateway-time", 1, 1_234)
+    assert dispatching.dispatched_at_ms == 1_234
+    assert StateStoreJournal.write(store, dispatching, 60_000) == :ok
+    assert {:ok, %{dispatched_at_ms: 1_234}} = StateStoreJournal.read(store, "gateway-time", 1)
+
+    assert {:ok, recorded} =
+             SettlementJournal.record_outcome(dispatching, {:sent, %{smsc_id: "abc"}})
+
+    assert StateStoreJournal.write(store, recorded, 60_000) == :ok
+    assert {:ok, reloaded} = StateStoreJournal.read(store, "gateway-time", 1)
+    assert reloaded.state == :sent
+    assert reloaded.dispatched_at_ms == 1_234
+  end
+
+  test "records without a dispatch time still load", %{store: store} do
+    legacy = ~s({"gateway_id":"gateway-old","attempt":1,"state":"dispatching","evidence":{}})
+    Store.put(elem(store, 1), StateStoreJournal.key("gateway-old", 1), legacy, 60_000)
+
+    assert {:ok, %{dispatched_at_ms: nil, state: :dispatching}} =
+             StateStoreJournal.read(store, "gateway-old", 1)
+  end
+
+  test "an invalid stored dispatch time is rejected", %{store: store} do
+    for value <- [~s("1234"), "-1", "1.5"] do
+      payload =
+        ~s({"gateway_id":"gateway-bad","attempt":1,"state":"dispatching","evidence":{},"dispatched_at_ms":#{value}})
+
+      Store.put(elem(store, 1), StateStoreJournal.key("gateway-bad", 1), payload, 60_000)
+      assert {:error, :invalid_journal_record} = StateStoreJournal.read(store, "gateway-bad", 1)
+    end
+  end
+
   test "legacy uncertainty records still load without known_response", %{store: store} do
     dispatching = SettlementJournal.dispatching("gateway-legacy", 1)
 
