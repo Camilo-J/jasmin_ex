@@ -40,6 +40,23 @@ defmodule JasminEx.Dlr.ConfigTest do
     assert Config.lifetime_s(config, "c1") == 420
   end
 
+  test "connectors declare an optional correlation group" do
+    config =
+      Config.with_connectors(Config.new(), [
+        [connector_id: "c1", dlr_correlation_group: "smsc-x"],
+        [connector_id: "c2"]
+      ])
+
+    assert Config.correlation_group(config, "c1") == "smsc-x"
+    assert Config.correlation_group(config, "c2") == "c2"
+    assert Config.correlation_group(config, "unknown") == "unknown"
+
+    assert {:error, :invalid_dlr_config} =
+             Config.with_connectors(Config.new(), [
+               [connector_id: "c1", dlr_correlation_group: ""]
+             ])
+  end
+
   test "a single keyword connector is accepted" do
     config = Config.with_connectors(Config.new(), connector_id: "c1", dlr_deadline: 30)
 

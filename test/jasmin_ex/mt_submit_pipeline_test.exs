@@ -826,7 +826,9 @@ defmodule JasminEx.MtSubmitPipelineTest do
 
       config =
         DlrConfig.new(enabled: true, dlr_closed_retention_s: 300)
-        |> DlrConfig.with_connectors([[connector_id: "smpp-t", dlr_deadline: 600]])
+        |> DlrConfig.with_connectors([
+          [connector_id: "smpp-t", dlr_deadline: 600, dlr_correlation_group: "smsc-x"]
+        ])
 
       opts =
         dlr_opts(router, queue, "mid-ttl", store, log, dlr)
@@ -835,6 +837,7 @@ defmodule JasminEx.MtSubmitPipelineTest do
       assert {:ok, "mid-ttl"} = MtSubmitPipeline.submit(valid_input(), opts)
       assert {:ok, record} = DlrMap.fetch_request(store, "mid-ttl", {DlrClock, 1_000})
       assert record.expiry_s == 900
+      assert record.correlation_group == "smsc-x"
     end
 
     test "ambiguous enqueue leaves the billing reservation open", %{tmp_dir: tmp_dir} do

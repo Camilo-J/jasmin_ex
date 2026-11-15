@@ -47,8 +47,9 @@ defmodule JasminEx.Dlr.Config do
   end
 
   @doc """
-  Records explicit per-connector `dlr_deadline` and `dlr_closed_retention`
-  overrides. Connectors without an override use the global values.
+  Records explicit per-connector `dlr_deadline`, `dlr_closed_retention`, and
+  `dlr_correlation_group` values. Connectors without an override use the
+  global values and their own connector id as correlation group.
   """
   @spec with_connectors(t(), keyword() | [keyword() | map()]) ::
           t() | {:error, :invalid_dlr_config}
@@ -66,6 +67,17 @@ defmodule JasminEx.Dlr.Config do
       deadline_s: Map.get(overrides, :deadline_s, config.dlr_deadline_s),
       closed_retention_s: Map.get(overrides, :closed_retention_s, config.dlr_closed_retention_s)
     }
+  end
+
+  @doc """
+  Correlation group of `connector_id`: its explicit `dlr_correlation_group`,
+  or its own connector id.
+  """
+  @spec correlation_group(t(), String.t()) :: String.t()
+  def correlation_group(%__MODULE__{} = config, connector_id) do
+    config.connector_windows
+    |> Map.get(connector_id, %{})
+    |> Map.get(:correlation_group, connector_id)
   end
 
   @doc """
@@ -104,10 +116,20 @@ defmodule JasminEx.Dlr.Config do
           into: %{},
           do: {field, Map.fetch!(opts, key)}
 
-    if Enum.all?(Map.values(overrides), &positive?/1),
-      do: {:ok, Map.get(opts, :connector_id), overrides},
-      else: :error
+    with true <- Enum.all?(Map.values(overrides), &positive?/1),
+         {:ok, overrides} <- put_group(overrides, opts) do
+      {:ok, Map.get(opts, :connector_id), overrides}
+    else
+      _invalid -> :error
+    end
   end
+
+  defp put_group(overrides, %{dlr_correlation_group: group})
+       when is_binary(group) and group != "",
+       do: {:ok, Map.put(overrides, :correlation_group, group)}
+
+  defp put_group(_overrides, %{dlr_correlation_group: _invalid}), do: :error
+  defp put_group(overrides, _opts), do: {:ok, overrides}
 
   defp valid?(%__MODULE__{} = config) do
     is_boolean(config.enabled) and valid_prefix?(config.queue_prefix) and

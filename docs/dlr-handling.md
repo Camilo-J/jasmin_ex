@@ -323,7 +323,8 @@ adds an explicit **correlation group**:
 - A connector without a declared group forms its own group, preserving today's
   per-connector isolation. Correlation by SMSC message id alone, across all
   connectors, was rejected because different SMSCs can issue the same id.
-- The configuration name of the group is not decided.
+- The group is configured per connector with `dlr_correlation_group`
+  (implemented; it defaults to the connector id, so existing keys are unchanged).
 - The root `connector` remains the connector that submitted the message, not the
   connector that received the receipt.
 
@@ -336,6 +337,10 @@ When an SMSC reuses a message id within a correlation group:
   segment becomes uncorrelatable, closing under the `SUBMIT_UNCONFIRMED` rule
   above. The collision is logged and counted so operators can detect it. A
   receipt is never attributed to a message it might not belong to.
+
+Until the closed-state record exists, a holding message counts as closed when
+its request record is gone, because the request is deleted on a final receipt
+and expires with the correlation lifetime.
 
 ### Deadline and operational retention
 

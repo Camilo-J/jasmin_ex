@@ -139,6 +139,21 @@ defmodule JasminEx.Smpp.Client.DeliverSMDispatchTest do
     assert event.deadline_ms - event.observed_at_ms == 900_000
   end
 
+  test "receipt events carry the connector's correlation group" do
+    context = Map.put(dlr_context(), :correlation_group, "smsc-x")
+
+    assert :ESME_ROK =
+             DeliverSMDispatch.dispatch(
+               receipt_body(),
+               {RecordingHandler, self()},
+               self(),
+               context
+             )
+
+    assert_receive {:dlr_publish, "dlr.deliver_sm", payload}
+    assert {:ok, %{correlation_group: "smsc-x"}} = Event.decode(payload)
+  end
+
   test "connector identity comes from configured context, never from the PDU" do
     body =
       receipt_body(

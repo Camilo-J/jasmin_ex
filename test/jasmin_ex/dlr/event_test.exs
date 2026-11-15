@@ -86,6 +86,29 @@ defmodule JasminEx.Dlr.EventTest do
       assert decoded.event_id == Event.receipt_event_id("c1", receipt)
     end
 
+    test "receipts carry the receiving connector's correlation group" do
+      receipt = %Receipt{id: "AB12", stat: "DELIVRD"}
+
+      event = %{
+        kind: :deliver_sm,
+        connector_id: "c2",
+        correlation_group: "smsc-x",
+        receipt: receipt,
+        observed_at_ms: 50,
+        deadline_ms: 150
+      }
+
+      assert {:ok, binary} = Event.encode(event)
+      assert {:ok, %{correlation_group: "smsc-x", connector_id: "c2"}} = Event.decode(binary)
+
+      assert {:ok, %{correlation_group: "c2"}} =
+               event
+               |> Map.delete(:correlation_group)
+               |> Event.encode()
+               |> elem(1)
+               |> Event.decode()
+    end
+
     test "receipt event ids ignore SMPP sequence numbers" do
       receipt = %Receipt{id: "AB12", stat: "UNDELIV"}
       first = Event.receipt_event_id("c1", receipt)

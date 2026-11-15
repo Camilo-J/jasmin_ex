@@ -15,6 +15,7 @@ defmodule JasminEx.Smpp.Client.DeliverSMDispatch do
           required(:connector_id) => String.t(),
           required(:publisher) => {module(), term()},
           optional(:dlr_lifetime_s) => pos_integer(),
+          optional(:correlation_group) => String.t(),
           optional(:clock) => {module(), term()}
         }
 
@@ -47,6 +48,7 @@ defmodule JasminEx.Smpp.Client.DeliverSMDispatch do
     event = %{
       kind: :deliver_sm,
       connector_id: context.connector_id,
+      correlation_group: Map.get(context, :correlation_group, context.connector_id),
       receipt: receipt,
       observed_at_ms: now,
       deadline_ms: now + lifetime * 1000

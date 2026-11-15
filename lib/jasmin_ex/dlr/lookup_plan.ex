@@ -1,7 +1,9 @@
 defmodule JasminEx.Dlr.LookupPlan do
   @moduledoc false
 
-  alias JasminEx.Dlr.{Event, Lookup}
+  require Logger
+
+  alias JasminEx.Dlr.{Event, Lookup, Telemetry}
   alias JasminEx.Dlr.Map, as: DlrMap
   alias JasminEx.StateStore
 
@@ -104,7 +106,12 @@ defmodule JasminEx.Dlr.LookupPlan do
 
   defp build(%{kind: :deliver_sm} = event, context) do
     reverse =
-      DlrMap.fetch_reverse(store(context), event.connector_id, event.raw_smsc_id, clock(context))
+      DlrMap.fetch_reverse(
+        store(context),
+        event.correlation_group,
+        event.raw_smsc_id,
+        clock(context)
+      )
 
     case reverse do
       {:ok, record} ->
@@ -166,9 +173,25 @@ defmodule JasminEx.Dlr.LookupPlan do
     case DlrMap.put_reverse(store(context), reverse, clock(context)) do
       :ok -> :ok
       {:error, {:malformed_map, _reason} = reason} -> {:terminal, reason}
-      {:error, :reverse_collision} -> {:terminal, :reverse_collision}
+      {:error, :reverse_collision} -> report_collision(reverse)
       _other -> :retry
     end
+  end
+
+  # The SMSC reused an id still held by an open message: the new message's
+  # segment stays uncorrelatable rather than stealing the mapping.
+  defp report_collision(reverse) do
+    Logger.warning(
+      "DLR reverse mapping collision: SMSC id reused while held by an open message " <>
+        "(connector=#{reverse.connector_id} group=#{reverse.correlation_group})"
+    )
+
+    Telemetry.emit([:reverse_collision], %{count: 1}, %{
+      connector_id: reverse.connector_id,
+      reason_class: :reverse_collision
+    })
+
+    {:terminal, :reverse_collision}
   end
 
   defp publish(nil, _context), do: :ok
@@ -276,6 +299,7 @@ defmodule JasminEx.Dlr.LookupPlan do
   defp encode_reverse(reverse) do
     %{
       "connector_id" => reverse.connector_id,
+      "correlation_group" => reverse.correlation_group,
       "raw_smsc_id" => reverse.raw_smsc_id,
       "gateway_id" => reverse.gateway_id,
       "expiry_s" => reverse.expiry_s
@@ -338,6 +362,7 @@ defmodule JasminEx.Dlr.LookupPlan do
   defp decode_reverse(map) when is_map(map) do
     reverse = %{
       connector_id: map["connector_id"],
+      correlation_group: Map.get(map, "correlation_group", map["connector_id"]),
       raw_smsc_id: map["raw_smsc_id"],
       gateway_id: map["gateway_id"],
       expiry_s: map["expiry_s"]

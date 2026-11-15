@@ -362,6 +362,7 @@ defmodule JasminEx.MtSubmitPipeline.Production do
           %{
             gateway_id: message.bill_id,
             connector_id: message.connector_id,
+            correlation_group: correlation_group(opts, message.connector_id),
             url: request.url,
             level: request.level,
             method: request.method,
@@ -382,12 +383,13 @@ defmodule JasminEx.MtSubmitPipeline.Production do
     end
   end
 
-  defp dlr_lifetime_s(opts, connector_id) do
-    opts
-    |> Map.get(:dlr_config)
-    |> Kernel.||(DlrConfig.new())
-    |> DlrConfig.lifetime_s(connector_id)
-  end
+  defp dlr_lifetime_s(opts, connector_id),
+    do: opts |> dlr_config() |> DlrConfig.lifetime_s(connector_id)
+
+  defp correlation_group(opts, connector_id),
+    do: opts |> dlr_config() |> DlrConfig.correlation_group(connector_id)
+
+  defp dlr_config(opts), do: Map.get(opts, :dlr_config) || DlrConfig.new()
 
   def now_ms(:system), do: System.system_time(:millisecond)
 

@@ -84,6 +84,7 @@ defmodule JasminEx.Dlr.Event do
          "kind" => "deliver_sm",
          "event_id" => receipt_event_id(connector_id, receipt),
          "connector_id" => connector_id,
+         "correlation_group" => Map.get(event, :correlation_group) || connector_id,
          "raw_smsc_id" => raw_smsc_id,
          "normalized_smsc_id" => normalized,
          "status" => receipt.stat,
@@ -127,6 +128,7 @@ defmodule JasminEx.Dlr.Event do
   defp decode_kind("deliver_sm", map) do
     with {:ok, event_id} <- required(map, "event_id"),
          {:ok, connector_id} <- required(map, "connector_id"),
+         {:ok, correlation_group} <- correlation_group(map, connector_id),
          {:ok, raw_smsc_id} <- required(map, "raw_smsc_id"),
          {:ok, normalized} <- required(map, "normalized_smsc_id"),
          {:ok, status} <- required(map, "status"),
@@ -143,6 +145,7 @@ defmodule JasminEx.Dlr.Event do
          kind: :deliver_sm,
          event_id: event_id,
          connector_id: connector_id,
+         correlation_group: correlation_group,
          raw_smsc_id: raw_smsc_id,
          normalized_smsc_id: normalized,
          status: status,
@@ -159,6 +162,14 @@ defmodule JasminEx.Dlr.Event do
   end
 
   defp decode_kind(_kind, _map), do: {:error, :unknown_kind}
+
+  # Events published before correlation groups existed belong to their connector.
+  defp correlation_group(map, connector_id) do
+    case Map.get(map, "correlation_group", connector_id) do
+      group when is_binary(group) and group != "" -> {:ok, group}
+      _invalid -> {:error, :invalid_event}
+    end
+  end
 
   defp required(map, key) do
     case Map.get(map, key) do

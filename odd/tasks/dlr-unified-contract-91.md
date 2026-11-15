@@ -24,8 +24,8 @@ Branch: `feat/dlr-unified-contract-91` from `main` `1f9dfed`. Delivery: stacked-
 | ID | Specs | Work | Route | Status | Commit |
 |---|---|---|---|---|---|
 | T1 | S7 | Config swap: add deadline/retention/group, remove `dlr_expiry*`, rewire injection and per-connector lookup | inline | done (RED 17 failing → GREEN; full suite 976 passed) | `5c0d2bc` (assess: medium, under_budget) |
-| T2 | S6 | Add dispatch timestamp to the `:dispatching` journal record and codec | inline | done (RED 4 failing → GREEN; full suite 980 passed) | see L7 |
-| T3 | S8 | Correlation group in reverse key and receipt matching; reused-id rule for open holders | inline | pending | |
+| T2 | S6 | Add dispatch timestamp to the `:dispatching` journal record and codec | inline | done (RED 4 failing → GREEN; full suite 980 passed) | `0dd7960` (assess: medium, under_budget) |
+| T3 | S8 | Correlation group in reverse key and receipt matching; reused-id rule for open holders | inline | done (RED 9 failing → GREEN; full suite 988 passed) | see L8 |
 | T4 | S1-S3 | JSON payload v1 builder, POST JSON thrower, `HttpJob` reshape, drop GET/form (single segment) | inline | pending | |
 | T5 | S4, S11 | Open aggregation record and acceptance closure (level 1) | inline | pending | |
 | T6 | S5 | Delivery aggregation and early closure (level 2) | inline | pending | |
@@ -44,4 +44,5 @@ Order: T1 → T2 → T3 → T4 → T5 → T6 → T7 → T8 → T9 (T2, T4 and th
 - L5 (2026-11-14) User: "Perfecto, vamos con ello. Si quieres tambien para mayor facilidad y revision podemos ir por lotes a main. Esto te dejo a desicion tuya".
 - L6 T1: `Dlr.Config` gains `dlr_deadline_s`, `dlr_closed_retention_s`, `with_connectors/2`, `windows/2`, `lifetime_s/2`; `Client.Config` gains `dlr_deadline`, `dlr_closed_retention`, `dlr_correlation_group`, `dlr_lifetime_s/1`. Interim correlation lifetime = deadline + retention (2 h default, was 24 h) until T5-T7 replace it. `outcome_retention_ms/2` kept (takes the lifetime). Checks: format, credo strict, dialyzer, `mix test` 976 passed / 30 excluded. Risk: none (requested config change).
 - L7 T2: `SettlementJournal.dispatching/3` stores `dispatched_at_ms` taken from the worker clock just before the pre-send write; the codec writes it only when set, decodes records without it as `nil`, and rejects non-integer or negative values. Additive field: older readers ignore unknown keys. Checks: format, credo strict, dialyzer, `mix test` 980 passed / 30 excluded. Risk: none (additive optional persisted field, both directions tested).
-- Next: T3.
+- L8 T3: reverse key is `(correlation_group, normalized SMSC id)`; request, reverse, plan and receipt-event records carry `correlation_group`, defaulting to the connector id when absent (older records and in-flight events keep working, key bytes unchanged by default). Receipts match when groups are equal. Reused id: interim "closed" = holder's request record missing (deleted on final receipt or expired) → take over; open holder keeps the mapping, the new submit is terminal `reverse_collision`, logged and emitted as `[:jasmin_ex, :dlr, :reverse_collision]`. T7 replaces the interim closed test with the closed marker. Checks: format, credo strict, dialyzer, `mix test` 988 passed / 30 excluded. Risk: none (requested behavior; additive optional persisted fields tested both ways).
+- Next: assess and open PR-A (T1-T3), then T4.
