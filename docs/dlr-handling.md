@@ -276,6 +276,15 @@ unsent segment. Successful sibling segments retain their actual evidence.
 | `FAILED` | A required segment has a definitive failure; other segments retain their actual outcomes. |
 | `UNRESOLVED` | The decision deadline expires with missing evidence and no known definitive failure (reason `DLR_TIMEOUT`), or, before the deadline, every segment is either decided or can never be correlated, with no known definitive failure (reason `SUBMIT_UNCONFIRMED`). |
 
+Provider receipt statuses are classified per segment. `DELIVRD` is delivered.
+`UNDELIV`, `REJECTD`, `EXPIRED`, and `DELETED` are definitive failures. Any
+other status, such as `ENROUTE`, `ACCEPTD`, or `UNKNOWN`, is intermediate: it is
+kept as the segment's latest evidence, produces no callback, and leaves the
+deadline running; if the deadline expires, delivery closes as `UNRESOLVED` with
+`DLR_TIMEOUT` and the intermediate status stays visible in `segments`. The raw
+status is always preserved in `segments[].message_status`; only the root
+`status` is the gateway conclusion.
+
 Delivery closes as soon as its outcome can no longer change. A segment without
 a known SMSC message id, because its dispatch stayed unresolved after a crash or
 its submit response arrived after `response_timeout_ms` and was discarded, can
