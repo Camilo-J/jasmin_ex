@@ -5,6 +5,7 @@ defmodule JasminEx.Smpp.Client.Config do
 
   @default_heartbeat_ms 30_000
   @default_response_timeout_ms 5_000
+  @default_dlr_window_s 3_600
 
   @enforce_keys [
     :connector_id,
@@ -20,7 +21,9 @@ defmodule JasminEx.Smpp.Client.Config do
     :reconnect,
     :deliver_handler,
     :lifecycle_notify,
-    :dlr_expiry
+    :dlr_deadline,
+    :dlr_closed_retention,
+    :dlr_correlation_group
   ]
   defstruct @enforce_keys ++ [dlr_publisher: nil]
 
@@ -38,7 +41,9 @@ defmodule JasminEx.Smpp.Client.Config do
           reconnect: ReconnectPolicy.t(),
           deliver_handler: {module() | nil, term()},
           lifecycle_notify: pid() | atom() | nil,
-          dlr_expiry: pos_integer(),
+          dlr_deadline: pos_integer(),
+          dlr_closed_retention: pos_integer(),
+          dlr_correlation_group: String.t(),
           dlr_publisher: {module(), term()} | nil
         }
 
@@ -51,8 +56,10 @@ defmodule JasminEx.Smpp.Client.Config do
       |> Keyword.get(:unbind_drain_timeout_ms, response_timeout_ms)
       |> validate_unbind_drain_timeout!()
 
+    connector_id = connector_id!(opts)
+
     %__MODULE__{
-      connector_id: connector_id!(opts),
+      connector_id: connector_id,
       host: Keyword.fetch!(opts, :host),
       port: Keyword.fetch!(opts, :port),
       system_id: Keyword.fetch!(opts, :system_id),
@@ -65,10 +72,21 @@ defmodule JasminEx.Smpp.Client.Config do
       reconnect: ReconnectPolicy.new(opts),
       deliver_handler: normalize_deliver_handler(Keyword.get(opts, :deliver_handler)),
       lifecycle_notify: lifecycle_notify!(Keyword.get(opts, :lifecycle_notify)),
-      dlr_expiry: dlr_expiry!(Keyword.get(opts, :dlr_expiry, 86_400)),
+      dlr_deadline: dlr_window!(opts, :dlr_deadline),
+      dlr_closed_retention: dlr_window!(opts, :dlr_closed_retention),
+      dlr_correlation_group:
+        correlation_group!(Keyword.get(opts, :dlr_correlation_group, connector_id)),
       dlr_publisher: dlr_publisher!(Keyword.get(opts, :dlr_publisher))
     }
   end
+
+  @doc """
+  Correlation lifetime of messages submitted by this connector: the delivery
+  decision deadline plus the post-closure retention window, in seconds.
+  """
+  @spec dlr_lifetime_s(t()) :: pos_integer()
+  def dlr_lifetime_s(%__MODULE__{dlr_deadline: deadline, dlr_closed_retention: retention}),
+    do: deadline + retention
 
   defp lifecycle_notify!(notify) when is_pid(notify) or is_atom(notify), do: notify
 
@@ -98,10 +116,21 @@ defmodule JasminEx.Smpp.Client.Config do
   defp normalize_deliver_handler({handler, context}) when is_atom(handler), do: {handler, context}
   defp normalize_deliver_handler(nil), do: {nil, nil}
 
-  defp dlr_expiry!(expiry) when is_integer(expiry) and expiry > 0, do: expiry
+  defp dlr_window!(opts, key) do
+    case Keyword.get(opts, key, @default_dlr_window_s) do
+      value when is_integer(value) and value > 0 ->
+        value
 
-  defp dlr_expiry!(expiry) do
-    raise ArgumentError, ":dlr_expiry must be a positive integer, got: #{inspect(expiry)}"
+      value ->
+        raise ArgumentError, "#{inspect(key)} must be a positive integer, got: #{inspect(value)}"
+    end
+  end
+
+  defp correlation_group!(group) when is_binary(group) and group != "", do: group
+
+  defp correlation_group!(group) do
+    raise ArgumentError,
+          ":dlr_correlation_group must be a non-empty binary, got: #{inspect(group)}"
   end
 
   defp dlr_publisher!(nil), do: nil

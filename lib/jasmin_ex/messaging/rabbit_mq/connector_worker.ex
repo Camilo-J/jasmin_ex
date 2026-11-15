@@ -248,7 +248,7 @@ defmodule JasminEx.Messaging.RabbitMQ.ConnectorWorker do
       observed_at_ms: observed_at_ms(state)
     }
 
-    ttl = state.dlr_outcome_ttl_ms || SettlementJournal.outcome_retention_ms(86_400)
+    ttl = state.dlr_outcome_ttl_ms || SettlementJournal.outcome_retention_ms(7_200)
 
     with {:ok, record} <-
            StateStoreJournal.read(state.store, envelope.gateway_id, envelope.attempt),

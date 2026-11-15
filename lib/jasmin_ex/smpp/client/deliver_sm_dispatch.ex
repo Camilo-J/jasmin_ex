@@ -8,11 +8,13 @@ defmodule JasminEx.Smpp.Client.DeliverSMDispatch do
   alias JasminEx.Smpp.PDU.Body
   alias JasminEx.Smpp.PDU.Constants
 
+  @default_lifetime_s 7_200
+
   @type handler_config :: {module() | nil, term()}
   @type dlr_context :: %{
           required(:connector_id) => String.t(),
           required(:publisher) => {module(), term()},
-          optional(:dlr_expiry) => pos_integer(),
+          optional(:dlr_lifetime_s) => pos_integer(),
           optional(:clock) => {module(), term()}
         }
 
@@ -40,14 +42,14 @@ defmodule JasminEx.Smpp.Client.DeliverSMDispatch do
 
   defp publish_receipt(receipt, context) do
     now = now_ms(context)
-    expiry = Map.get(context, :dlr_expiry, 86_400)
+    lifetime = Map.get(context, :dlr_lifetime_s, @default_lifetime_s)
 
     event = %{
       kind: :deliver_sm,
       connector_id: context.connector_id,
       receipt: receipt,
       observed_at_ms: now,
-      deadline_ms: now + expiry * 1000
+      deadline_ms: now + lifetime * 1000
     }
 
     with {:ok, payload} <- Event.encode(event),

@@ -58,7 +58,14 @@ Values marked as attempts are *additional* attempts after the first delivery.
 | `http_additional_attempts` | `3` | HTTP worker budget; broker delivery limit is `4`. |
 | `http_delay_ms` | `30000` | HTTP quorum delayed-retry minimum and maximum. |
 | `http_timeout_ms` | `30000` | Mint's overall callback request timeout. |
-| `dlr_expiry_s` | `86400` | Correlation and connector receipt lifetime. |
+| `dlr_deadline_s` | `3600` | Delivery decision deadline; connectors override it with `dlr_deadline`. |
+| `dlr_closed_retention_s` | `3600` | Post-closure retention window; connectors override it with `dlr_closed_retention`. |
+
+Each SMPP connector also accepts `dlr_correlation_group`, which defaults to its
+connector id. Until delivery aggregation is implemented, a message's
+correlation records and its connector's receipt events live for the deadline
+plus the post-closure window of the connector that submitted it (two hours by
+default). `dlr_expiry_s` and the connector `dlr_expiry` were removed.
 
 The validated production defaults use the existing `StateStore.Redix`,
 `TopicPublisher`, `HttpClient.Mint`, and the system clock. Explicit `:store`,
@@ -458,14 +465,35 @@ keys, serialized values, operation volume, and deployment overhead. A compact
 closed marker does not eliminate the cost of correlation keys. No memory or cost
 estimate has been measured for the proposed aggregate records yet.
 
-### Decisions still open
+### Implementation decisions
 
-- Configuration names for the delivery decision deadline, the post-closure
-  retention window, and the correlation group, and the margin of the safety TTL
-  for open records. These are implementation-level details.
+- Configuration names follow the existing `dlr_expiry_s` / `dlr_expiry` pattern,
+  in seconds: the global `:dlr` fields `dlr_deadline_s` and
+  `dlr_closed_retention_s` (both default `3600`), and the connector overrides
+  `dlr_deadline` and `dlr_closed_retention`. A connector declares its
+  correlation group with `dlr_correlation_group`, which defaults to its own
+  connector id.
+- `dlr_expiry_s` and the connector `dlr_expiry` are removed: the deadline and
+  the post-closure window replace the single correlation lifetime.
+- The safety TTL of open records is the deadline plus the post-closure window
+  plus a fixed, non-configurable margin of one hour. The margin only matters
+  when a wake-up is lost, so a generous value costs almost no memory and covers
+  long broker outages.
+- Deadline wait queues reuse the existing retry wait-queue arguments: quorum
+  type, `x-overflow: reject-publish`, `x-dead-letter-strategy: at-least-once`,
+  and one `x-message-ttl` per tier. At-least-once dead-lettering does not drop
+  expired wake-ups but may duplicate them, which the state check already
+  tolerates. Queues are named `<queue_prefix>.deadline` (work) and
+  `<queue_prefix>.deadline.wait.{1h,10m,1m,10s}`, and the work queue is
+  declared first.
+- Capacity is measured by an integration test against a real Redis using
+  `MEMORY USAGE` for an open message, a segment, reverse keys, and a closed
+  marker; the measured figures are documented here.
+- No changelog is kept while the project has no users; Conventional Commits
+  record the breaking contract change.
 
-These decisions must be resolved before implementation. This design does not
-authorize automatic retransmission, cancellation, refunds, or exactly-once claims.
+This design does not authorize automatic retransmission, cancellation, refunds,
+or exactly-once claims.
 Documentation organization can be revisited once the contract is complete.
 
 ## Troubleshoot and roll back

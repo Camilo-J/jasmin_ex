@@ -123,6 +123,22 @@ defmodule JasminEx.Smpp.Client.DeliverSMDispatchTest do
     assert event.status == "DELIVRD"
   end
 
+  test "receipt event deadline uses the connector's DLR lifetime" do
+    context = Map.put(dlr_context(), :dlr_lifetime_s, 900)
+
+    assert :ESME_ROK =
+             DeliverSMDispatch.dispatch(
+               receipt_body(),
+               {RecordingHandler, self()},
+               self(),
+               context
+             )
+
+    assert_receive {:dlr_publish, "dlr.deliver_sm", payload}
+    assert {:ok, event} = Event.decode(payload)
+    assert event.deadline_ms - event.observed_at_ms == 900_000
+  end
+
   test "connector identity comes from configured context, never from the PDU" do
     body =
       receipt_body(
@@ -227,7 +243,7 @@ defmodule JasminEx.Smpp.Client.DeliverSMDispatchTest do
     %{
       connector_id: "configured-connector",
       publisher: {publisher, self()},
-      dlr_expiry: 86_400
+      dlr_lifetime_s: 7_200
     }
   end
 

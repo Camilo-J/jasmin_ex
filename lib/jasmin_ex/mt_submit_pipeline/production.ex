@@ -365,7 +365,7 @@ defmodule JasminEx.MtSubmitPipeline.Production do
             url: request.url,
             level: request.level,
             method: request.method,
-            expiry_s: dlr_expiry_s(opts, message.connector_id)
+            expiry_s: dlr_lifetime_s(opts, message.connector_id)
           },
           Map.get(opts, :dlr_clock, {__MODULE__, :system})
         )
@@ -382,14 +382,11 @@ defmodule JasminEx.MtSubmitPipeline.Production do
     end
   end
 
-  defp dlr_expiry_s(opts, connector_id) do
-    case Map.get(opts, :dlr_expiry_fun) do
-      fun when is_function(fun, 1) ->
-        fun.(connector_id)
-
-      _missing ->
-        DlrConfig.connector_expiry(Map.get(opts, :dlr_config) || DlrConfig.new())
-    end
+  defp dlr_lifetime_s(opts, connector_id) do
+    opts
+    |> Map.get(:dlr_config)
+    |> Kernel.||(DlrConfig.new())
+    |> DlrConfig.lifetime_s(connector_id)
   end
 
   def now_ms(:system), do: System.system_time(:millisecond)

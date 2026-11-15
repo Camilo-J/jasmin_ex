@@ -103,7 +103,7 @@ defmodule JasminEx.Application do
 
       true ->
         require_messaging!(messaging_options)
-        dlr_config = dlr_config!(options)
+        dlr_config = dlr_config!(options, Keyword.get(config, :smpp_connectors, []))
 
         [
           config: dlr_config,
@@ -121,9 +121,11 @@ defmodule JasminEx.Application do
     end
   end
 
-  defp dlr_config!(options) do
-    case DlrConfig.new(options) do
-      %DlrConfig{} = config -> config
+  defp dlr_config!(options, connectors) do
+    with %DlrConfig{} = config <- DlrConfig.new(options),
+         %DlrConfig{} = config <- DlrConfig.with_connectors(config, connectors) do
+      config
+    else
       {:error, :invalid_dlr_config} -> raise ArgumentError, "invalid DLR configuration"
     end
   end
@@ -147,11 +149,11 @@ defmodule JasminEx.Application do
 
   defp inject_connectors(connectors, dlr_options) do
     publisher = Keyword.fetch!(dlr_options, :publisher)
-    expiry = Keyword.fetch!(dlr_options, :config).dlr_expiry_s
+    config = Keyword.fetch!(dlr_options, :config)
 
     known_publisher = fn key, payload ->
       with "dlr.submit_sm_resp" <- key,
-           {:ok, event} <- known_event(payload, expiry),
+           {:ok, event} <- known_event(payload, config),
            {:ok, encoded} <- DlrEvent.encode(event),
            {module, context} <- publisher do
         module.publish(context, key, encoded)
@@ -164,14 +166,16 @@ defmodule JasminEx.Application do
       opts when is_list(opts) ->
         opts
         |> Keyword.put_new(:dlr_enabled, true)
-        |> Keyword.put_new(:dlr_expiry, expiry)
+        |> Keyword.put_new(:dlr_deadline, config.dlr_deadline_s)
+        |> Keyword.put_new(:dlr_closed_retention, config.dlr_closed_retention_s)
         |> Keyword.put_new(:dlr_publisher, publisher)
         |> Keyword.put_new(:dlr_known_publisher, known_publisher)
 
       opts when is_map(opts) ->
         opts
         |> Map.put_new(:dlr_enabled, true)
-        |> Map.put_new(:dlr_expiry, expiry)
+        |> Map.put_new(:dlr_deadline, config.dlr_deadline_s)
+        |> Map.put_new(:dlr_closed_retention, config.dlr_closed_retention_s)
         |> Map.put_new(:dlr_publisher, publisher)
         |> Map.put_new(:dlr_known_publisher, known_publisher)
     end
@@ -179,9 +183,10 @@ defmodule JasminEx.Application do
     if Keyword.keyword?(connectors), do: inject.(connectors), else: Enum.map(connectors, inject)
   end
 
-  defp known_event(payload, expiry) do
+  defp known_event(payload, config) do
     known = :json.decode(payload)
     now = known["observed_at_ms"]
+    lifetime = DlrConfig.lifetime_s(config, known["connector_id"])
 
     {:ok,
      %{
@@ -192,7 +197,7 @@ defmodule JasminEx.Application do
        status: known["status"],
        raw_smsc_id: known["smsc_id"],
        observed_at_ms: now,
-       deadline_ms: now + expiry * 1000
+       deadline_ms: now + lifetime * 1000
      }}
   rescue
     _ -> {:error, :invalid_dlr_event}

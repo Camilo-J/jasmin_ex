@@ -34,14 +34,28 @@ defmodule JasminEx.Smpp.Client.ConfigTest do
              },
              deliver_handler: {nil, nil},
              lifecycle_notify: nil,
-             dlr_expiry: 86_400,
+             dlr_deadline: 3_600,
+             dlr_closed_retention: 3_600,
+             dlr_correlation_group: "connector-a",
              dlr_publisher: nil
            } = Config.new!(@required_opts)
   end
 
-  test "accepts a positive connector dlr_expiry" do
-    assert %Config{dlr_expiry: 3600} =
-             Config.new!(Keyword.put(@required_opts, :dlr_expiry, 3600))
+  test "accepts connector DLR window overrides and a correlation group" do
+    opts =
+      @required_opts
+      |> Keyword.put(:dlr_deadline, 600)
+      |> Keyword.put(:dlr_closed_retention, 120)
+      |> Keyword.put(:dlr_correlation_group, "smsc-x")
+
+    assert %Config{dlr_deadline: 600, dlr_closed_retention: 120, dlr_correlation_group: "smsc-x"} =
+             config = Config.new!(opts)
+
+    assert Config.dlr_lifetime_s(config) == 720
+  end
+
+  test "no longer carries a dlr_expiry field" do
+    refute Map.has_key?(Config.new!(@required_opts), :dlr_expiry)
   end
 
   test "accepts an optional DLR publisher and defaults it to nil" do
@@ -57,14 +71,22 @@ defmodule JasminEx.Smpp.Client.ConfigTest do
     end
   end
 
-  test "rejects a missing or non-positive dlr_expiry" do
-    message = fn value ->
-      ":dlr_expiry must be a positive integer, got: #{inspect(value)}"
-    end
+  test "rejects non-positive DLR windows" do
+    for key <- [:dlr_deadline, :dlr_closed_retention], value <- [0, -1, 1.5, "3600"] do
+      message = "#{inspect(key)} must be a positive integer, got: #{inspect(value)}"
 
-    for value <- [0, -1, 1.5, "86400"] do
-      assert_raise ArgumentError, message.(value), fn ->
-        Config.new!(Keyword.put(@required_opts, :dlr_expiry, value))
+      assert_raise ArgumentError, message, fn ->
+        Config.new!(Keyword.put(@required_opts, key, value))
+      end
+    end
+  end
+
+  test "rejects an empty or non-binary correlation group" do
+    for value <- ["", :group, 1] do
+      message = ":dlr_correlation_group must be a non-empty binary, got: #{inspect(value)}"
+
+      assert_raise ArgumentError, message, fn ->
+        Config.new!(Keyword.put(@required_opts, :dlr_correlation_group, value))
       end
     end
   end
