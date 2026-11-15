@@ -1,7 +1,7 @@
 defmodule JasminEx.Dlr.Lookup do
   @moduledoc false
 
-  @final_statuses ~w(DELIVRD EXPIRED DELETED UNDELIV REJECTD)
+  alias JasminEx.Dlr.Payload
 
   @spec plan(map(), keyword()) :: {:ok, map()} | {:retry, term()} | {:terminal, term()}
   def plan(event, inputs) when is_map(event) and is_list(inputs) do
@@ -32,7 +32,8 @@ defmodule JasminEx.Dlr.Lookup do
 
     case {request.level, success?} do
       {1, _} ->
-        {:ok, base_plan(event, job(event, request, 1), nil, {:request, request.gateway_id})}
+        {:ok,
+         base_plan(event, acceptance_job(event, request), nil, {:request, request.gateway_id})}
 
       {2, true} ->
         {:ok, base_plan(event, nil, reverse(event, request), nil)}
@@ -41,10 +42,11 @@ defmodule JasminEx.Dlr.Lookup do
         {:terminal, :submit_failed_without_callback}
 
       {3, true} ->
-        {:ok, base_plan(event, job(event, request, 1), reverse(event, request), nil)}
+        {:ok, base_plan(event, acceptance_job(event, request), reverse(event, request), nil)}
 
       {3, false} ->
-        {:ok, base_plan(event, job(event, request, 1), nil, {:request, request.gateway_id})}
+        {:ok,
+         base_plan(event, acceptance_job(event, request), nil, {:request, request.gateway_id})}
 
       _unsupported_level ->
         {:terminal, {:malformed_map, :invalid_state}}
@@ -54,8 +56,15 @@ defmodule JasminEx.Dlr.Lookup do
   defp receipt_plan(_event, %{level: 1}), do: {:terminal, :receipt_not_requested}
 
   defp receipt_plan(event, request) do
-    cleanup = if event.status in @final_statuses, do: {:request, request.gateway_id}, else: nil
-    {:ok, base_plan(event, job(event, request, 2), nil, cleanup)}
+    case Payload.classify(event.status) do
+      :intermediate ->
+        {:ok, base_plan(event, nil, nil, nil)}
+
+      outcome ->
+        status = if outcome == :delivered, do: "DELIVERED", else: "FAILED"
+        payload = Payload.delivery(request, event, status)
+        {:ok, base_plan(event, job(event, request, payload), nil, {:request, request.gateway_id})}
+    end
   end
 
   defp base_plan(event, job, reverse, cleanup) do
@@ -68,48 +77,19 @@ defmodule JasminEx.Dlr.Lookup do
     }
   end
 
-  defp job(event, request, 1) do
-    %{
-      job_id: event.event_id,
-      event_id: event.event_id,
-      gateway_id: request.gateway_id,
-      url: request.url,
-      method: request.method,
-      level: 1,
-      created_at_ms: event.observed_at_ms,
-      deadline_ms: event.deadline_ms,
-      fields: %{
-        "id" => request.gateway_id,
-        "level" => "1",
-        "message_status" => event.status,
-        "connector" => event.connector_id
-      }
-    }
-  end
+  defp acceptance_job(event, request),
+    do: job(event, request, Payload.acceptance(request, event))
 
-  defp job(event, request, 2) do
+  defp job(event, request, payload) do
     %{
       job_id: event.event_id,
       event_id: event.event_id,
       gateway_id: request.gateway_id,
       url: request.url,
-      method: request.method,
-      level: 2,
+      level: payload["level"],
       created_at_ms: event.observed_at_ms,
       deadline_ms: event.deadline_ms,
-      fields: %{
-        "id" => request.gateway_id,
-        "level" => "2",
-        "message_status" => event.status,
-        "connector" => event.raw_smsc_id,
-        "id_smsc" => event.normalized_smsc_id,
-        "sub" => event.sub,
-        "dlvrd" => event.dlvrd,
-        "subdate" => event.subdate,
-        "donedate" => event.donedate,
-        "err" => event.err,
-        "text" => event.text
-      }
+      payload: payload
     }
   end
 

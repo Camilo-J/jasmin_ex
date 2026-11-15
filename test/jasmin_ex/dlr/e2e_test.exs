@@ -204,8 +204,8 @@ defmodule JasminEx.Dlr.E2ETest do
     assert [%{method: "POST", path: "/dlr", body: callback_body}] =
              FakeDlrEndpoint.requests(endpoint)
 
-    assert URI.decode_query(callback_body)["id"] == gateway_id
-    assert URI.decode_query(callback_body)["level"] == "1"
+    assert %{"id" => ^gateway_id, "level" => 1, "status" => "ACCEPTED"} =
+             :json.decode(callback_body)
 
     clock = {ConnectorWorker, :system}
     event_id = Event.submit_event_id(connector_id, gateway_id, 1)
@@ -227,7 +227,7 @@ defmodule JasminEx.Dlr.E2ETest do
     assert_receive {:fake_smsc_pdu, ^smsc_ref, %{command: :submit_sm}}, 5_000
     assert eventually(fn -> length(FakeDlrEndpoint.requests(endpoint)) == 3 end, 8_000)
     assert [_, first_retry, second_retry] = FakeDlrEndpoint.requests(endpoint)
-    assert URI.decode_query(first_retry.body)["id"] == retry_gateway_id
+    assert :json.decode(first_retry.body)["id"] == retry_gateway_id
     assert first_retry.body == second_retry.body
     assert queue_has_no_messages?(messaging, names.http)
 
@@ -243,7 +243,7 @@ defmodule JasminEx.Dlr.E2ETest do
     assert eventually(fn -> length(FakeDlrEndpoint.requests(endpoint)) == 7 end, 8_000)
 
     assert Enum.all?(Enum.drop(FakeDlrEndpoint.requests(endpoint), 3), fn request ->
-             URI.decode_query(request.body)["id"] == exhausted_id
+             :json.decode(request.body)["id"] == exhausted_id
            end)
 
     assert eventually(fn -> queue_counts(messaging, names.dead) == {1, 0} end, 8_000)
@@ -348,8 +348,13 @@ defmodule JasminEx.Dlr.E2ETest do
 
     assert eventually(fn -> length(FakeDlrEndpoint.requests(endpoint)) == 8 end, 20_000)
     assert %{body: receipt_callback} = List.last(FakeDlrEndpoint.requests(endpoint))
-    assert URI.decode_query(receipt_callback)["id"] == receipt_gateway_id
-    assert URI.decode_query(receipt_callback)["message_status"] == "DELIVRD"
+
+    assert %{
+             "id" => ^receipt_gateway_id,
+             "level" => 2,
+             "status" => "DELIVERED",
+             "segments" => [%{"message_status" => "DELIVRD"}]
+           } = :json.decode(receipt_callback)
 
     assert eventually(
              fn -> DlrMap.fetch_request(store, receipt_gateway_id, clock) == :missing end,

@@ -66,7 +66,8 @@ defmodule JasminEx.Dlr.Request do
 
   defp parse_method(method) when is_binary(method) do
     case String.upcase(method) do
-      normalized when normalized in ["GET", "POST"] -> {:ok, normalized}
+      # JSON callbacks are POST only; GET is not part of the callback contract.
+      "POST" -> {:ok, "POST"}
       _other -> {:error, :invalid_dlr_method}
     end
   end
