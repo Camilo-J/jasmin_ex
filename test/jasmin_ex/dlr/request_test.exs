@@ -50,9 +50,9 @@ defmodule JasminEx.Dlr.RequestTest do
     end
 
     test "method-only does not enable DLR" do
-      assert {:ok, request} = Request.normalize(%{"dlr-method" => "GET"})
+      assert {:ok, request} = Request.normalize(%{"dlr-method" => "POST"})
       assert request.enabled == false
-      assert request.method == "GET"
+      assert request.method == "POST"
       assert request.request_receipt == false
       assert request.register_callback == false
     end
@@ -79,15 +79,26 @@ defmodule JasminEx.Dlr.RequestTest do
       assert {:error, :unknown_field} = Request.normalize(%{"dlr-expiry" => "3600"})
     end
 
-    test "dlr-method get is stored as GET" do
+    test "dlr-method post is accepted case-insensitively" do
       assert {:ok, request} =
                Request.normalize(%{
                  "dlr" => "yes",
                  "dlr-url" => "http://example.com/dlr",
-                 "dlr-method" => "get"
+                 "dlr-method" => "post"
                })
 
-      assert request.method == "GET"
+      assert request.method == "POST"
+    end
+
+    test "GET callbacks are not supported by the JSON callback contract" do
+      for method <- ["GET", "get"] do
+        assert {:error, :invalid_dlr_method} =
+                 Request.normalize(%{
+                   "dlr" => "yes",
+                   "dlr-url" => "http://example.com/dlr",
+                   "dlr-method" => method
+                 })
+      end
     end
   end
 
@@ -114,7 +125,7 @@ defmodule JasminEx.Dlr.RequestTest do
                Request.normalize(%{
                  "dlr" => "yes",
                  "dlr-level" => "2",
-                 "dlr-method" => "GET",
+                 "dlr-method" => "POST",
                  "dlr-url" => "http://example.com/dlr"
                })
 

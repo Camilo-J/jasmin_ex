@@ -14,7 +14,7 @@ defmodule JasminEx.Dlr.LookupTest do
     expires_at_ms: 90_000
   }
 
-  test "level 1 submit success creates a compatible callback and cleanup" do
+  test "level 1 submit success creates an ACCEPTED callback and cleanup" do
     event = submit_event()
 
     assert {:ok, plan} = Lookup.plan(event, request: {:ok, @request})
@@ -23,12 +23,13 @@ defmodule JasminEx.Dlr.LookupTest do
     assert plan.cleanup == {:request, "G1"}
     assert plan.job.level == 1
 
-    assert plan.job.fields == %{
-             "connector" => "c1",
-             "id" => "G1",
-             "level" => "1",
-             "message_status" => "ESME_ROK"
-           }
+    assert plan.job.url == "https://example.com/dlr"
+    assert plan.job.payload["status"] == "ACCEPTED"
+    assert plan.job.payload["connector"] == "c1"
+
+    assert plan.job.payload["segments"] == [
+             %{"index" => 1, "id_smsc" => "00ab12", "message_status" => "ESME_ROK"}
+           ]
   end
 
   test "level 2 submit success creates only the reverse mapping" do
@@ -56,7 +57,12 @@ defmodule JasminEx.Dlr.LookupTest do
 
     for level <- [1, 3] do
       assert {:ok, plan} = Lookup.plan(event, request: {:ok, %{@request | level: level}})
-      assert plan.job.fields["message_status"] == "ESME_RSUBMITFAIL"
+      assert plan.job.payload["status"] == "FAILED"
+
+      assert plan.job.payload["segments"] == [
+               %{"index" => 1, "message_status" => "ESME_RSUBMITFAIL"}
+             ]
+
       assert plan.cleanup == {:request, "G1"}
       assert plan.reverse == nil
     end
@@ -70,7 +76,7 @@ defmodule JasminEx.Dlr.LookupTest do
              Lookup.plan(submit_event(), request: {:ok, %{@request | level: 4}})
   end
 
-  test "final receipt creates level 2 callback using Python-compatible connector fields" do
+  test "a DELIVRD receipt closes delivery as DELIVERED with the submitting connector" do
     event = receipt_event()
     reverse = {:ok, %{gateway_id: "G1", connector_id: "c1", correlation_group: "c1"}}
     request = {:ok, %{@request | level: 3}}
@@ -78,13 +84,30 @@ defmodule JasminEx.Dlr.LookupTest do
     assert {:ok, plan} = Lookup.plan(event, reverse: reverse, request: request)
     assert plan.cleanup == {:request, "G1"}
     assert plan.job.level == 2
-    assert plan.job.fields["connector"] == "00ab12"
-    assert plan.job.fields["id_smsc"] == "AB12"
-    assert plan.job.fields["id"] == "G1"
-    assert plan.job.fields["message_status"] == "DELIVRD"
+    assert plan.job.payload["status"] == "DELIVERED"
+    assert plan.job.payload["connector"] == "c1"
+    assert plan.job.payload["id"] == "G1"
+
+    assert [%{"id_smsc" => "00ab12", "message_status" => "DELIVRD", "index" => 1}] =
+             plan.job.payload["segments"]
   end
 
-  test "non-final receipt keeps correlation and level 1 requests do not receive receipts" do
+  test "a definitive failure receipt closes delivery as FAILED" do
+    reverse = {:ok, %{gateway_id: "G1", connector_id: "c1", correlation_group: "c1"}}
+
+    for status <- ~w(UNDELIV REJECTD EXPIRED DELETED) do
+      event = %{receipt_event() | status: status}
+
+      assert {:ok, plan} =
+               Lookup.plan(event, reverse: reverse, request: {:ok, %{@request | level: 2}})
+
+      assert plan.cleanup == {:request, "G1"}
+      assert plan.job.payload["status"] == "FAILED"
+      assert [%{"message_status" => ^status}] = plan.job.payload["segments"]
+    end
+  end
+
+  test "an intermediate receipt keeps correlation without a callback" do
     event = %{receipt_event() | status: "ACCEPTD"}
     reverse = {:ok, %{gateway_id: "G1", connector_id: "c1", correlation_group: "c1"}}
 
@@ -92,7 +115,7 @@ defmodule JasminEx.Dlr.LookupTest do
              Lookup.plan(event, reverse: reverse, request: {:ok, %{@request | level: 2}})
 
     assert plan.cleanup == nil
-    assert plan.job.level == 2
+    assert plan.job == nil
 
     assert {:terminal, :receipt_not_requested} =
              Lookup.plan(event, reverse: reverse, request: {:ok, @request})

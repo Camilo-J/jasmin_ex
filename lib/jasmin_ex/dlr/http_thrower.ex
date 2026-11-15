@@ -20,31 +20,14 @@ defmodule JasminEx.Dlr.HttpThrower do
     end
   end
 
-  defp request(%{method: "GET"} = job) do
-    uri = URI.parse(job.url)
-    query = merge_query(uri.query, job.fields)
-    {:ok, %{method: "GET", url: URI.to_string(%{uri | query: query}), headers: [], body: ""}}
-  rescue
-    _error -> {:error, :invalid_url}
-  end
-
-  defp request(%{method: "POST"} = job) do
+  defp request(job) do
     {:ok,
      %{
        method: "POST",
        url: job.url,
-       headers: [{"content-type", "application/x-www-form-urlencoded"}],
-       body: URI.encode_query(job.fields)
+       headers: [{"content-type", "application/json"}],
+       body: HttpJob.body(job)
      }}
-  end
-
-  defp merge_query(nil, fields), do: URI.encode_query(fields)
-
-  defp merge_query(existing, fields) do
-    existing
-    |> URI.decode_query()
-    |> Map.merge(fields)
-    |> URI.encode_query()
   end
 
   defp invoke({module, client_context}, request), do: module.request(client_context, request)

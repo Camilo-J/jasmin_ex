@@ -117,22 +117,26 @@ repeated callbacks. A delivered callback requires the literal trimmed body
 failures retry within the broker-owned budget. There is one network attempt
 per HTTP job, not an inner Mint retry loop.
 
-HTTP callbacks support GET with compatible query fields and POST with
-`application/x-www-form-urlencoded` fields (`id`, `level`, `message_status`,
-`connector`, plus receipt fields for level 2). The destination policy rejects
+HTTP callbacks are POST requests with `Content-Type: application/json` and the
+unified payload described under "Callback contract" below; `dlr-method=GET` is
+rejected with `invalid_dlr_method`. Single-segment messages send one acceptance
+callback and one delivery callback when a receipt closes delivery
+(`DELIVERED` or `FAILED`); intermediate receipts keep correlation without a
+callback. Delivery closure on the deadline (`UNRESOLVED`) is not implemented
+yet. The destination policy rejects
 private or otherwise disallowed resolved addresses by default, pins the
 approved peer while preserving the original Host/TLS hostname, verifies TLS,
 and does not follow redirects. Mint bounds connect time (default 5000 ms),
 response headers (16384 bytes), and response body (65536 bytes). A redirect
 response is classified by status and ACK body without following its Location.
 
-## Multipart DLR — agreed design (not implemented)
+## Unified DLR contract — agreed design (partially implemented)
 
 This section records the agreed direction for [issue #91](https://github.com/Camilo-J/jasmin_ex/issues/91),
 not a released feature or a complete implementation specification. Multipart
 requests with enabled DLR still return HTTP 400 `multipart_dlr_not_supported`.
-The configuration table above describes current behavior; the proposed deadline
-below has no implemented configuration option yet.
+Implemented so far: the deadline and retention configuration, correlation
+groups, and the JSON callback contract for single-segment messages.
 
 ### Callback contract
 
@@ -143,7 +147,7 @@ optional legacy transport or automatic fallback. This replaces the earlier
 form-default and JSON-default-with-optional-legacy proposals. Existing receivers
 using GET or form payloads must migrate to POST JSON. This is an intentional
 breaking callback-interface change, not a change to the HTTP send endpoint.
-The current implementation has not changed. HTTP QUERY is outside this design.
+HTTP QUERY is outside this design.
 
 JSON callbacks retain the current receiver acknowledgement behavior: a status
 below 400 and a body equal to `ACK/Jasmin` after trimming whitespace confirms
@@ -275,6 +279,15 @@ unsent segment. Successful sibling segments retain their actual evidence.
 | `DELIVERED` | Every required segment has a delivery receipt reporting `DELIVRD`. |
 | `FAILED` | A required segment has a definitive failure; other segments retain their actual outcomes. |
 | `UNRESOLVED` | The decision deadline expires with missing evidence and no known definitive failure (reason `DLR_TIMEOUT`), or, before the deadline, every segment is either decided or can never be correlated, with no known definitive failure (reason `SUBMIT_UNCONFIRMED`). |
+
+Provider receipt statuses are classified per segment. `DELIVRD` is delivered.
+`UNDELIV`, `REJECTD`, `EXPIRED`, and `DELETED` are definitive failures. Any
+other status, such as `ENROUTE`, `ACCEPTD`, or `UNKNOWN`, is intermediate: it is
+kept as the segment's latest evidence, produces no callback, and leaves the
+deadline running; if the deadline expires, delivery closes as `UNRESOLVED` with
+`DLR_TIMEOUT` and the intermediate status stays visible in `segments`. The raw
+status is always preserved in `segments[].message_status`; only the root
+`status` is the gateway conclusion.
 
 Delivery closes as soon as its outcome can no longer change. A segment without
 a known SMSC message id, because its dispatch stayed unresolved after a crash or

@@ -247,15 +247,14 @@ defmodule JasminEx.Dlr.LookupPlan do
       :event_id,
       :gateway_id,
       :url,
-      :method,
       :level,
       :created_at_ms,
       :deadline_ms,
-      :fields
+      :payload
     ]
 
-    if Enum.all?(required, &Map.has_key?(job, &1)) and job.method in ["GET", "POST"] and
-         job.level in [1, 2] and is_map(job.fields),
+    if Enum.all?(required, &Map.has_key?(job, &1)) and job.level in [1, 2] and
+         is_map(job.payload),
        do: :ok,
        else: {:error, :invalid_plan}
   end
@@ -286,11 +285,10 @@ defmodule JasminEx.Dlr.LookupPlan do
       "event_id" => job.event_id,
       "gateway_id" => job.gateway_id,
       "url" => job.url,
-      "method" => job.method,
       "level" => job.level,
       "created_at_ms" => job.created_at_ms,
       "deadline_ms" => job.deadline_ms,
-      "fields" => job.fields
+      "payload" => job.payload
     }
   end
 
@@ -345,11 +343,10 @@ defmodule JasminEx.Dlr.LookupPlan do
       event_id: map["event_id"],
       gateway_id: map["gateway_id"],
       url: map["url"],
-      method: map["method"],
       level: map["level"],
       created_at_ms: map["created_at_ms"],
       deadline_ms: map["deadline_ms"],
-      fields: map["fields"]
+      payload: map["payload"]
     }
 
     with :ok <- validate_job(job), do: {:ok, job}

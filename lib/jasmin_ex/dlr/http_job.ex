@@ -1,29 +1,28 @@
 defmodule JasminEx.Dlr.HttpJob do
   @moduledoc false
 
-  @common_fields ~w(id level message_status connector)
-  @level_two_fields @common_fields ++ ~w(id_smsc sub dlvrd subdate donedate err text)
+  @version 2
   @max_url_bytes 8_192
-  @max_field_bytes 4_096
+  @max_payload_bytes 65_536
+  @statuses ~w(ACCEPTED DELIVERED FAILED UNRESOLVED)
 
   @spec encode(map()) :: {:ok, binary()} | {:error, atom()}
   def encode(job) when is_map(job) do
     with :ok <- validate(job) do
       payload = %{
-        "version" => 1,
+        "version" => @version,
         "kind" => "http_job",
         "job_id" => job.job_id,
         "event_id" => job.event_id,
         "gateway_id" => job.gateway_id,
         "url" => job.url,
-        "method" => job.method,
         "level" => job.level,
         "created_at_ms" => job.created_at_ms,
         "deadline_ms" => job.deadline_ms,
-        "fields" => job.fields
+        "payload" => job.payload
       }
 
-      {:ok, payload |> :json.encode() |> IO.iodata_to_binary()}
+      {:ok, json(payload)}
     end
   rescue
     _error -> {:error, :invalid_job}
@@ -34,8 +33,8 @@ defmodule JasminEx.Dlr.HttpJob do
   @spec decode(binary()) :: {:ok, map()} | {:error, atom()}
   def decode(payload) when is_binary(payload) do
     case :json.decode(payload) do
-      %{"version" => 1, "kind" => "http_job"} = map -> decode_v1(map)
-      %{"version" => 1} -> {:error, :invalid_job}
+      %{"version" => @version, "kind" => "http_job"} = map -> decode_current(map)
+      %{"version" => @version} -> {:error, :invalid_job}
       %{"version" => _version} -> {:error, :unsupported_version}
       _other -> {:error, :invalid_job}
     end
@@ -43,17 +42,20 @@ defmodule JasminEx.Dlr.HttpJob do
     _error -> {:error, :invalid_job}
   end
 
-  defp decode_v1(map) do
+  @doc "The callback request body: the unified JSON payload."
+  @spec body(map()) :: binary()
+  def body(%{payload: payload}), do: json(payload)
+
+  defp decode_current(map) do
     job = %{
       job_id: map["job_id"],
       event_id: map["event_id"],
       gateway_id: map["gateway_id"],
       url: map["url"],
-      method: map["method"],
       level: map["level"],
       created_at_ms: map["created_at_ms"],
       deadline_ms: map["deadline_ms"],
-      fields: map["fields"]
+      payload: map["payload"]
     }
 
     with :ok <- validate(job), do: {:ok, job}
@@ -64,10 +66,9 @@ defmodule JasminEx.Dlr.HttpJob do
          :ok <- binary(job, :event_id),
          :ok <- binary(job, :gateway_id),
          :ok <- bounded_binary(job, :url, @max_url_bytes),
-         :ok <- method(job),
          :ok <- level(job),
          :ok <- timestamps(job),
-         do: fields(job)
+         do: payload(job)
   end
 
   defp binary(job, key) do
@@ -84,8 +85,6 @@ defmodule JasminEx.Dlr.HttpJob do
     end
   end
 
-  defp method(%{method: method}) when method in ["GET", "POST"], do: :ok
-  defp method(_job), do: {:error, :invalid_job}
   defp level(%{level: level}) when level in [1, 2], do: :ok
   defp level(_job), do: {:error, :invalid_job}
 
@@ -95,16 +94,29 @@ defmodule JasminEx.Dlr.HttpJob do
 
   defp timestamps(_job), do: {:error, :invalid_job}
 
-  defp fields(%{level: level, fields: fields}) when is_map(fields) do
-    expected = if level == 1, do: @common_fields, else: @level_two_fields
-
-    if Map.keys(fields) |> Enum.sort() == Enum.sort(expected) and
-         Enum.all?(fields, fn {key, value} ->
-           is_binary(key) and is_binary(value) and byte_size(value) <= @max_field_bytes
-         end),
-       do: :ok,
-       else: {:error, :invalid_job}
+  defp payload(%{gateway_id: id, level: level, payload: payload}) do
+    with %{
+           "schema_version" => 1,
+           "id" => ^id,
+           "level" => ^level,
+           "status" => status,
+           "status_origin" => "gateway",
+           "total_segments" => total,
+           "segments" => [_ | _] = segments
+         }
+         when status in @statuses and is_integer(total) and total > 0 <- payload,
+         true <- Enum.all?(segments, &segment?/1),
+         true <- byte_size(json(payload)) <= @max_payload_bytes do
+      :ok
+    else
+      _invalid -> {:error, :invalid_job}
+    end
   end
 
-  defp fields(_job), do: {:error, :invalid_job}
+  defp payload(_job), do: {:error, :invalid_job}
+
+  defp segment?(%{"index" => index}) when is_integer(index) and index > 0, do: true
+  defp segment?(_segment), do: false
+
+  defp json(term), do: term |> :json.encode() |> IO.iodata_to_binary()
 end

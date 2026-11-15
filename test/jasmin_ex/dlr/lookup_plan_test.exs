@@ -265,15 +265,18 @@ defmodule JasminEx.Dlr.LookupPlanTest do
         event_id: "event-submit",
         gateway_id: "G1",
         url: "https://example.com/dlr",
-        method: "POST",
         level: 1,
         created_at_ms: 1_000,
         deadline_ms: 80_000,
-        fields: %{
+        payload: %{
+          "schema_version" => 1,
           "id" => "G1",
-          "level" => "1",
-          "message_status" => "ESME_ROK",
-          "connector" => "c1"
+          "level" => 1,
+          "status" => "ACCEPTED",
+          "status_origin" => "gateway",
+          "connector" => "c1",
+          "total_segments" => 1,
+          "segments" => [%{"index" => 1, "message_status" => "ESME_ROK"}]
         }
       }
     }

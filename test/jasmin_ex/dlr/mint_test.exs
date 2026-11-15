@@ -367,15 +367,18 @@ defmodule JasminEx.Dlr.MintBrokerIntegrationTest do
       event_id: "broker-event",
       gateway_id: "G1",
       url: FakeDlrEndpoint.url(endpoint, "callback.test"),
-      method: "POST",
       level: 1,
       created_at_ms: now,
       deadline_ms: now + 120_000,
-      fields: %{
+      payload: %{
+        "schema_version" => 1,
         "id" => "G1",
-        "level" => "1",
-        "message_status" => "ESME_ROK",
-        "connector" => "c1"
+        "level" => 1,
+        "status" => "ACCEPTED",
+        "status_origin" => "gateway",
+        "connector" => "c1",
+        "total_segments" => 1,
+        "segments" => [%{"index" => 1, "message_status" => "ESME_ROK"}]
       }
     }
 
